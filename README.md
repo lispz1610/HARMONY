@@ -241,10 +241,12 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | File | Changes |
 |:---|:---|
 | `dcl/types.hpp` | Added `struct TopoMetrics` (R1); added `numa_distance`, `device_numa_node` fields (R2); added `memory_contention_factor`, `thermal_tdp_watts`, `current_power_watts` fields (R5); added `BalanceMode::hierarchical` (R3); added `numa_cost_gain_ratio_threshold`, `use_contention_adjustment`, `use_power_cap`, `power_budget_watts` to `AutoBalancePolicy` (R2, R5) |
-| `dcl/runtime.hpp` | Added `set_topo_metrics()`, `topo_metrics()`, `set_topo_metrics()`, `maybe_rebalance_hierarchical()`, `set_simulated_devices_count()`, `set_simulated_times()`, `clear_simulated_times()` to the `Runtime` public API |
+| `dcl/runtime.hpp` | Added `set_topo_metrics()`, `topo_metrics()`, `maybe_rebalance_hierarchical()`, `set_simulated_devices_count()`, `set_simulated_times()`, `clear_simulated_times()` to the `Runtime` public API |
 | `dcl/runtime.cpp` | Implemented public-API method bodies forwarding to `Impl` |
 | `dcl/runtime_impl.hpp` | Integrated NUMA cost gating into `maybe_rebalance_from_timings()` (R2); implemented `maybe_rebalance_hierarchical()` two-phase logic (R3); integrated contention adjustment and power cap into rebalancing pipeline (R5) |
+| `tests/test_hierarchical.cpp` | Fixed: `[HIER]` log assertions and PASS/summary messages gated on `rank == 0` only; `maybe_rebalance_hierarchical()` emits logs exclusively from rank 0 so rank 1 captured no output and aborted |
 | `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md` |
+
 
 ### Removed Files
 
@@ -311,23 +313,28 @@ Each test is a self-contained translation unit. Compile with `mpic++`:
 ```bash
 # R1 — Topology metrics I/O
 mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_topo_metrics.cpp -o tests/test_topo_metrics.out
+  tests/test_topo_metrics.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_topo_metrics.out
 
 # R2 — NUMA migration cost
 mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_numa_cost.cpp -o tests/test_numa_cost.out
+  tests/test_numa_cost.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_numa_cost.out
 
 # R3 — Hierarchical balancing
 mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_hierarchical.cpp -o tests/test_hierarchical.out
+  tests/test_hierarchical.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_hierarchical.out
 
 # R4 — Algorithm comparison
 mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_algorithms.cpp -o tests/test_algorithms.out
+  tests/test_algorithms.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_algorithms.out
 
 # R5 — Contention and power cap
 mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_contention_power.cpp -o tests/test_contention_power.out
+  tests/test_contention_power.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_contention_power.out
 ```
 
 ### Running Tests

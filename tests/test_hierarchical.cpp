@@ -25,10 +25,18 @@
 
 namespace {
 
-void test_hierarchical_timing_imbalance(dcl::Runtime& rt) {
-    std::cout << "[TEST] Running test_hierarchical_timing_imbalance..." << std::endl;
+// Helper: get current MPI rank in MPI_COMM_WORLD
+static int get_rank() {
+    int r = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &r);
+    return r;
+}
 
-    // 1. Configure simulated 2-device runtime on single rank
+void test_hierarchical_timing_imbalance(dcl::Runtime& rt) {
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hierarchical_timing_imbalance..." << std::endl;
+
+    // 1. Configure simulated 2-device runtime
     rt.set_simulated_devices_count(2);
 
     dcl::PartitionSpec ps;
@@ -48,29 +56,35 @@ void test_hierarchical_timing_imbalance(dcl::Runtime& rt) {
     //    Device 1 time = 20.0 ms (0.020 s)
     rt.set_simulated_times({0.010, 0.020});
 
-    // 3. Capture stdout to verify all [HIER] log lines appear
+    // 3. Capture stdout on rank 0 to verify [HIER] log lines appear
     std::stringstream captured;
-    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
 
     // 4. Call hierarchical balancing path
     const bool ok = rt.maybe_rebalance_hierarchical();
 
-    // Restore stdout
-    std::cout.rdbuf(old_buf);
-    const std::string out_str = captured.str();
-
-    // Echo to stdout so test logs and auditor can see it
-    std::cout << out_str;
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        // Echo captured output so test logs are visible
+        std::cout << out_str;
+    }
 
     assert(ok && "Expected maybe_rebalance_hierarchical to return true");
 
-    // 5. Verify all [HIER] log lines appear
-    assert(out_str.find("[HIER] intra-node loads:") != std::string::npos &&
-           "Expected log line '[HIER] intra-node loads:' not found");
-    assert(out_str.find("[HIER] inter-node loads:") != std::string::npos &&
-           "Expected log line '[HIER] inter-node loads:' not found");
-    assert(out_str.find("[HIER] final partition:") != std::string::npos &&
-           "Expected log line '[HIER] final partition:' not found");
+    // 5. Verify all [HIER] log lines appear — only rank 0 emits them
+    if (rank == 0) {
+        assert(out_str.find("[HIER] intra-node loads:") != std::string::npos &&
+               "Expected log line '[HIER] intra-node loads:' not found");
+        assert(out_str.find("[HIER] inter-node loads:") != std::string::npos &&
+               "Expected log line '[HIER] inter-node loads:' not found");
+        assert(out_str.find("[HIER] final partition:") != std::string::npos &&
+               "Expected log line '[HIER] final partition:' not found");
+    }
 
     // 6. Verify resulting partitions reflect per-device timing ratios
     //    Capacities: C0 = 1/10 = 0.1, C1 = 1/20 = 0.05
@@ -94,11 +108,12 @@ void test_hierarchical_timing_imbalance(dcl::Runtime& rt) {
     assert(std::fabs(timing_ratio - 2.0) < 1e-3);
 
     rt.clear_simulated_times();
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 void test_hierarchical_reverse_imbalance(dcl::Runtime& rt) {
-    std::cout << "[TEST] Running test_hierarchical_reverse_imbalance..." << std::endl;
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hierarchical_reverse_imbalance..." << std::endl;
 
     rt.set_simulated_devices_count(2);
 
@@ -114,18 +129,26 @@ void test_hierarchical_reverse_imbalance(dcl::Runtime& rt) {
     rt.set_simulated_times({0.020, 0.010});
 
     std::stringstream captured;
-    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
 
     const bool ok = rt.maybe_rebalance_hierarchical();
 
-    std::cout.rdbuf(old_buf);
-    const std::string out_str = captured.str();
-    std::cout << out_str;
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
 
     assert(ok);
-    assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    if (rank == 0) {
+        assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    }
 
     const auto& parts = rt.partitions();
     assert(parts.size() == 2);
@@ -141,11 +164,12 @@ void test_hierarchical_reverse_imbalance(dcl::Runtime& rt) {
     assert(std::fabs(ratio1 - (2.0 / 3.0)) < 1e-4);
 
     rt.clear_simulated_times();
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 void test_hierarchical_equal_times(dcl::Runtime& rt) {
-    std::cout << "[TEST] Running test_hierarchical_equal_times..." << std::endl;
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hierarchical_equal_times..." << std::endl;
 
     rt.set_simulated_devices_count(2);
 
@@ -160,18 +184,26 @@ void test_hierarchical_equal_times(dcl::Runtime& rt) {
     rt.set_simulated_times({0.015, 0.015});
 
     std::stringstream captured;
-    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
 
     const bool ok = rt.maybe_rebalance_hierarchical();
 
-    std::cout.rdbuf(old_buf);
-    const std::string out_str = captured.str();
-    std::cout << out_str;
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
 
     assert(ok);
-    assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    if (rank == 0) {
+        assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    }
 
     const auto& parts = rt.partitions();
     assert(parts.size() == 2);
@@ -179,11 +211,12 @@ void test_hierarchical_equal_times(dcl::Runtime& rt) {
     assert(parts[1].element_count == 500000);
 
     rt.clear_simulated_times();
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 void test_hierarchical_with_granularity(dcl::Runtime& rt) {
-    std::cout << "[TEST] Running test_hierarchical_with_granularity..." << std::endl;
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hierarchical_with_granularity..." << std::endl;
 
     rt.set_simulated_devices_count(2);
 
@@ -197,13 +230,19 @@ void test_hierarchical_with_granularity(dcl::Runtime& rt) {
     rt.set_simulated_times({0.010, 0.020});
 
     std::stringstream captured;
-    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
 
     const bool ok = rt.maybe_rebalance_hierarchical();
 
-    std::cout.rdbuf(old_buf);
-    const std::string out_str = captured.str();
-    std::cout << out_str;
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
 
     assert(ok);
     const auto& parts = rt.partitions();
@@ -220,11 +259,12 @@ void test_hierarchical_with_granularity(dcl::Runtime& rt) {
     assert(parts[0].element_count == 667000 || parts[0].element_count == 666000);
 
     rt.clear_simulated_times();
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 void test_hierarchical_with_registered_field(dcl::Runtime& rt) {
-    std::cout << "[TEST] Running test_hierarchical_with_registered_field..." << std::endl;
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hierarchical_with_registered_field..." << std::endl;
 
     rt.set_simulated_devices_count(2);
 
@@ -247,18 +287,26 @@ void test_hierarchical_with_registered_field(dcl::Runtime& rt) {
     rt.set_simulated_times({0.010, 0.020});
 
     std::stringstream captured;
-    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
 
     const bool ok = rt.maybe_rebalance_hierarchical({fh});
 
-    std::cout.rdbuf(old_buf);
-    const std::string out_str = captured.str();
-    std::cout << out_str;
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
 
     assert(ok);
-    assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
-    assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    if (rank == 0) {
+        assert(out_str.find("[HIER] intra-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] inter-node loads:") != std::string::npos);
+        assert(out_str.find("[HIER] final partition:") != std::string::npos);
+    }
 
     const auto& parts = rt.partitions();
     assert(parts.size() == 2);
@@ -266,11 +314,12 @@ void test_hierarchical_with_registered_field(dcl::Runtime& rt) {
     assert(parts[1].element_count == 333333);
 
     rt.clear_simulated_times();
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 void test_balance_mode_enum_and_policy() {
-    std::cout << "[TEST] Running test_balance_mode_enum_and_policy..." << std::endl;
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_balance_mode_enum_and_policy..." << std::endl;
 
     dcl::AutoBalancePolicy pol;
     pol.mode = dcl::BalanceMode::hierarchical;
@@ -304,13 +353,14 @@ void test_balance_mode_enum_and_policy() {
     }
     assert(mode_id == 5);
 
-    std::cout << "  -> PASS" << std::endl;
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     dcl::Runtime rt = dcl::Runtime::create(argc, argv);
+    const int rank = get_rank();
 
     test_balance_mode_enum_and_policy();
     test_hierarchical_timing_imbalance(rt);
@@ -319,7 +369,7 @@ int main(int argc, char** argv) {
     test_hierarchical_with_granularity(rt);
     test_hierarchical_with_registered_field(rt);
 
-    std::cout << "\nAll test_hierarchical unit tests PASSED successfully!" << std::endl;
+    if (rank == 0) std::cout << "\nAll test_hierarchical unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();
     return 0;
 }
