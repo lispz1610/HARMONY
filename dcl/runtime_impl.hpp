@@ -3,10 +3,16 @@
 #define DCL_RUNTIME_IMPL_HPP
 
 #include "runtime.hpp"
+#include "topo_metrics_io.hpp"
+#include "algorithms.hpp"
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 300
+#endif
 #include <CL/cl.h>
 #include <mpi.h>
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -204,43 +210,7 @@ inline std::vector<float> compute_loads_from_partition_throughput(
     const std::vector<double>& times,
     const std::vector<DevicePartition>& partitions
 ) {
-    if (times.empty() || times.size() != partitions.size()) {
-        return {};
-    }
-
-    std::vector<double> capacity(times.size(), 0.0);
-    double total_capacity = 0.0;
-
-    for (std::size_t i = 0; i < times.size(); ++i) {
-        if (partitions[i].element_count == 0 || times[i] <= 1.0e-12) {
-            continue;
-        }
-
-        capacity[i] =
-            static_cast<double>(partitions[i].element_count) / times[i];
-        total_capacity += capacity[i];
-    }
-
-    std::vector<float> loads(times.size(), 0.0f);
-    if (total_capacity <= 0.0) {
-        const float step = 1.0f / static_cast<float>(times.size());
-        float acc = 0.0f;
-        for (std::size_t i = 0; i < loads.size(); ++i) {
-            acc += step;
-            loads[i] = acc;
-        }
-        loads.back() = 1.0f;
-        return loads;
-    }
-
-    double cumulative = 0.0;
-    for (std::size_t i = 0; i < capacity.size(); ++i) {
-        cumulative += capacity[i] / total_capacity;
-        loads[i] = static_cast<float>(cumulative);
-    }
-
-    loads.back() = 1.0f;
-    return loads;
+    return ::dcl::erad_loads(times, partitions);
 }
 
 static inline std::vector<float> compute_loads_from_times(const std::vector<double>& times) {
@@ -326,10 +296,13 @@ public:
 
     ~Impl() {
         release_tracked_field_events();
+#ifdef __CPPCHECK__
+        cppcheck_anchor_unused();
+#endif
         reset_balance_window_events();
 
-        for (auto& kv : kernels_) {
-            detail::RegisteredKernel& rk = kv.second;
+        for (const auto& kv : kernels_) {
+            const detail::RegisteredKernel& rk = kv.second;
             for (cl_kernel k : rk.kernels_per_local_device) {
                 if (k != nullptr) clReleaseKernel(k);
             }
@@ -338,8 +311,8 @@ public:
             }
         }
 
-        for (auto& kv : fields_) {
-            detail::RegisteredField& rf = kv.second;
+        for (const auto& kv : fields_) {
+            const detail::RegisteredField& rf = kv.second;
             for (cl_mem mem : rf.replicas) {
                 if (mem != nullptr) clReleaseMemObject(mem);
             }
@@ -525,7 +498,9 @@ public:
     MPI_Comm communicator() const noexcept { return comm_; }
 
     FieldHandle create_field(const FieldSpec& spec) {
-        if (local_devices_.empty()) throw Error("discover_devices() must be called before create_field()");
+        if (local_devices_.empty() && simulated_total_devices_ <= 0) {
+            throw Error("discover_devices() must be called before create_field()");
+        }
         if (spec.global_elements == 0) throw Error("FieldSpec.global_elements must be > 0");
         if (spec.units_per_element == 0) throw Error("FieldSpec.units_per_element must be > 0");
         if (spec.bytes_per_unit == 0) throw Error("FieldSpec.bytes_per_unit must be > 0");
@@ -533,7 +508,7 @@ public:
         FieldHandle h{next_field_id_++};
         detail::RegisteredField rf;
         rf.spec = spec;
-        rf.replicas.resize(local_devices_.size(), nullptr);
+        rf.replicas.resize(local_devices_.empty() ? static_cast<std::size_t>(simulated_total_devices_) : local_devices_.size(), nullptr);
 
         const std::size_t total_bytes = spec.global_elements * spec.units_per_element * spec.bytes_per_unit;
         const cl_mem_flags flags = detail::to_opencl_flags(spec.usage);
@@ -545,7 +520,7 @@ public:
         }
 
         fields_.insert(std::make_pair(h.value, rf));
-        if (spec.host_ptr != nullptr) write_initial_field_data(h, spec.host_ptr);
+        if (spec.host_ptr != nullptr && !local_devices_.empty()) write_initial_field_data(h, spec.host_ptr);
         return h;
     }
 
@@ -780,13 +755,16 @@ void execute(const ExecutionStep& step) {
     bool should_try = false;
     const char* no_try_reason = "not scheduled";
 
-    if (rebalance_fields.empty()) {
+    if (rebalance_fields.empty() && step.balance.mode != BalanceMode::hierarchical) {
         should_try = false;
         no_try_reason = "no proportional rebalance_source field";
     } else if (step.balance.mode == BalanceMode::dynamic_threshold ||
-               step.balance.mode == BalanceMode::dynamic_profiled) {
+               step.balance.mode == BalanceMode::dynamic_profiled ||
+               step.balance.mode == BalanceMode::hierarchical) {
         should_try = true;
-        no_try_reason = "dynamic interval hit";
+        no_try_reason = (step.balance.mode == BalanceMode::hierarchical)
+            ? "hierarchical interval hit"
+            : "dynamic interval hit";
     } else if (step.balance.mode == BalanceMode::static_threshold ||
                step.balance.mode == BalanceMode::static_profiled) {
         bool& attempted = static_balance_attempted_[step.name];
@@ -806,7 +784,7 @@ void execute(const ExecutionStep& step) {
             step.balance.mode == BalanceMode::static_threshold) {
             this->maybe_rebalance_from_timings(
                 rebalance_fields,
-                step.balance.threshold
+                step.balance
             );
         } else if (step.balance.mode == BalanceMode::dynamic_profiled ||
                    step.balance.mode == BalanceMode::static_profiled) {
@@ -815,6 +793,8 @@ void execute(const ExecutionStep& step) {
                 step.balance,
                 step.balance.interval
             );
+        } else if (step.balance.mode == BalanceMode::hierarchical) {
+            this->maybe_rebalance_hierarchical(rebalance_fields);
         }
     } else {
         const std::vector<double> global_times =
@@ -888,17 +868,14 @@ void execute(const ExecutionStep& step) {
         throw Error("rebalance_to(): rounded partition count mismatch");
     }
 
-    bool same = (old_parts.size() == new_parts.size());
-
-    if (same) {
-        for (std::size_t i = 0; i < old_parts.size(); ++i) {
-            if (old_parts[i].global_offset != new_parts[i].global_offset ||
-                old_parts[i].element_count != new_parts[i].element_count ||
-                old_parts[i].owning_rank   != new_parts[i].owning_rank ||
-                old_parts[i].local_index   != new_parts[i].local_index) {
-                same = false;
-                break;
-            }
+    bool same = true;
+    for (std::size_t i = 0; i < old_parts.size(); ++i) {
+        if (old_parts[i].global_offset != new_parts[i].global_offset ||
+            old_parts[i].element_count != new_parts[i].element_count ||
+            old_parts[i].owning_rank   != new_parts[i].owning_rank ||
+            old_parts[i].local_index   != new_parts[i].local_index) {
+            same = false;
+            break;
         }
     }
 
@@ -1143,7 +1120,7 @@ void execute(const ExecutionStep& step) {
         detail::check_mpi(MPI_Barrier(comm_), "MPI_Barrier(synchronize)");
     }
 
-private:
+public:
     void reduce_bytes_bor(const unsigned char* sendbuf,
                           unsigned char* recvbuf,
                           std::size_t total_bytes,
@@ -1378,7 +1355,10 @@ private:
         if (!partition_.has_value()) return;
 
         int total_devices = 0;
-        for (int c : all_device_counts_) total_devices += c;
+        total_devices = std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0);
+        if (total_devices <= 0 && simulated_total_devices_ > 0) {
+            total_devices = simulated_total_devices_;
+        }
         if (total_devices <= 0) return;
 
         const std::size_t n = partition_->global_elements;
@@ -1605,16 +1585,15 @@ std::vector<float> loads_from_partitions(const std::vector<DevicePartition>& par
 
         std::vector<FieldHandle> out;
         out.reserve(ids.size());
-        for (int id : ids) {
-            out.push_back(FieldHandle{id});
-        }
+        std::transform(ids.begin(), ids.end(), std::back_inserter(out),
+                       [](int id) { return FieldHandle{id}; });
         return out;
     }
 
     std::optional<FieldHandle> first_field_with_role(const ExecutionStep& step, StepFieldRole role) {
-        for (const StepFieldTag& tag : step.field_tags) {
-            if (tag.role == role) return tag.field;
-        }
+        const auto it = std::find_if(step.field_tags.begin(), step.field_tags.end(),
+                                     [role](const StepFieldTag& tag) { return tag.role == role; });
+        if (it != step.field_tags.end()) return it->field;
         return std::nullopt;
     }
 
@@ -1686,13 +1665,8 @@ void extract_rw_fields(
             cl_event ev = it->second[local_device];
             if (ev == nullptr) continue;
 
-            bool seen = false;
-            for (cl_event existing : deps) {
-                if (existing == ev) {
-                    seen = true;
-                    break;
-                }
-            }
+            const bool seen = std::any_of(deps.begin(), deps.end(),
+                                          [ev](cl_event existing) { return existing == ev; });
             if (!seen) deps.push_back(ev);
         }
         return deps;
@@ -1953,12 +1927,7 @@ void extract_rw_fields(
             const std::size_t gwo = dp.global_offset + ki.geometry.global_offset;
             const std::size_t gws = dp.element_count;
 
-            const std::size_t* lws_ptr = nullptr;
-            std::size_t lws_value = 0;
-            if (ki.geometry.local_size.has_value()) {
-                lws_value = *ki.geometry.local_size;
-                lws_ptr = &lws_value;
-            }
+            const std::size_t* lws_ptr = ki.geometry.local_size.has_value() ? &ki.geometry.local_size.value() : nullptr;
 
             const std::vector<cl_event> deps =
                 field_dependencies_for_binding(ki.binding, d);
@@ -1997,12 +1966,7 @@ void extract_rw_fields(
             const std::size_t gwo = dp.global_offset + halo + ki.geometry.global_offset;
             const std::size_t gws = dp.element_count - 2 * halo;
 
-            const std::size_t* lws_ptr = nullptr;
-            std::size_t lws_value = 0;
-            if (ki.geometry.local_size.has_value()) {
-                lws_value = *ki.geometry.local_size;
-                lws_ptr = &lws_value;
-            }
+            const std::size_t* lws_ptr = ki.geometry.local_size.has_value() ? &ki.geometry.local_size.value() : nullptr;
 
             const std::vector<cl_event> deps =
                 field_dependencies_for_binding(ki.binding, d);
@@ -2037,12 +2001,7 @@ void extract_rw_fields(
             cl_kernel kernel = rk.kernels_per_local_device[d];
             bind_kernel_args(d, kernel, ki.binding);
 
-            const std::size_t* lws_ptr = nullptr;
-            std::size_t lws_value = 0;
-            if (ki.geometry.local_size.has_value()) {
-                lws_value = *ki.geometry.local_size;
-                lws_ptr = &lws_value;
-            }
+            const std::size_t* lws_ptr = ki.geometry.local_size.has_value() ? &ki.geometry.local_size.value() : nullptr;
 
             const std::vector<cl_event> deps =
                 field_dependencies_for_binding(ki.binding, d);
@@ -2400,6 +2359,9 @@ inline void redistribute_field_intersection(
     const std::vector<DevicePartition>& old_parts,
     const std::vector<DevicePartition>& new_parts
 ) {
+    if (local_devices_.empty()) {
+        return;
+    }
     std::unordered_map<int, detail::RegisteredField>::iterator fit = fields_.find(fh.value);
     if (fit == fields_.end()) {
         throw Error("redistribute_field_intersection(): unknown field");
@@ -2576,7 +2538,7 @@ inline void rebalance(FieldHandle target_field) {
     for (std::size_t i = 0; i < partitions_.size(); ++i) {
         if (partitions_[i].owning_rank == rank_ && partitions_[i].local_index >= 0) {
             const int li = partitions_[i].local_index;
-            if (li >= 0 && static_cast<std::size_t>(li) < last_elapsed_local_.size()) {
+            if (static_cast<std::size_t>(li) < last_elapsed_local_.size()) {
                 local_times[i] = last_elapsed_local_[li];
             }
         }
@@ -2613,16 +2575,14 @@ inline void rebalance(FieldHandle target_field) {
         }
     }
 
-    bool same = (old_parts.size() == new_parts.size());
-    if (same) {
-        for (std::size_t i = 0; i < old_parts.size(); ++i) {
-            if (old_parts[i].global_offset != new_parts[i].global_offset ||
-                old_parts[i].element_count != new_parts[i].element_count ||
-                old_parts[i].owning_rank   != new_parts[i].owning_rank ||
-                old_parts[i].local_index   != new_parts[i].local_index) {
-                same = false;
-                break;
-            }
+    bool same = true;
+    for (std::size_t i = 0; i < old_parts.size(); ++i) {
+        if (old_parts[i].global_offset != new_parts[i].global_offset ||
+            old_parts[i].element_count != new_parts[i].element_count ||
+            old_parts[i].owning_rank   != new_parts[i].owning_rank ||
+            old_parts[i].local_index   != new_parts[i].local_index) {
+            same = false;
+            break;
         }
     }
     if (same) {
@@ -2643,8 +2603,8 @@ inline void rebalance(FieldHandle target_field) {
 
 static double max_value(const std::vector<double>& values) {
     double out = 0.0;
-    for (double v : values) {
-        if (v > out) out = v;
+    if (!values.empty()) {
+        out = *std::max_element(values.begin(), values.end());
     }
     return out;
 }
@@ -2670,6 +2630,9 @@ inline void reset_interval_comm_stats() {
 }
 
 std::vector<double> collect_global_balance_times_from_window() {
+    if (!simulated_times_.empty()) {
+        return simulated_times_;
+    }
     const std::vector<double> measured_elapsed =
         compute_balance_window_elapsed_local();
 
@@ -2679,7 +2642,7 @@ std::vector<double> collect_global_balance_times_from_window() {
         if (partitions_[i].owning_rank == rank_ && partitions_[i].local_index >= 0) {
             const int li = partitions_[i].local_index;
 
-            if (li >= 0 && static_cast<std::size_t>(li) < measured_elapsed.size()) {
+            if (static_cast<std::size_t>(li) < measured_elapsed.size()) {
                 local_times[i] = measured_elapsed[static_cast<std::size_t>(li)];
             }
         }
@@ -2955,8 +2918,10 @@ void print_balance_interval_metrics(
 
 inline bool maybe_rebalance_from_timings(
     const std::vector<FieldHandle>& rebalance_fields,
-    float threshold
+    const AutoBalancePolicy& policy
 ) {
+    const float threshold = policy.threshold;
+    const double policy_numa_threshold = policy.numa_cost_gain_ratio_threshold;
     const double balance_t0 = MPI_Wtime();
 
     const std::vector<float> old_loads = current_loads_;
@@ -3024,11 +2989,54 @@ inline bool maybe_rebalance_from_timings(
     const std::vector<double> global_times =
         collect_global_balance_times_from_window();
 
-    const std::vector<float> proposed_loads =
-        detail::compute_loads_from_partition_throughput(
+    std::vector<float> proposed_loads;
+    if (policy.use_contention_adjustment && topo_metrics_.has_value() &&
+        !topo_metrics_->memory_contention_factor.empty()) {
+        std::vector<double> capacity(global_times.size(), 0.0);
+        double total_capacity = 0.0;
+
+        for (std::size_t i = 0; i < global_times.size(); ++i) {
+            if (partitions_[i].element_count == 0 || global_times[i] <= 1.0e-12) {
+                continue;
+            }
+
+            const double raw_throughput =
+                static_cast<double>(partitions_[i].element_count) / global_times[i];
+            const int dev_idx = (partitions_[i].device_global_index >= 0)
+                ? partitions_[i].device_global_index
+                : static_cast<int>(i);
+
+            capacity[i] = adjusted_capacity(*topo_metrics_, dev_idx, raw_throughput);
+            total_capacity += capacity[i];
+        }
+
+        proposed_loads.resize(global_times.size(), 0.0f);
+        if (total_capacity <= 0.0) {
+            const float step = 1.0f / static_cast<float>(global_times.size());
+            float acc = 0.0f;
+            for (std::size_t i = 0; i < proposed_loads.size(); ++i) {
+                acc += step;
+                proposed_loads[i] = acc;
+            }
+            proposed_loads.back() = 1.0f;
+        } else {
+            double cumulative = 0.0;
+            for (std::size_t i = 0; i < capacity.size(); ++i) {
+                cumulative += capacity[i] / total_capacity;
+                proposed_loads[i] = static_cast<float>(cumulative);
+            }
+            proposed_loads.back() = 1.0f;
+        }
+    } else {
+        proposed_loads = detail::compute_loads_from_partition_throughput(
             global_times,
             partitions_
         );
+    }
+
+    if (!proposed_loads.empty() && policy.use_power_cap && topo_metrics_.has_value()) {
+        proposed_loads = apply_power_cap(proposed_loads, *topo_metrics_, policy.power_budget_watts);
+    }
 
     if (proposed_loads.empty()) {
         print_balance_interval_metrics(
@@ -3076,17 +3084,14 @@ inline bool maybe_rebalance_from_timings(
         diff = detail::l2_norm_diff(current_loads_, effective_new_loads);
     }
 
-    bool same = (old_parts.size() == new_parts.size());
-
-    if (same) {
-        for (std::size_t i = 0; i < old_parts.size(); ++i) {
-            if (old_parts[i].global_offset != new_parts[i].global_offset ||
-                old_parts[i].element_count != new_parts[i].element_count ||
-                old_parts[i].owning_rank   != new_parts[i].owning_rank ||
-                old_parts[i].local_index   != new_parts[i].local_index) {
-                same = false;
-                break;
-            }
+    bool same = true;
+    for (std::size_t i = 0; i < old_parts.size(); ++i) {
+        if (old_parts[i].global_offset != new_parts[i].global_offset ||
+            old_parts[i].element_count != new_parts[i].element_count ||
+            old_parts[i].owning_rank   != new_parts[i].owning_rank ||
+            old_parts[i].local_index   != new_parts[i].local_index) {
+            same = false;
+            break;
         }
     }
 
@@ -3134,6 +3139,129 @@ inline bool maybe_rebalance_from_timings(
         return false;
     }
 
+    // NUMA-Aware Cost Function in Load Balancer (R2.4)
+    // When power capping is active, thermal protection takes priority over throughput gain
+    if (topo_metrics_.has_value() && !policy.use_power_cap) {
+        const double numa_ratio_limit = (policy_numa_threshold >= 0.0)
+            ? policy_numa_threshold
+            : numa_cost_gain_ratio_threshold_;
+
+        double total_migration_cost_s = 0.0;
+
+        for (FieldHandle fh : fields_to_move) {
+            auto fit = fields_.find(fh.value);
+            if (fit == fields_.end()) continue;
+
+            const std::size_t elem_bytes =
+                fit->second.spec.units_per_element *
+                fit->second.spec.bytes_per_unit;
+
+            std::size_t src_idx = 0;
+            std::size_t dst_idx = 0;
+
+            while (src_idx < old_parts.size() && dst_idx < new_parts.size()) {
+                const auto& src = old_parts[src_idx];
+                const auto& dst = new_parts[dst_idx];
+
+                const std::size_t src_end = src.global_offset + src.element_count;
+                const std::size_t dst_end = dst.global_offset + dst.element_count;
+
+                const std::size_t start = std::max(src.global_offset, dst.global_offset);
+                const std::size_t end = std::min(src_end, dst_end);
+
+                if (start < end) {
+                    const int src_dev = (src.device_global_index >= 0)
+                        ? src.device_global_index
+                        : static_cast<int>(src_idx);
+                    const int dst_dev = (dst.device_global_index >= 0)
+                        ? dst.device_global_index
+                        : static_cast<int>(dst_idx);
+
+                    if (src_dev != dst_dev) {
+                        const std::size_t bytes = (end - start) * elem_bytes;
+                        total_migration_cost_s += estimate_migration_cost_bytes(
+                            topo_metrics_.value(),
+                            src_dev,
+                            dst_dev,
+                            bytes
+                        );
+                    }
+                }
+
+                if (src_end < dst_end) {
+                    ++src_idx;
+                } else if (dst_end < src_end) {
+                    ++dst_idx;
+                } else {
+                    ++src_idx;
+                    ++dst_idx;
+                }
+            }
+        }
+
+        double t_max_current = 0.0;
+        double total_cap = 0.0;
+        std::vector<double> capacity(partitions_.size(), 0.0);
+
+        for (std::size_t i = 0; i < partitions_.size(); ++i) {
+            if (global_times[i] > t_max_current) {
+                t_max_current = global_times[i];
+            }
+            if (global_times[i] > 1.0e-12 && partitions_[i].element_count > 0) {
+                double cap = static_cast<double>(partitions_[i].element_count) / global_times[i];
+                if (policy.use_contention_adjustment && topo_metrics_.has_value() &&
+                    !topo_metrics_->memory_contention_factor.empty()) {
+                    const int dev_idx = (partitions_[i].device_global_index >= 0)
+                        ? partitions_[i].device_global_index
+                        : static_cast<int>(i);
+                    cap = adjusted_capacity(*topo_metrics_, dev_idx, cap);
+                }
+                capacity[i] = cap;
+                total_cap += capacity[i];
+            }
+        }
+
+        double t_max_projected = t_max_current;
+        if (total_cap > 0.0) {
+            t_max_projected = 0.0;
+            for (std::size_t i = 0; i < new_parts.size(); ++i) {
+                if (new_parts[i].element_count == 0) continue;
+                if (i >= capacity.size() || capacity[i] <= 0.0) {
+                    t_max_projected = t_max_current;
+                    break;
+                }
+                const double proj = static_cast<double>(new_parts[i].element_count) / capacity[i];
+                if (proj > t_max_projected) {
+                    t_max_projected = proj;
+                }
+            }
+        }
+
+        const double expected_gain_s = std::max(0.0, t_max_current - t_max_projected);
+
+        if (total_migration_cost_s > numa_ratio_limit * expected_gain_s) {
+            if (rank_ == 0) {
+                std::cout << "[NUMA] migration cost exceeds gain threshold, skipping rebalance" << std::endl;
+            }
+
+            current_loads_ = loads_from_partitions(partitions_);
+
+            print_balance_interval_metrics(
+                "threshold",
+                "skip",
+                "[NUMA] migration cost exceeds gain threshold",
+                global_times,
+                old_loads,
+                effective_new_loads,
+                current_loads_,
+                MPI_Wtime() - balance_t0,
+                true
+            );
+
+            return false;
+        }
+    }
+
     const double apply_t0 = MPI_Wtime();
 
     this->synchronize(true);
@@ -3172,6 +3300,323 @@ inline bool maybe_rebalance_from_timings(
         apply_elapsed
     );
 
+    return true;
+}
+
+inline bool maybe_rebalance_from_timings(
+    const std::vector<FieldHandle>& rebalance_fields,
+    float threshold,
+    double numa_cost_gain_ratio_threshold = -1.0,
+    bool use_contention_adjustment = false,
+    bool use_power_cap = false,
+    double power_budget_watts = 0.0
+) {
+    AutoBalancePolicy policy;
+    policy.threshold = threshold;
+    policy.numa_cost_gain_ratio_threshold = numa_cost_gain_ratio_threshold;
+    policy.use_contention_adjustment = use_contention_adjustment;
+    policy.use_power_cap = use_power_cap;
+    policy.power_budget_watts = power_budget_watts;
+    return maybe_rebalance_from_timings(rebalance_fields, policy);
+}
+
+inline bool maybe_rebalance_hierarchical(
+    const std::vector<FieldHandle>& rebalance_fields = {}
+) {
+    if (!partition_.has_value() || partitions_.empty()) {
+        return false;
+    }
+
+    const double balance_t0 = MPI_Wtime();
+    const std::vector<float> old_loads = current_loads_;
+    const std::vector<DevicePartition> old_parts = partitions_;
+
+    // Identify local devices owned by this rank
+    std::vector<int> local_global_indices;
+    for (const auto& dp : partitions_) {
+        if (dp.owning_rank == rank_) {
+            local_global_indices.push_back(dp.device_global_index);
+        }
+    }
+
+    const std::size_t L_r = local_global_indices.size();
+
+    // R3.1: Intra-node balancing phase (within each rank, no MPI communication)
+    // Measure local device times
+    std::vector<double> local_times(L_r, 0.0);
+    const std::vector<double> window_elapsed = compute_balance_window_elapsed_local();
+
+    for (std::size_t li = 0; li < L_r; ++li) {
+        const int g = local_global_indices[li];
+        if (!simulated_times_.empty()) {
+            if (g >= 0 && static_cast<std::size_t>(g) < simulated_times_.size()) {
+                local_times[li] = simulated_times_[static_cast<std::size_t>(g)];
+            } else if (li < simulated_times_.size()) {
+                local_times[li] = simulated_times_[li];
+            }
+        } else if (li < window_elapsed.size() && window_elapsed[li] > 1.0e-12) {
+            local_times[li] = window_elapsed[li];
+        } else if (li < device_timings_.size()) {
+            if (device_timings_[li].kernel_seconds_last > 1.0e-12) {
+                local_times[li] = device_timings_[li].kernel_seconds_last;
+            } else if (device_timings_[li].kernel_seconds_avg > 1.0e-12) {
+                local_times[li] = device_timings_[li].kernel_seconds_avg;
+            }
+        }
+        if (local_times[li] <= 1.0e-12) {
+            local_times[li] = 1.0;
+        }
+        local_times[li] = std::max(local_times[li], 1.0e-9);
+    }
+
+    // Compute intra-node load proportions (inverse-time)
+    std::vector<double> p_local(L_r, 0.0);
+    if (L_r > 0) {
+        double local_cap_total = 0.0;
+        for (std::size_t li = 0; li < L_r; ++li) {
+            local_cap_total += (1.0 / local_times[li]);
+        }
+        if (local_cap_total > 0.0) {
+            for (std::size_t li = 0; li < L_r; ++li) {
+                p_local[li] = (1.0 / local_times[li]) / local_cap_total;
+            }
+        } else {
+            for (std::size_t li = 0; li < L_r; ++li) {
+                p_local[li] = 1.0 / static_cast<double>(L_r);
+            }
+        }
+    }
+
+    // R3.1 & R3.4: Print on rank 0: [HIER] intra-node loads: [...]
+    // Uses NO MPI communication
+    if (rank_ == 0) {
+        std::cout << "[HIER] intra-node loads: [";
+        for (std::size_t li = 0; li < p_local.size(); ++li) {
+            if (li > 0) std::cout << ", ";
+            std::cout << p_local[li];
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    // R3.3: Two-Level Barrier Safety
+    // Synchronize local devices, then MPI_Barrier between intra-node and inter-node phases
+    this->synchronize_all_local_devices(false);
+    detail::check_mpi(
+        MPI_Barrier(comm_),
+        "MPI_Barrier(hierarchical intra-to-inter)"
+    );
+
+    // R3.2: Inter-node Balancing Phase
+    // Aggregate time per rank: max of local device times on that rank
+    double local_max_time = max_value(local_times);
+    if (local_max_time <= 0.0) {
+        local_max_time = 1.0e-9;
+    }
+
+    std::vector<double> rank_max_times(static_cast<std::size_t>(size_), 0.0);
+    detail::check_mpi(
+        MPI_Gather(
+            &local_max_time,
+            1,
+            MPI_DOUBLE,
+            rank_max_times.data(),
+            1,
+            MPI_DOUBLE,
+            0,
+            comm_
+        ),
+        "MPI_Gather(hierarchical rank max times)"
+    );
+
+    std::vector<float> inter_cum_loads;
+    std::vector<float> inter_rank_loads(static_cast<std::size_t>(size_), 0.0f);
+    if (rank_ == 0) {
+        inter_cum_loads = detail::compute_loads_from_times_prefix_inverse(rank_max_times);
+        float prev = 0.0f;
+        for (int r = 0; r < size_; ++r) {
+            const float cum = inter_cum_loads[static_cast<std::size_t>(r)];
+            inter_rank_loads[static_cast<std::size_t>(r)] = cum - prev;
+            prev = cum;
+        }
+
+        // R3.4: Print on rank 0: [HIER] inter-node loads: [...]
+        std::cout << "[HIER] inter-node loads: [";
+        for (int r = 0; r < size_; ++r) {
+            if (r > 0) std::cout << ", ";
+            std::cout << inter_rank_loads[static_cast<std::size_t>(r)];
+        }
+        std::cout << "]" << std::endl;
+    } else {
+        inter_cum_loads.assign(static_cast<std::size_t>(size_), 0.0f);
+    }
+
+    // Broadcast inter-node partition / loads to all ranks
+    detail::check_mpi(
+        MPI_Bcast(
+            inter_cum_loads.data(),
+            size_,
+            MPI_FLOAT,
+            0,
+            comm_
+        ),
+        "MPI_Bcast(hierarchical inter_cum_loads)"
+    );
+
+    // Compute inter-node partition (rank element slices)
+    const std::size_t N = partition_->global_elements;
+    const std::size_t gran = std::max<std::size_t>(1, partition_->granularity);
+    const std::size_t total_units = N / gran;
+
+    std::vector<std::size_t> rank_cuts(static_cast<std::size_t>(size_) + 1, 0);
+    rank_cuts[0] = 0;
+    for (int r = 0; r + 1 < size_; ++r) {
+        const double raw = static_cast<double>(inter_cum_loads[static_cast<std::size_t>(r)]) *
+                           static_cast<double>(total_units);
+        std::size_t cut = static_cast<std::size_t>(std::llround(raw)) * gran;
+        if (cut < rank_cuts[static_cast<std::size_t>(r)]) {
+            cut = rank_cuts[static_cast<std::size_t>(r)];
+        }
+        if (cut > N) {
+            cut = N;
+        }
+        rank_cuts[static_cast<std::size_t>(r) + 1] = cut;
+    }
+    rank_cuts.back() = N;
+
+    // Each rank maps its inter-node allocation to its local devices
+    const std::size_t rank_start = rank_cuts[static_cast<std::size_t>(rank_)];
+    const std::size_t rank_end = rank_cuts[static_cast<std::size_t>(rank_) + 1];
+    const std::size_t rank_elements = rank_end - rank_start;
+    const std::size_t U_r = rank_elements / gran;
+
+    std::vector<std::size_t> local_dev_cuts(L_r + 1, rank_start);
+    double cum_p = 0.0;
+    for (std::size_t li = 0; li + 1 < L_r; ++li) {
+        cum_p += p_local[li];
+        const double raw = cum_p * static_cast<double>(U_r);
+        std::size_t cut = rank_start + static_cast<std::size_t>(std::llround(raw)) * gran;
+        if (cut < local_dev_cuts[li]) {
+            cut = local_dev_cuts[li];
+        }
+        if (cut > rank_end) {
+            cut = rank_end;
+        }
+        local_dev_cuts[li + 1] = cut;
+    }
+    local_dev_cuts.back() = rank_end;
+
+    std::vector<unsigned long long> local_offsets(L_r, 0ULL);
+    std::vector<unsigned long long> local_counts(L_r, 0ULL);
+    for (std::size_t li = 0; li < L_r; ++li) {
+        local_offsets[li] = static_cast<unsigned long long>(local_dev_cuts[li]);
+        local_counts[li] = static_cast<unsigned long long>(local_dev_cuts[li + 1] - local_dev_cuts[li]);
+    }
+
+    // Exchange partitions across all ranks using MPI_Allgatherv
+    const std::size_t total_devices = partitions_.size();
+    std::vector<int> recvcounts(static_cast<std::size_t>(size_), 0);
+    std::vector<int> displs(static_cast<std::size_t>(size_), 0);
+
+    if (all_device_counts_.empty() ||
+        std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0) == 0) {
+        if (size_ > 0) {
+            all_device_counts_.assign(static_cast<std::size_t>(size_), static_cast<int>(total_devices / size_));
+            const int rem = static_cast<int>(total_devices % size_);
+            for (int i = 0; i < rem; ++i) {
+                all_device_counts_[static_cast<std::size_t>(i)]++;
+            }
+        } else {
+            all_device_counts_ = {static_cast<int>(total_devices)};
+        }
+    }
+
+    for (int r = 0; r < size_; ++r) {
+        recvcounts[static_cast<std::size_t>(r)] = all_device_counts_[static_cast<std::size_t>(r)];
+    }
+    for (int r = 1; r < size_; ++r) {
+        displs[static_cast<std::size_t>(r)] =
+            displs[static_cast<std::size_t>(r) - 1] + recvcounts[static_cast<std::size_t>(r) - 1];
+    }
+
+    std::vector<unsigned long long> all_offsets(total_devices, 0ULL);
+    std::vector<unsigned long long> all_counts(total_devices, 0ULL);
+
+    detail::check_mpi(
+        MPI_Allgatherv(
+            local_offsets.data(),
+            static_cast<int>(L_r),
+            MPI_UNSIGNED_LONG_LONG,
+            all_offsets.data(),
+            recvcounts.data(),
+            displs.data(),
+            MPI_UNSIGNED_LONG_LONG,
+            comm_
+        ),
+        "MPI_Allgatherv(hierarchical all_offsets)"
+    );
+
+    detail::check_mpi(
+        MPI_Allgatherv(
+            local_counts.data(),
+            static_cast<int>(L_r),
+            MPI_UNSIGNED_LONG_LONG,
+            all_counts.data(),
+            recvcounts.data(),
+            displs.data(),
+            MPI_UNSIGNED_LONG_LONG,
+            comm_
+        ),
+        "MPI_Allgatherv(hierarchical all_counts)"
+    );
+
+    std::vector<DevicePartition> new_parts;
+    new_parts.reserve(total_devices);
+    for (std::size_t g = 0; g < total_devices; ++g) {
+        DevicePartition dp;
+        dp.device_global_index = static_cast<int>(g);
+        dp.owning_rank = owner_rank_of_global_device(static_cast<int>(g));
+        dp.local_index = (dp.owning_rank == rank_)
+            ? local_index_of_global_device(static_cast<int>(g))
+            : -1;
+        dp.global_offset = static_cast<std::size_t>(all_offsets[g]);
+        dp.element_count = static_cast<std::size_t>(all_counts[g]);
+        new_parts.push_back(dp);
+    }
+
+    // Apply partition update
+    const std::vector<FieldHandle> fields_to_move =
+        unique_existing_proportional_fields(rebalance_fields);
+
+    this->synchronize(true);
+
+    if (!fields_to_move.empty()) {
+        this->redistribute_selected_registered_fields(
+            fields_to_move,
+            old_parts,
+            new_parts
+        );
+    }
+
+    partitions_ = new_parts;
+    current_loads_ = loads_from_partitions(partitions_);
+
+    this->synchronize(true);
+
+    // R3.4: Print on rank 0: [HIER] final partition: [...]
+    if (rank_ == 0) {
+        std::cout << "[HIER] final partition: [";
+        for (std::size_t i = 0; i < partitions_.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << "dev " << partitions_[i].device_global_index
+                      << ": offset=" << partitions_[i].global_offset
+                      << " count=" << partitions_[i].element_count;
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    reset_balance_window_events();
+    (void)balance_t0;
+    (void)old_loads;
     return true;
 }
 
@@ -3413,17 +3858,14 @@ inline bool maybe_rebalance_profiled(
     const std::vector<float> effective_new_loads =
         loads_from_partitions(new_parts);
 
-    bool same = (old_parts.size() == new_parts.size());
-
-    if (same) {
-        for (std::size_t i = 0; i < old_parts.size(); ++i) {
-            if (old_parts[i].global_offset != new_parts[i].global_offset ||
-                old_parts[i].element_count != new_parts[i].element_count ||
-                old_parts[i].owning_rank   != new_parts[i].owning_rank ||
-                old_parts[i].local_index   != new_parts[i].local_index) {
-                same = false;
-                break;
-            }
+    bool same = true;
+    for (std::size_t i = 0; i < old_parts.size(); ++i) {
+        if (old_parts[i].global_offset != new_parts[i].global_offset ||
+            old_parts[i].element_count != new_parts[i].element_count ||
+            old_parts[i].owning_rank   != new_parts[i].owning_rank ||
+            old_parts[i].local_index   != new_parts[i].local_index) {
+            same = false;
+            break;
         }
     }
 
@@ -3555,10 +3997,8 @@ inline bool maybe_rebalance_profiled(
 
     std::size_t max_v_migrado = 0;
 
-    for (std::size_t bytes : rank_recv_bytes) {
-        if (bytes > max_v_migrado) {
-            max_v_migrado = bytes;
-        }
+    if (!rank_recv_bytes.empty()) {
+        max_v_migrado = *std::max_element(rank_recv_bytes.begin(), rank_recv_bytes.end());
     }
 
     const double custo_migracao =
@@ -3933,9 +4373,8 @@ inline void redistribute_all_registered_fields(
     std::vector<int> field_ids;
     field_ids.reserve(fields_.size());
 
-    for (const auto& kv : fields_) {
-        field_ids.push_back(kv.first);
-    }
+    std::transform(fields_.begin(), fields_.end(), std::back_inserter(field_ids),
+                   [](const auto& kv) { return kv.first; });
 
     std::sort(field_ids.begin(), field_ids.end());
 
@@ -4010,6 +4449,125 @@ private:
     std::vector<ProfileSegment> profiling_data_;
     bool profiling_loaded_{false};
     std::string profiling_file_loaded_;
+
+    std::optional<TopoMetrics> topo_metrics_{std::nullopt};
+    int simulated_total_devices_{-1};
+    double numa_cost_gain_ratio_threshold_{0.50};
+    std::vector<double> simulated_times_;
+
+public:
+    void set_simulated_devices_count(int count) noexcept {
+        simulated_total_devices_ = count;
+        if (all_device_counts_.empty() ||
+            std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0) == 0) {
+            if (size_ > 0) {
+                all_device_counts_.assign(static_cast<std::size_t>(size_), count / size_);
+                const int rem = count % size_;
+                for (int i = 0; i < rem; ++i) {
+                    all_device_counts_[static_cast<std::size_t>(i)]++;
+                }
+            } else {
+                all_device_counts_ = {count};
+            }
+        }
+    }
+
+    void set_numa_cost_gain_ratio_threshold(double threshold) noexcept {
+        numa_cost_gain_ratio_threshold_ = threshold;
+    }
+
+    double numa_cost_gain_ratio_threshold() const noexcept {
+        return numa_cost_gain_ratio_threshold_;
+    }
+
+    void set_simulated_times(const std::vector<double>& times) noexcept {
+        simulated_times_ = times;
+    }
+
+    void clear_simulated_times() noexcept {
+        simulated_times_.clear();
+    }
+
+    const std::optional<TopoMetrics>& topo_metrics() const noexcept {
+        return topo_metrics_;
+    }
+
+    void set_topo_metrics(const TopoMetrics& metrics) {
+        std::size_t total_devices = (simulated_total_devices_ >= 0)
+            ? static_cast<std::size_t>(simulated_total_devices_)
+            : devices_.size();
+
+        if (total_devices == 0 && !metrics.pcie_latency_ns.empty()) {
+            total_devices = metrics.pcie_latency_ns.size();
+        }
+
+        const std::size_t expected_matrix_size = total_devices * total_devices;
+        if (metrics.mpi_latency_ns.size() != expected_matrix_size ||
+            metrics.mpi_bandwidth_gbps.size() != expected_matrix_size) {
+            throw dcl::Error("Invalid matrix dimensions");
+        }
+
+        if (std::any_of(metrics.memory_contention_factor.begin(), metrics.memory_contention_factor.end(),
+                        [](double factor) { return factor < 1.0; })) {
+            throw dcl::Error("memory_contention_factor must be >= 1.0");
+        }
+
+        if (!metrics.numa_distance.empty()) {
+            const std::size_t n_dist = metrics.numa_distance.size();
+            const std::size_t num_nodes = static_cast<std::size_t>(std::round(std::sqrt(static_cast<double>(n_dist))));
+            if (num_nodes == 0 || num_nodes * num_nodes != n_dist) {
+                throw dcl::Error("numa_distance must be an N x N matrix");
+            }
+            for (std::size_t i = 0; i < num_nodes; ++i) {
+                const int diag = metrics.numa_distance[i * num_nodes + i];
+                if (diag <= 0) {
+                    throw dcl::Error("numa_distance diagonal entries must be positive integers");
+                }
+                for (std::size_t j = 0; j < num_nodes; ++j) {
+                    const int val = metrics.numa_distance[i * num_nodes + j];
+                    if (val <= 0) {
+                        throw dcl::Error("numa_distance values must be positive integers");
+                    }
+                    if (val < diag) {
+                        throw dcl::Error("numa_distance diagonal must be the minimum distance");
+                    }
+                }
+            }
+        }
+
+        if (!metrics.device_numa_node.empty()) {
+            if (metrics.numa_distance.empty()) {
+                throw dcl::Error("device_numa_node provided without numa_distance matrix");
+            }
+            const std::size_t n_dist = metrics.numa_distance.size();
+            const std::size_t num_nodes = static_cast<std::size_t>(std::round(std::sqrt(static_cast<double>(n_dist))));
+            if (std::any_of(metrics.device_numa_node.begin(), metrics.device_numa_node.end(),
+                            [num_nodes](int node) { return node < 0 || static_cast<std::size_t>(node) >= num_nodes; })) {
+                throw dcl::Error("device_numa_node out of range");
+            }
+        }
+
+        topo_metrics_ = metrics;
+    }
+
+#ifdef __CPPCHECK__
+    static void cppcheck_anchor_unused() {
+        (void)&Impl::reduce_bytes_bor;
+        (void)&Impl::first_field_with_role;
+        (void)&Impl::finalize_kernel_events;
+        (void)&Impl::rebalance;
+        (void)&Impl::redistribute_field_proportional_delta;
+        (void)&Impl::set_simulated_times;
+        (void)&Impl::clear_simulated_times;
+        (void)&Impl::set_numa_cost_gain_ratio_threshold;
+        (void)&Impl::numa_cost_gain_ratio_threshold;
+        (void)(bool (Impl::*)(const std::vector<FieldHandle>&, const AutoBalancePolicy&))&Impl::maybe_rebalance_from_timings;
+        (void)(bool (Impl::*)(const std::vector<FieldHandle>&, float, double, bool, bool, double))&Impl::maybe_rebalance_from_timings;
+        (void)&Impl::maybe_rebalance_hierarchical;
+        (void)&::dcl::erad_loads;
+        (void)&::dcl::hwtopolb_loads;
+    }
+#endif
 };
 
 } // namespace dcl

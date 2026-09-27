@@ -75,6 +75,34 @@ public:
     void gather(FieldHandle field, void* host_dst, std::size_t bytes);
     void synchronize(bool force_finish = false);
 
+    void set_topo_metrics(const TopoMetrics& metrics);
+    const std::optional<TopoMetrics>& topo_metrics() const noexcept;
+    void set_simulated_devices_count(int count) noexcept;
+
+    void set_numa_cost_gain_ratio_threshold(double threshold) noexcept;
+    double numa_cost_gain_ratio_threshold() const noexcept;
+
+    void set_simulated_times(const std::vector<double>& times) noexcept;
+    void clear_simulated_times() noexcept;
+
+    bool maybe_rebalance_from_timings(
+        const std::vector<FieldHandle>& rebalance_fields,
+        float threshold,
+        double numa_cost_gain_ratio_threshold = 0.50,
+        bool use_contention_adjustment = false,
+        bool use_power_cap = false,
+        double power_budget_watts = 0.0
+    );
+
+    bool maybe_rebalance_from_timings(
+        const std::vector<FieldHandle>& rebalance_fields,
+        const AutoBalancePolicy& policy
+    );
+
+    bool maybe_rebalance_hierarchical(
+        const std::vector<FieldHandle>& rebalance_fields = {}
+    );
+
 private:
     class Impl;
     explicit Runtime(std::unique_ptr<Impl> impl);

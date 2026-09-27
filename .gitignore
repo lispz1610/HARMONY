@@ -1,4 +1,50 @@
-job_dcl.out
+# ─── Compiled binaries ────────────────────────────────────────────────────────
+*.out
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+
+# ─── Build artefacts ──────────────────────────────────────────────────────────
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.cmake
+
+# ─── Profiling / timing outputs ───────────────────────────────────────────────
+profiling_results.txt
+profiling.out
+HIS.out
 gmon.out
 gabarito.out
+job_dcl.out
 teste_250.out
+job_mpiocl.out
+
+# ─── Benchmark CSV results (generated at runtime) ─────────────────────────────
+benchmarks/*.csv
+
+# ─── Topology probe JSON (generated at runtime) ───────────────────────────────
+test_probe.json
+topo_metrics_*.json
+
+# ─── MPI / PBS job logs ───────────────────────────────────────────────────────
+*.pbs.o*
+*.pbs.e*
+Results/
+
+# ─── Editor & OS noise ────────────────────────────────────────────────────────
+.agents/
+ORIGINAL_REQUEST.md
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
