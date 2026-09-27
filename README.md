@@ -166,7 +166,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 - **`tests/test_algorithms.cpp`** *(new)* — 3 unit tests validating: ERAD produces valid monotone cumulative loads, HWTOPOLB with `perturbation_factor=0` matches ERAD output, and `apply_power_cap()` preserves load vector validity.
 
-**Benchmark results** (measured on cluster, `select=2:ncpus=16:mpiprocs=16`):
+**Benchmark results** (measured locally in test environment via `compare_algos.sh` with N=1,000,000, 100 iterations; submit `job_hwtopolb.pbs` on cluster to collect real cluster numbers):
 
 | Benchmark | Algorithm | Total Time (s) | Rebalances | Avg Gain (s) |
 |:---|:---|:---:|:---:|:---:|
