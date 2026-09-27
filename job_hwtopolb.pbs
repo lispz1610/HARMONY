@@ -1,0 +1,42 @@
+#!/bin/bash
+#----------------------------------------------------------
+# Job name
+#PBS -N hwtopolb_eval
+
+# Output files
+#PBS -j oe
+#PBS -o hwtopolb_eval.out
+
+# Run time
+#PBS -l walltime=01:00:00
+
+# Resource allocation (2 chunks, 16 CPUs, 16 MPI processes each)
+#PBS -l select=2:ncpus=16:mpiprocs=16
+#----------------------------------------------------------
+
+# Change to submission directory
+cd $PBS_O_WORKDIR
+
+echo "=== Allocated Nodes ==="
+cat $PBS_NODEFILE
+echo ""
+
+# Ensure proper modules are loaded as recommended by the cluster guide
+module purge
+module load gcc/13.2.0
+module load openmpi5/5.0.5
+
+# Step 1: Compile and run topo_probe to collect cluster metrics
+echo "=== Compiling topo_probe ==="
+mpic++ -std=c++20 -Wall -Wextra -O2 topo_probe.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o topo_probe.out
+
+echo "=== Running topo_probe ==="
+mpirun ./topo_probe.out --output-json topo_metrics_cluster.json
+echo ""
+
+# Step 2: Compile and run benchmarks (ERAD vs HWTOPOLB)
+echo "=== Running Algorithm Comparison ==="
+export MPI_LAUNCHER="mpirun"
+bash ./benchmarks/compare_algos.sh
+
+echo "=== Job Completed ==="

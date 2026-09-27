@@ -22,18 +22,20 @@ CSV_KN_HW="${SCRIPT_DIR}/kneighbor_hwtopolb.csv"
 CSV_MD_ERAD="${SCRIPT_DIR}/leanmd_erad.csv"
 CSV_MD_HW="${SCRIPT_DIR}/leanmd_hwtopolb.csv"
 
+MPI_LAUNCHER=${MPI_LAUNCHER:-}
+
 echo "=== Running R4 Benchmarks (ERAD vs HWTOPOLB) ==="
 echo "Running kneighbor (erad)..."
-"${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_KN_ERAD}" > /dev/null
+${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_KN_ERAD}" > /dev/null
 
 echo "Running kneighbor (hwtopolb)..."
-"${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_KN_HW}" > /dev/null
+${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_KN_HW}" > /dev/null
 
 echo "Running leanmd (erad)..."
-"${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_MD_ERAD}" > /dev/null
+${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_MD_ERAD}" > /dev/null
 
 echo "Running leanmd (hwtopolb)..."
-"${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_MD_HW}" > /dev/null
+${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_MD_HW}" > /dev/null
 
 echo ""
 python3 - "${ROOT_DIR}" << 'PYEOF'
