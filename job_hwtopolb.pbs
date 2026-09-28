@@ -3,14 +3,14 @@
 # Job name
 #PBS -N hwtopolb_eval
 
-# Output files
+# Output files (merged stdout and stderr)
 #PBS -j oe
 #PBS -o hwtopolb_eval.out
 
 # Run time
 #PBS -l walltime=01:00:00
 
-# Resource allocation (2 chunks, 16 CPUs, 16 MPI processes each)
+# Resource allocation (2 chunks, 16 CPUs, 16 MPI processes each = 32 total)
 #PBS -l select=2:ncpus=16:mpiprocs=16
 #----------------------------------------------------------
 
@@ -21,22 +21,47 @@ echo "=== Allocated Nodes ==="
 cat $PBS_NODEFILE
 echo ""
 
-# Ensure proper modules are loaded as recommended by the cluster guide
+# Ensure proper modules are loaded as recommended by cluster guide v5.0 (Section 10.6)
 module purge
 module load gcc/13.2.0
 module load openmpi5/5.0.5
 
-# Step 1: Compile and run topo_probe to collect cluster metrics
-echo "=== Compiling topo_probe ==="
-mpic++ -std=c++20 -Wall -Wextra -O2 topo_probe.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o topo_probe.out
+# Optional: if nodes have AMD EPYC 7713 (compute-1-*), architecture flags can be used
+ARCH_FLAGS="-march=znver3"
 
-echo "=== Running topo_probe ==="
+# ---------------------------------------------------------
+# Step 1: Run Unit Tests on the Cluster (R1 - R5)
+# ---------------------------------------------------------
+echo "=== Step 1: Compiling and Running Unit Tests ==="
+for test_src in tests/test_*.cpp; do
+    test_bin="${test_src%.cpp}.out"
+    echo "Compiling ${test_src}..."
+    mpic++ -std=c++20 -Wall -Wextra -O2 "${test_src}" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${test_bin}"
+    
+    echo "Running ${test_bin}..."
+    if [[ "${test_bin}" == *"hierarchical"* ]]; then
+        # Hierarchical test requires at least 2 ranks
+        mpirun -n 2 "./${test_bin}"
+    else
+        mpirun -n 1 "./${test_bin}"
+    fi
+    echo ""
+done
+
+# ---------------------------------------------------------
+# Step 2: Measure Cluster Topology (PCIe & MPI Interconnect)
+# ---------------------------------------------------------
+echo "=== Step 2: Running Topology Probe ==="
+mpic++ -std=c++20 -Wall -Wextra -O2 topo_probe.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o topo_probe.out
 mpirun ./topo_probe.out --output-json topo_metrics_cluster.json
 echo ""
 
-# Step 2: Compile and run benchmarks (ERAD vs HWTOPOLB)
-echo "=== Running Algorithm Comparison ==="
+# ---------------------------------------------------------
+# Step 3: Run Algorithm Comparison Benchmarks (ERAD vs HWTOPOLB)
+# ---------------------------------------------------------
+echo "=== Step 3: Running ERAD vs HWTOPOLB Comparison ==="
 export MPI_LAUNCHER="mpirun"
 bash ./benchmarks/compare_algos.sh
 
-echo "=== Job Completed ==="
+echo ""
+echo "=== All Evaluations Completed Successfully ==="
