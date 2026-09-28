@@ -177,9 +177,15 @@ inline std::vector<float> compute_loads_from_times_prefix_inverse(
     double capacidade_total = 0.0;
 
     for (int i = 0; i < participantes; ++i) {
-        const double t = std::max(tempos_medidos[static_cast<std::size_t>(i)], 1.0e-9);
-        capacidade[static_cast<std::size_t>(i)] = 1.0 / t;
-        capacidade_total += capacidade[static_cast<std::size_t>(i)];
+        const double t = tempos_medidos[static_cast<std::size_t>(i)];
+        // A zero or negative time means the participant has no devices / zero capacity.
+        // Do NOT clamp to 1e-9: that would assign enormous (1/1e-9) capacity to
+        // device-less ranks, causing their allocated elements to vanish from the partition.
+        if (t > 0.0) {
+            capacidade[static_cast<std::size_t>(i)] = 1.0 / t;
+            capacidade_total += capacidade[static_cast<std::size_t>(i)];
+        }
+        // else capacidade[i] stays 0.0 — this rank gets zero load share
     }
 
     if (capacidade_total <= 0.0) {
@@ -3407,11 +3413,15 @@ inline bool maybe_rebalance_hierarchical(
     );
 
     // R3.2: Inter-node Balancing Phase
-    // Aggregate time per rank: max of local device times on that rank
-    double local_max_time = max_value(local_times);
-    if (local_max_time <= 0.0) {
+    // Aggregate time per rank: max of local device times on that rank.
+    // If this rank has no devices (L_r == 0), use 0.0 to signal zero capacity.
+    double local_max_time = (L_r > 0) ? max_value(local_times) : 0.0;
+    if (L_r > 0 && local_max_time <= 0.0) {
+        // Devices exist but reported zero time — use a small positive sentinel so
+        // they still participate with finite (but very high) capacity.
         local_max_time = 1.0e-9;
     }
+    // Ranks with L_r == 0 keep local_max_time = 0.0 → zero capacity → zero elements.
 
     std::vector<double> rank_max_times(static_cast<std::size_t>(size_), 0.0);
     detail::check_mpi(
@@ -3581,6 +3591,42 @@ inline bool maybe_rebalance_hierarchical(
         dp.global_offset = static_cast<std::size_t>(all_offsets[g]);
         dp.element_count = static_cast<std::size_t>(all_counts[g]);
         new_parts.push_back(dp);
+    }
+
+    // C1 fix: Collective invariant check — sum(element_count) must equal global_elements.
+    // Every rank performs this check so that a silent loss of elements is caught immediately
+    // rather than producing incorrect results without any diagnostic.
+    {
+        const std::size_t expected = partition_->global_elements;
+        std::size_t covered = 0;
+        for (const auto& dp : new_parts) {
+            covered += dp.element_count;
+        }
+        // Use MPI_Allreduce with MPI_MIN to verify that ALL ranks compute the same covered
+        // count (they should, since new_parts is replicated). Any discrepancy also fires here.
+        unsigned long long covered_ull = static_cast<unsigned long long>(covered);
+        unsigned long long min_covered = 0;
+        unsigned long long max_covered = 0;
+        detail::check_mpi(
+            MPI_Allreduce(&covered_ull, &min_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+            "MPI_Allreduce(C1 partition conservation min)"
+        );
+        detail::check_mpi(
+            MPI_Allreduce(&covered_ull, &max_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+            "MPI_Allreduce(C1 partition conservation max)"
+        );
+        if (min_covered != static_cast<unsigned long long>(expected) ||
+            max_covered != static_cast<unsigned long long>(expected)) {
+            // Abort with a descriptive message rather than silently accepting a broken partition.
+            if (rank_ == 0) {
+                std::cerr << "[HIER][C1 ERROR] Partition invariant violated: "
+                          << "covered=" << min_covered << ".." << max_covered
+                          << " expected=" << expected
+                          << ". Partition not applied.\n";
+            }
+            // Return false: caller may retry or fall back. Do NOT update partitions_.
+            return false;
+        }
     }
 
     // Apply partition update

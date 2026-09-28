@@ -356,6 +356,79 @@ void test_balance_mode_enum_and_policy() {
     if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
+void test_c1_no_element_loss_with_more_ranks_than_devices(int argc, char** argv) {
+    const int rank = get_rank();
+    int size = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (rank == 0) {
+        std::cout << "[TEST] Running test_c1_no_element_loss_with_more_ranks_than_devices"
+                  << " (size=" << size << ")..." << std::endl;
+    }
+
+    // Create a fresh Runtime so all_device_counts_ starts empty.
+    dcl::Runtime rt2 = dcl::Runtime::create(argc, argv);
+
+    // 1 total device across 'size' ranks — only rank 0 has a device.
+    rt2.set_simulated_devices_count(1);
+
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1200000; // reproduces the audit scenario (4 ranks, 3 devices)
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = 4;
+    ps.granularity = 1;
+    rt2.set_partition(ps);
+
+    // Only 1 partition exists (1 device).
+    const auto& init_parts = rt2.partitions();
+    if (rank == 0) {
+        assert(init_parts.size() == 1 && "Expected 1 partition for 1 total device");
+        assert(init_parts[0].element_count == 1200000 && "Initial partition must cover all elements");
+    }
+
+    // Simulate a kernel time only for device 0 (rank 0 owns it).
+    // Rank 1+ has no device, so local_max_time must become 0.0 (zero capacity).
+    rt2.set_simulated_times({0.010}); // only 1 device has timing
+
+    std::stringstream captured;
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
+
+    const bool ok = rt2.maybe_rebalance_hierarchical();
+
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
+
+    // The rebalance must succeed (return true).
+    assert(ok && "maybe_rebalance_hierarchical must return true");
+
+    // Critical invariant: sum(element_count) == global_elements.
+    // With the old code this would be 0 (all elements lost); with the fix it's 1200000.
+    const auto& parts = rt2.partitions();
+    std::size_t covered = 0;
+    for (const auto& dp : parts) {
+        covered += dp.element_count;
+    }
+    if (rank == 0) {
+        assert(covered == 1200000 &&
+               "C1 regression: sum(element_count) != global_elements — elements were lost!");
+        assert(parts.size() == 1 && "Expected exactly 1 partition (1 device)");
+        // All elements must be assigned to the only device (rank 1 has zero capacity).
+        assert(parts[0].element_count == 1200000 &&
+               "All elements must go to rank 0's device — rank 1 has zero capacity");
+        assert(parts[0].global_offset == 0);
+        std::cout << "[C1 CHECK] covered=" << covered << " expected=1200000 OK\n";
+    }
+
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -368,6 +441,7 @@ int main(int argc, char** argv) {
     test_hierarchical_equal_times(rt);
     test_hierarchical_with_granularity(rt);
     test_hierarchical_with_registered_field(rt);
+    test_c1_no_element_loss_with_more_ranks_than_devices(argc, argv);
 
     if (rank == 0) std::cout << "\nAll test_hierarchical unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();
