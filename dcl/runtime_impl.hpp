@@ -4559,9 +4559,14 @@ public:
     }
 
     void set_topo_metrics(const TopoMetrics& metrics) {
+        std::size_t global_device_count = 0;
+        for (int count : all_device_counts_) {
+            global_device_count += count;
+        }
+
         std::size_t total_devices = (simulated_total_devices_ >= 0)
             ? static_cast<std::size_t>(simulated_total_devices_)
-            : devices_.size();
+            : global_device_count;
 
         if (total_devices == 0 && !metrics.pcie_latency_ns.empty()) {
             total_devices = metrics.pcie_latency_ns.size();
@@ -4571,6 +4576,25 @@ public:
         if (metrics.mpi_latency_ns.size() != expected_matrix_size ||
             metrics.mpi_bandwidth_gbps.size() != expected_matrix_size) {
             throw dcl::Error("Invalid matrix dimensions");
+        }
+
+        if (!metrics.pcie_latency_ns.empty() && metrics.pcie_latency_ns.size() != total_devices) {
+            throw dcl::Error("Invalid pcie_latency_ns dimensions");
+        }
+        if (!metrics.pcie_bandwidth_gbps.empty() && metrics.pcie_bandwidth_gbps.size() != total_devices) {
+            throw dcl::Error("Invalid pcie_bandwidth_gbps dimensions");
+        }
+        if (!metrics.device_numa_node.empty() && metrics.device_numa_node.size() != total_devices) {
+            throw dcl::Error("Invalid device_numa_node dimensions");
+        }
+        if (!metrics.memory_contention_factor.empty() && metrics.memory_contention_factor.size() != total_devices) {
+            throw dcl::Error("Invalid memory_contention_factor dimensions");
+        }
+        if (!metrics.thermal_tdp_watts.empty() && metrics.thermal_tdp_watts.size() != total_devices) {
+            throw dcl::Error("Invalid thermal_tdp_watts dimensions");
+        }
+        if (!metrics.current_power_watts.empty() && metrics.current_power_watts.size() != total_devices) {
+            throw dcl::Error("Invalid current_power_watts dimensions");
         }
 
         if (std::any_of(metrics.memory_contention_factor.begin(), metrics.memory_contention_factor.end(),

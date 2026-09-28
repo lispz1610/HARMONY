@@ -73,6 +73,32 @@ void test_reject_wrong_dimensions(dcl::Runtime& rt) {
         }
         assert(caught && "Expected dcl::Error for invalid mpi_bandwidth_gbps dimension");
     }
+
+    // Case 3: pcie_latency_ns wrong size (3 instead of 2)
+    {
+        dcl::TopoMetrics bad = base;
+        bad.pcie_latency_ns = {4200.0, 4300.0, 4400.0};
+        bool caught = false;
+        try {
+            rt.set_topo_metrics(bad);
+        } catch (const dcl::Error&) {
+            caught = true;
+        }
+        assert(caught && "Expected dcl::Error for invalid pcie_latency_ns dimension");
+    }
+
+    // Case 4: memory_contention_factor wrong size (1 instead of 2)
+    {
+        dcl::TopoMetrics bad = base;
+        bad.memory_contention_factor = {1.5};
+        bool caught = false;
+        try {
+            rt.set_topo_metrics(bad);
+        } catch (const dcl::Error&) {
+            caught = true;
+        }
+        assert(caught && "Expected dcl::Error for invalid memory_contention_factor dimension");
+    }
     std::cout << "  -> PASS" << std::endl;
 }
 
@@ -212,6 +238,32 @@ void test_helpers() {
     std::cout << "  -> PASS" << std::endl;
 }
 
+void test_topology_larger_than_local(dcl::Runtime& rt) {
+    std::cout << "[TEST] Running test_topology_larger_than_local..." << std::endl;
+    // Set simulated devices to 4 (representing 2 per rank for 2 ranks, for example)
+    // The local rank might only have 2, but the topology should represent all 4.
+    rt.set_simulated_devices_count(4);
+
+    dcl::TopoMetrics m;
+    m.pcie_latency_ns = {4000.0, 4000.0, 4000.0, 4000.0};
+    m.pcie_bandwidth_gbps = {15.0, 15.0, 15.0, 15.0};
+    m.mpi_latency_ns.assign(16, 1000.0);
+    for (int i = 0; i < 4; ++i) m.mpi_latency_ns[i * 4 + i] = 0.0;
+    m.mpi_bandwidth_gbps.assign(16, 3.0);
+    for (int i = 0; i < 4; ++i) m.mpi_bandwidth_gbps[i * 4 + i] = 0.0;
+    m.memory_contention_factor = {1.0, 1.0, 1.0, 1.0};
+
+    // Before the fix, this would fail if the local rank had fewer than 4 devices
+    // and simulated_total_devices_ wasn't used or fell back incorrectly.
+    // Now it correctly uses the global device count.
+    rt.set_topo_metrics(m);
+
+    const auto& stored = rt.topo_metrics();
+    assert(stored.has_value());
+    assert(stored->pcie_latency_ns.size() == 4);
+    std::cout << "  -> PASS" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -224,6 +276,7 @@ int main(int argc, char** argv) {
     test_save_load_round_trip();
     test_error_handling();
     test_helpers();
+    test_topology_larger_than_local(rt);
 
     std::cout << "\nAll test_topo_metrics unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();
