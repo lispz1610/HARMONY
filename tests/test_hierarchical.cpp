@@ -356,6 +356,68 @@ void test_balance_mode_enum_and_policy() {
     if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// C1 fix test: run with np=2 but only 1 total simulated device.
+// Before the fix, rank 1 (no device) received 1e-9 as its time, resulting in
+// capacity = 1/1e-9 = 1e9, and almost all elements were assigned to it.
+// Because rank 1 has no device to publish via MPI_Allgatherv, those elements
+// vanished, making sum(element_count) < global_elements.
+// After the fix, rank 1 has capacity = 0, so all elements go to rank 0's device.
+//
+// Uses a fresh Runtime so that all_device_counts_ starts empty (unaffected by
+// earlier tests that set it to [1,1] for 2 total devices).
+// Runtime::create checks MPI_Initialized() and skips MPI_Init_thread if MPI is
+// already up; the destructor will not call MPI_Finalize (mpi_initialized_by_runtime_=false).
+// ---------------------------------------------------------------------------
+void test_hysteresis_prevents_oscillation(dcl::Runtime& rt) {
+    const int rank = get_rank();
+    if (rank == 0) std::cout << "[TEST] Running test_hysteresis_prevents_oscillation..." << std::endl;
+
+    rt.set_simulated_devices_count(2);
+
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = 4;
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    // Initial perfectly balanced state (simulates exactly after a previous balance)
+    rt.set_simulated_times({0.100, 0.100});
+    rt.maybe_rebalance_hierarchical(); 
+
+    // Now introduce a very tiny imbalance, e.g. 0.100 and 0.102
+    rt.set_simulated_times({0.100, 0.102});
+
+    std::stringstream captured;
+    std::streambuf* old_buf = nullptr;
+    if (rank == 0) {
+        old_buf = std::cout.rdbuf(captured.rdbuf());
+    }
+
+    const bool ok = rt.maybe_rebalance_hierarchical();
+
+    std::string out_str;
+    if (rank == 0) {
+        std::cout.rdbuf(old_buf);
+        out_str = captured.str();
+        std::cout << out_str;
+    }
+
+    assert(ok);
+    const auto& parts = rt.partitions();
+    assert(parts.size() == 2);
+    assert(parts[0].element_count == 500000);
+    assert(parts[1].element_count == 500000);
+    
+    if (rank == 0) {
+        assert(out_str.find("aborted due to hysteresis") != std::string::npos);
+    }
+
+    rt.clear_simulated_times();
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
+}
+
 void test_c1_no_element_loss_with_more_ranks_than_devices(int argc, char** argv) {
     const int rank = get_rank();
     int size = 0;
@@ -441,6 +503,7 @@ int main(int argc, char** argv) {
     test_hierarchical_equal_times(rt);
     test_hierarchical_with_granularity(rt);
     test_hierarchical_with_registered_field(rt);
+    test_hysteresis_prevents_oscillation(rt);
     test_c1_no_element_loss_with_more_ranks_than_devices(argc, argv);
 
     if (rank == 0) std::cout << "\nAll test_hierarchical unit tests PASSED successfully!" << std::endl;

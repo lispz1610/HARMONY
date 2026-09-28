@@ -3454,6 +3454,11 @@ inline bool maybe_rebalance_hierarchical(
     );
 
     // R3.2: Inter-node Balancing Phase
+    std::size_t rank_elements_count = 0;
+    for (std::size_t li = 0; li < L_r; ++li) {
+        int g = local_global_indices[li];
+        rank_elements_count += old_parts[static_cast<std::size_t>(g)].element_count;
+    }
     // Aggregate time per rank: max of local device times on that rank.
     // If this rank has no devices (L_r == 0), use 0.0 to signal zero capacity.
     double local_max_time = (L_r > 0) ? max_value(local_times) : 0.0;
@@ -3464,25 +3469,79 @@ inline bool maybe_rebalance_hierarchical(
     }
     // Ranks with L_r == 0 keep local_max_time = 0.0 → zero capacity → zero elements.
 
-    std::vector<double> rank_max_times(static_cast<std::size_t>(size_), 0.0);
+    double local_data[2] = {static_cast<double>(rank_elements_count), local_max_time};
+    std::vector<double> rank_data(static_cast<std::size_t>(size_) * 2, 0.0);
     detail::check_mpi(
         MPI_Gather(
-            &local_max_time,
-            1,
+            local_data,
+            2,
             MPI_DOUBLE,
-            rank_max_times.data(),
-            1,
+            rank_data.data(),
+            2,
             MPI_DOUBLE,
             0,
             comm_
         ),
-        "MPI_Gather(hierarchical rank max times)"
+        "MPI_Gather(hierarchical rank capacities)"
     );
 
     std::vector<float> inter_cum_loads;
     std::vector<float> inter_rank_loads(static_cast<std::size_t>(size_), 0.0f);
     if (rank_ == 0) {
-        inter_cum_loads = detail::compute_loads_from_times_prefix_inverse(rank_max_times);
+        double total_capacity = 0.0;
+        double global_max_time = 0.0;
+        std::vector<double> capacities(static_cast<std::size_t>(size_), 0.0);
+
+        for (int r = 0; r < size_; ++r) {
+            double r_elements = rank_data[static_cast<std::size_t>(r * 2)];
+            double r_max_time = rank_data[static_cast<std::size_t>(r * 2 + 1)];
+            double r_capacity = (r_max_time > 0.0) ? (std::max(1.0, r_elements) / r_max_time) : 0.0;
+            total_capacity += r_capacity;
+            global_max_time = std::max(global_max_time, r_max_time);
+            capacities[static_cast<std::size_t>(r)] = r_capacity;
+        }
+
+        double projected_time = 0.0;
+        if (total_capacity > 0.0) {
+            projected_time = static_cast<double>(partition_->global_elements) / total_capacity;
+        }
+
+        bool abort_migration = false;
+        if (global_max_time > 0.0 && projected_time > 0.0) {
+            if ((global_max_time - projected_time) < 0.05 * global_max_time) {
+                abort_migration = true;
+                std::cout << "[HIER] Inter-node migration aborted due to hysteresis (gain < 5%). projected_time="
+                          << projected_time << " global_max_time=" << global_max_time << std::endl;
+            }
+        }
+
+        inter_cum_loads.assign(static_cast<std::size_t>(size_), 1.0f);
+        if (abort_migration) {
+            double elements_accum = 0.0;
+            for (int r = 0; r < size_; ++r) {
+                elements_accum += rank_data[static_cast<std::size_t>(r * 2)];
+                inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(elements_accum / static_cast<double>(partition_->global_elements));
+            }
+            inter_cum_loads.back() = 1.0f;
+        } else {
+            if (total_capacity <= 0.0) {
+                const float passo = 1.0f / static_cast<float>(size_);
+                float acumulada = 0.0f;
+                for (int r = 0; r < size_; ++r) {
+                    acumulada += passo;
+                    inter_cum_loads[static_cast<std::size_t>(r)] = acumulada;
+                }
+                inter_cum_loads.back() = 1.0f;
+            } else {
+                double carga_acumulada = 0.0;
+                for (int r = 0; r < size_; ++r) {
+                    const double fatia = capacities[static_cast<std::size_t>(r)] / total_capacity;
+                    carga_acumulada += fatia;
+                    inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(carga_acumulada);
+                }
+                inter_cum_loads.back() = 1.0f;
+            }
+        }
         float prev = 0.0f;
         for (int r = 0; r < size_; ++r) {
             const float cum = inter_cum_loads[static_cast<std::size_t>(r)];
