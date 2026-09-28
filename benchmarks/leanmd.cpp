@@ -26,6 +26,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
     int balance_interval = 10;
     std::string output_csv = "leanmd.csv";
     int cutoff = 4;
+    unsigned int seed = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -62,6 +64,8 @@ int main(int argc, char** argv) {
             output_csv = argv[++i];
         } else if (arg == "--k" && i + 1 < argc) {
             cutoff = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--seed" && i + 1 < argc) {
+            seed = static_cast<unsigned int>(std::stoul(argv[++i]));
         }
     }
 
@@ -107,8 +111,8 @@ int main(int argc, char** argv) {
             return dcl::erad_loads(t, p);
         };
     } else if (balance_algo == "hwtopolb") {
-        algo_fn = [perturbation](const std::vector<double>& t, const std::vector<dcl::DevicePartition>& p) {
-            return dcl::hwtopolb_loads(t, p, perturbation);
+        algo_fn = [perturbation, seed](const std::vector<double>& t, const std::vector<dcl::DevicePartition>& p) {
+            return dcl::hwtopolb_loads(t, p, perturbation, seed);
         };
     } else {
         if (rank == 0) {
@@ -153,7 +157,10 @@ int main(int argc, char** argv) {
                 }
             }
 
-            std::vector<float> new_loads = algo_fn(prev_device_times, runtime.partitions());
+            std::vector<float> new_loads;
+            if (rank == 0) {
+                new_loads = algo_fn(prev_device_times, runtime.partitions());
+            }
             runtime.rebalance_to(new_loads);
 
             const auto& new_parts = runtime.partitions();

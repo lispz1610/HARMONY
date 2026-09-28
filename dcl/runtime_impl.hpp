@@ -832,16 +832,25 @@ void execute(const ExecutionStep& step) {
         throw Error("rebalance_to(): no partitions available");
     }
 
-    if (loads.empty()) {
-        throw Error("rebalance_to(): loads vector is empty");
+    if (rank_ == 0) {
+        if (loads.empty()) {
+            throw Error("rebalance_to(): loads vector is empty");
+        }
     }
-
-    if (loads.size() != partitions_.size()) {
+    
+    if (!loads.empty() && loads.size() != partitions_.size()) {
         throw Error("rebalance_to(): loads size must match number of partitions");
     }
 
+    std::vector<float> synced_loads = loads;
+    if (rank_ != 0) {
+        synced_loads.resize(partitions_.size(), 0.0f);
+    }
+    
+    MPI_Bcast(synced_loads.data(), static_cast<int>(partitions_.size()), MPI_FLOAT, 0, comm_);
+
     // From now on, loads is cumulative: [0.10, 0.20, ..., 1.00].
-    std::vector<float> cumulative = loads;
+    std::vector<float> cumulative = synced_loads;
 
     float prev = 0.0f;
     for (std::size_t i = 0; i < cumulative.size(); ++i) {

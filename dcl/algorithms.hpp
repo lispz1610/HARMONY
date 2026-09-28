@@ -82,7 +82,8 @@ inline std::vector<float> erad_loads(
 inline std::vector<float> hwtopolb_loads(
     const std::vector<double>& times,
     const std::vector<DevicePartition>& partitions,
-    float perturbation_factor
+    float perturbation_factor,
+    unsigned int seed = 0
 ) {
     if (times.empty() || times.size() != partitions.size()) {
         return {};
@@ -118,10 +119,13 @@ inline std::vector<float> hwtopolb_loads(
         }
     }
 
-    thread_local std::mt19937 gen([]() {
+    std::mt19937 gen;
+    if (seed != 0) {
+        gen.seed(seed);
+    } else {
         std::random_device rd;
-        return rd();
-    }());
+        gen.seed(rd());
+    }
     std::uniform_real_distribution<float> dist(-perturbation_factor, perturbation_factor);
 
     std::vector<float> perturbed_share(n, 0.0f);
