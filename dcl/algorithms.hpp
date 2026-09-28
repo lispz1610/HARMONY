@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -168,7 +169,8 @@ inline std::vector<float> hwtopolb_loads(
 inline std::vector<float> apply_power_cap(
     const std::vector<float>& loads,
     const TopoMetrics& metrics,
-    double power_budget_watts = 0.0
+    double power_budget_watts = 0.0,
+    double* out_throttle_factor = nullptr
 ) {
     if (loads.empty()) {
         return {};
@@ -233,9 +235,8 @@ inline std::vector<float> apply_power_cap(
     // 3. Identify overloaded devices: current_power_watts[i] > effective_limit[i]
     //    and scale down their load shares proportionally
     double freed_load = 0.0;
-    std::vector<double> headroom(n, 0.0);
-    double total_headroom = 0.0;
-    double total_underloaded_shares = 0.0;
+    std::vector<double> headroom_share(n, 0.0);
+    double total_headroom_share = 0.0;
     std::vector<std::size_t> underloaded_indices;
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -249,37 +250,54 @@ inline std::vector<float> apply_power_cap(
             shares[i] = new_share;
         } else {
             underloaded_indices.push_back(i);
-            const double hr = std::max(0.0, limit - curr_pwr);
-            headroom[i] = hr;
-            total_headroom += hr;
-            total_underloaded_shares += shares[i];
+            
+            double hs = 0.0;
+            if (curr_pwr > 1e-12 && shares[i] > 1e-12) {
+                hs = shares[i] * (limit / curr_pwr) - shares[i];
+            } else if (limit > 1e-12) {
+                hs = 1.0; 
+            }
+            headroom_share[i] = std::max(0.0, hs);
+            total_headroom_share += headroom_share[i];
         }
     }
 
     // 4. Redistribute the freed excess load to underloaded devices
+    double s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
+    double throttle = 1.0;
+
     if (freed_load > 0.0 && !underloaded_indices.empty()) {
-        if (total_headroom > 1e-12) {
+        const double absorbable = std::min(freed_load, total_headroom_share);
+        
+        if (absorbable > 1e-12 && total_headroom_share > 1e-12) {
             for (std::size_t idx : underloaded_indices) {
-                shares[idx] += freed_load * (headroom[idx] / total_headroom);
+                shares[idx] += absorbable * (headroom_share[idx] / total_headroom_share);
             }
-        } else if (total_underloaded_shares > 1e-12) {
-            for (std::size_t idx : underloaded_indices) {
-                shares[idx] += freed_load * (shares[idx] / total_underloaded_shares);
-            }
-        } else {
-            const double equal_share = freed_load / static_cast<double>(underloaded_indices.size());
-            for (std::size_t idx : underloaded_indices) {
-                shares[idx] += equal_share;
-            }
+        }
+        
+        // After redistribution, re-evaluate sum and throttle
+        s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
+        if (s_sum > 0.0 && s_sum < 0.99999) {
+            throttle = 1.0 / s_sum;
         }
     } else if (freed_load > 0.0 && underloaded_indices.empty()) {
         // All devices were overloaded; their shares were reduced proportionally.
-        // Normalize so shares sum to 1.0.
-        const double s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
+        s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
         if (s_sum > 0.0) {
-            for (std::size_t i = 0; i < n; ++i) {
-                shares[i] /= s_sum;
-            }
+            throttle = 1.0 / s_sum;
+        }
+    }
+
+    if (out_throttle_factor) {
+        *out_throttle_factor = throttle;
+    }
+
+    // Normalize so shares sum to 1.0. 
+    // This maintains the 100% data coverage requirement, while the throttle factor
+    // informs the runtime to stretch the execution time (decouple time) to respect TDP.
+    if (s_sum > 0.0) {
+        for (std::size_t i = 0; i < n; ++i) {
+            shares[i] /= s_sum;
         }
     }
 

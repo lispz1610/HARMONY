@@ -333,6 +333,8 @@ void test_divergent_numa_consensus(dcl::Runtime& rt) {
 
     if (rank == 0) std::cout << "[TEST] Running test_divergent_numa_consensus..." << std::endl;
 
+    rt.set_simulated_devices_count(2);
+    
     dcl::PartitionSpec ps;
     ps.global_elements = 1000000;
     ps.units_per_element = 1;

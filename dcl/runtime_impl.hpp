@@ -3049,8 +3049,27 @@ inline bool maybe_rebalance_from_timings(
         );
     }
 
+    double throttle = 1.0;
     if (!proposed_loads.empty() && policy.use_power_cap && topo_metrics_.has_value()) {
-        proposed_loads = apply_power_cap(proposed_loads, *topo_metrics_, policy.power_budget_watts);
+        proposed_loads = apply_power_cap(proposed_loads, *topo_metrics_, policy.power_budget_watts, &throttle);
+    }
+
+    if (throttle > 1.0) {
+        if (!simulated_times_.empty()) {
+            for (auto& t : simulated_times_) {
+                t *= throttle;
+            }
+        } else {
+            double max_t = 0.0;
+            for (double t : global_times) {
+                if (t > max_t) max_t = t;
+            }
+            double delay = max_t * (throttle - 1.0);
+            if (delay > 0.0) {
+                double start_delay = MPI_Wtime();
+                while (MPI_Wtime() - start_delay < delay) {}
+            }
+        }
     }
 
     if (proposed_loads.empty()) {
