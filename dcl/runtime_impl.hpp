@@ -3459,6 +3459,7 @@ inline bool maybe_rebalance_hierarchical(
         int g = local_global_indices[li];
         rank_elements_count += old_parts[static_cast<std::size_t>(g)].element_count;
     }
+
     // Aggregate time per rank: max of local device times on that rank.
     // If this rank has no devices (L_r == 0), use 0.0 to signal zero capacity.
     double local_max_time = (L_r > 0) ? max_value(local_times) : 0.0;
@@ -3487,6 +3488,7 @@ inline bool maybe_rebalance_hierarchical(
 
     std::vector<float> inter_cum_loads;
     std::vector<float> inter_rank_loads(static_cast<std::size_t>(size_), 0.0f);
+    int abort_migration_flag = 0;
     if (rank_ == 0) {
         double total_capacity = 0.0;
         double global_max_time = 0.0;
@@ -3510,6 +3512,7 @@ inline bool maybe_rebalance_hierarchical(
         if (global_max_time > 0.0 && projected_time > 0.0) {
             if ((global_max_time - projected_time) < 0.05 * global_max_time) {
                 abort_migration = true;
+                abort_migration_flag = 1;
                 std::cout << "[HIER] Inter-node migration aborted due to hysteresis (gain < 5%). projected_time="
                           << projected_time << " global_max_time=" << global_max_time << std::endl;
             }
@@ -3542,6 +3545,7 @@ inline bool maybe_rebalance_hierarchical(
                 inter_cum_loads.back() = 1.0f;
             }
         }
+
         float prev = 0.0f;
         for (int r = 0; r < size_; ++r) {
             const float cum = inter_cum_loads[static_cast<std::size_t>(r)];
@@ -3572,6 +3576,17 @@ inline bool maybe_rebalance_hierarchical(
         "MPI_Bcast(hierarchical inter_cum_loads)"
     );
 
+    detail::check_mpi(
+        MPI_Bcast(
+            &abort_migration_flag,
+            1,
+            MPI_INT,
+            0,
+            comm_
+        ),
+        "MPI_Bcast(hierarchical abort_migration_flag)"
+    );
+
     // Compute inter-node partition (rank element slices)
     const std::size_t N = partition_->global_elements;
     const std::size_t gran = std::max<std::size_t>(1, partition_->granularity);
@@ -3594,8 +3609,15 @@ inline bool maybe_rebalance_hierarchical(
     rank_cuts.back() = N;
 
     // Each rank maps its inter-node allocation to its local devices
-    const std::size_t rank_start = rank_cuts[static_cast<std::size_t>(rank_)];
-    const std::size_t rank_end = rank_cuts[static_cast<std::size_t>(rank_) + 1];
+    std::size_t rank_start = 0;
+    std::size_t rank_end = 0;
+    if (abort_migration_flag && L_r > 0) {
+        rank_start = old_parts[local_global_indices.front()].global_offset;
+        rank_end = old_parts[local_global_indices.back()].global_offset + old_parts[local_global_indices.back()].element_count;
+    } else {
+        rank_start = rank_cuts[static_cast<std::size_t>(rank_)];
+        rank_end = rank_cuts[static_cast<std::size_t>(rank_) + 1];
+    }
     const std::size_t rank_elements = rank_end - rank_start;
     const std::size_t U_r = rank_elements / gran;
 
@@ -3622,110 +3644,120 @@ inline bool maybe_rebalance_hierarchical(
         local_counts[li] = static_cast<unsigned long long>(local_dev_cuts[li + 1] - local_dev_cuts[li]);
     }
 
-    // Exchange partitions across all ranks using MPI_Allgatherv
-    const std::size_t total_devices = partitions_.size();
-    std::vector<int> recvcounts(static_cast<std::size_t>(size_), 0);
-    std::vector<int> displs(static_cast<std::size_t>(size_), 0);
+    std::vector<DevicePartition> new_parts = partitions_;
 
-    if (all_device_counts_.empty() ||
-        std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0) == 0) {
-        if (size_ > 0) {
-            all_device_counts_.assign(static_cast<std::size_t>(size_), static_cast<int>(total_devices / size_));
-            const int rem = static_cast<int>(total_devices % size_);
-            for (int i = 0; i < rem; ++i) {
-                all_device_counts_[static_cast<std::size_t>(i)]++;
+    if (!abort_migration_flag) {
+        // Exchange partitions across all ranks using MPI_Allgatherv
+        const std::size_t total_devices = partitions_.size();
+        std::vector<int> recvcounts(static_cast<std::size_t>(size_), 0);
+        std::vector<int> displs(static_cast<std::size_t>(size_), 0);
+
+        if (all_device_counts_.empty() ||
+            std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0) == 0) {
+            if (size_ > 0) {
+                all_device_counts_.assign(static_cast<std::size_t>(size_), static_cast<int>(total_devices / size_));
+                const int rem = static_cast<int>(total_devices % size_);
+                for (int i = 0; i < rem; ++i) {
+                    all_device_counts_[static_cast<std::size_t>(i)]++;
+                }
+            } else {
+                all_device_counts_ = {static_cast<int>(total_devices)};
             }
-        } else {
-            all_device_counts_ = {static_cast<int>(total_devices)};
         }
-    }
 
-    for (int r = 0; r < size_; ++r) {
-        recvcounts[static_cast<std::size_t>(r)] = all_device_counts_[static_cast<std::size_t>(r)];
-    }
-    for (int r = 1; r < size_; ++r) {
-        displs[static_cast<std::size_t>(r)] =
-            displs[static_cast<std::size_t>(r) - 1] + recvcounts[static_cast<std::size_t>(r) - 1];
-    }
-
-    std::vector<unsigned long long> all_offsets(total_devices, 0ULL);
-    std::vector<unsigned long long> all_counts(total_devices, 0ULL);
-
-    detail::check_mpi(
-        MPI_Allgatherv(
-            local_offsets.data(),
-            static_cast<int>(L_r),
-            MPI_UNSIGNED_LONG_LONG,
-            all_offsets.data(),
-            recvcounts.data(),
-            displs.data(),
-            MPI_UNSIGNED_LONG_LONG,
-            comm_
-        ),
-        "MPI_Allgatherv(hierarchical all_offsets)"
-    );
-
-    detail::check_mpi(
-        MPI_Allgatherv(
-            local_counts.data(),
-            static_cast<int>(L_r),
-            MPI_UNSIGNED_LONG_LONG,
-            all_counts.data(),
-            recvcounts.data(),
-            displs.data(),
-            MPI_UNSIGNED_LONG_LONG,
-            comm_
-        ),
-        "MPI_Allgatherv(hierarchical all_counts)"
-    );
-
-    std::vector<DevicePartition> new_parts;
-    new_parts.reserve(total_devices);
-    for (std::size_t g = 0; g < total_devices; ++g) {
-        DevicePartition dp;
-        dp.device_global_index = static_cast<int>(g);
-        dp.owning_rank = owner_rank_of_global_device(static_cast<int>(g));
-        dp.local_index = (dp.owning_rank == rank_)
-            ? local_index_of_global_device(static_cast<int>(g))
-            : -1;
-        dp.global_offset = static_cast<std::size_t>(all_offsets[g]);
-        dp.element_count = static_cast<std::size_t>(all_counts[g]);
-        new_parts.push_back(dp);
-    }
-
-    // C1 fix: Collective invariant check — sum(element_count) must equal global_elements.
-    // Every rank performs this check so that a silent loss of elements is caught immediately
-    // rather than producing incorrect results without any diagnostic.
-    {
-        const std::size_t expected = partition_->global_elements;
-        std::size_t covered = 0;
-        for (const auto& dp : new_parts) {
-            covered += dp.element_count;
+        for (int r = 0; r < size_; ++r) {
+            recvcounts[static_cast<std::size_t>(r)] = all_device_counts_[static_cast<std::size_t>(r)];
         }
-        // Use MPI_Allreduce with MPI_MIN to verify that ALL ranks compute the same covered
-        // count (they should, since new_parts is replicated). Any discrepancy also fires here.
-        unsigned long long covered_ull = static_cast<unsigned long long>(covered);
-        unsigned long long min_covered = 0;
-        unsigned long long max_covered = 0;
+        for (int r = 1; r < size_; ++r) {
+            displs[static_cast<std::size_t>(r)] =
+                displs[static_cast<std::size_t>(r) - 1] + recvcounts[static_cast<std::size_t>(r) - 1];
+        }
+
+        std::vector<unsigned long long> all_offsets(total_devices, 0ULL);
+        std::vector<unsigned long long> all_counts(total_devices, 0ULL);
+
         detail::check_mpi(
-            MPI_Allreduce(&covered_ull, &min_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
-            "MPI_Allreduce(C1 partition conservation min)"
+            MPI_Allgatherv(
+                local_offsets.data(),
+                static_cast<int>(L_r),
+                MPI_UNSIGNED_LONG_LONG,
+                all_offsets.data(),
+                recvcounts.data(),
+                displs.data(),
+                MPI_UNSIGNED_LONG_LONG,
+                comm_
+            ),
+            "MPI_Allgatherv(hierarchical all_offsets)"
         );
+
         detail::check_mpi(
-            MPI_Allreduce(&covered_ull, &max_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
-            "MPI_Allreduce(C1 partition conservation max)"
+            MPI_Allgatherv(
+                local_counts.data(),
+                static_cast<int>(L_r),
+                MPI_UNSIGNED_LONG_LONG,
+                all_counts.data(),
+                recvcounts.data(),
+                displs.data(),
+                MPI_UNSIGNED_LONG_LONG,
+                comm_
+            ),
+            "MPI_Allgatherv(hierarchical all_counts)"
         );
-        if (min_covered != static_cast<unsigned long long>(expected) ||
-            max_covered != static_cast<unsigned long long>(expected)) {
-            // Abort with a descriptive message rather than silently accepting a broken partition.
-            if (rank_ == 0) {
-                std::cerr << "[HIER][C1 ERROR] Partition invariant violated: "
-                          << "covered=" << min_covered << ".." << max_covered
-                          << " expected=" << expected
-                          << ". Partition not applied.\n";
+
+        new_parts.clear();
+        new_parts.reserve(total_devices);
+        for (std::size_t g = 0; g < total_devices; ++g) {
+            DevicePartition dp;
+            dp.device_global_index = static_cast<int>(g);
+            dp.owning_rank = owner_rank_of_global_device(static_cast<int>(g));
+            dp.local_index = (dp.owning_rank == rank_)
+                ? local_index_of_global_device(static_cast<int>(g))
+                : -1;
+            dp.global_offset = static_cast<std::size_t>(all_offsets[g]);
+            dp.element_count = static_cast<std::size_t>(all_counts[g]);
+            new_parts.push_back(dp);
+        }
+
+        // C1 fix: Collective invariant check — sum(element_count) must equal global_elements.
+        // Every rank performs this check so that a silent loss of elements is caught immediately
+        // rather than producing incorrect results without any diagnostic.
+        {
+            const std::size_t expected = partition_->global_elements;
+            std::size_t covered = 0;
+            for (const auto& dp : new_parts) {
+                covered += dp.element_count;
             }
-            // Return false: caller may retry or fall back. Do NOT update partitions_.
-            return false;
+            // Use MPI_Allreduce with MPI_MIN to verify that ALL ranks compute the same covered
+            // count (they should, since new_parts is replicated). Any discrepancy also fires here.
+            unsigned long long covered_ull = static_cast<unsigned long long>(covered);
+            unsigned long long min_covered = 0;
+            unsigned long long max_covered = 0;
+            detail::check_mpi(
+                MPI_Allreduce(&covered_ull, &min_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+                "MPI_Allreduce(C1 partition conservation min)"
+            );
+            detail::check_mpi(
+                MPI_Allreduce(&covered_ull, &max_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+                "MPI_Allreduce(C1 partition conservation max)"
+            );
+            if (min_covered != static_cast<unsigned long long>(expected) ||
+                max_covered != static_cast<unsigned long long>(expected)) {
+                // Abort with a descriptive message rather than silently accepting a broken partition.
+                if (rank_ == 0) {
+                    std::cerr << "[HIER][C1 ERROR] Partition invariant violated: "
+                              << "covered=" << min_covered << ".." << max_covered
+                              << " expected=" << expected
+                              << ". Partition not applied.\n";
+                }
+                // Return false: caller may retry or fall back. Do NOT update partitions_.
+                return false;
+            }
+        }
+    } else {
+        for (std::size_t li = 0; li < L_r; ++li) {
+            int g = local_global_indices[li];
+            new_parts[static_cast<std::size_t>(g)].global_offset = static_cast<std::size_t>(local_offsets[li]);
+            new_parts[static_cast<std::size_t>(g)].element_count = static_cast<std::size_t>(local_counts[li]);
         }
     }
 
