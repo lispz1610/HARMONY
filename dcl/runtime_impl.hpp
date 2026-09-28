@@ -3145,6 +3145,8 @@ inline bool maybe_rebalance_from_timings(
         return false;
     }
 
+    int local_skip = 0;
+
     // NUMA-Aware Cost Function in Load Balancer (R2.4)
     // When power capping is active, thermal protection takes priority over throughput gain
     if (topo_metrics_.has_value() && !policy.use_power_cap) {
@@ -3245,27 +3247,36 @@ inline bool maybe_rebalance_from_timings(
 
         const double expected_gain_s = std::max(0.0, t_max_current - t_max_projected);
 
-        if (total_migration_cost_s > numa_ratio_limit * expected_gain_s) {
-            if (rank_ == 0) {
-                std::cout << "[NUMA] migration cost exceeds gain threshold, skipping rebalance" << std::endl;
-            }
+        local_skip = (total_migration_cost_s > numa_ratio_limit * expected_gain_s) ? 1 : 0;
+    }
 
-            current_loads_ = loads_from_partitions(partitions_);
+    int global_skip = 0;
+    
+    detail::check_mpi(
+        MPI_Allreduce(&local_skip, &global_skip, 1, MPI_INT, MPI_LOR, comm_),
+        "MPI_Allreduce(NUMA decision to skip rebalance)"
+    );
 
-            print_balance_interval_metrics(
-                "threshold",
-                "skip",
-                "[NUMA] migration cost exceeds gain threshold",
-                global_times,
-                old_loads,
-                effective_new_loads,
-                current_loads_,
-                MPI_Wtime() - balance_t0,
-                true
-            );
-
-            return false;
+    if (global_skip != 0) {
+        if (rank_ == 0) {
+            std::cout << "[NUMA] migration cost exceeds gain threshold, skipping rebalance" << std::endl;
         }
+
+        current_loads_ = loads_from_partitions(partitions_);
+
+        print_balance_interval_metrics(
+            "threshold",
+            "skip",
+            "[NUMA] migration cost exceeds gain threshold",
+            global_times,
+            old_loads,
+            effective_new_loads,
+            current_loads_,
+            MPI_Wtime() - balance_t0,
+            true
+        );
+
+        return false;
     }
 
     const double apply_t0 = MPI_Wtime();

@@ -294,10 +294,14 @@ void test_numa_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
     // Verify rebalance was skipped
     assert(!rebalanced && "Expected rebalance to be skipped due to NUMA migration cost");
 
-    // Verify exact log line was emitted
-    const std::string expected_log = "[NUMA] migration cost exceeds gain threshold, skipping rebalance";
-    assert(out_str.find(expected_log) != std::string::npos &&
-           "Expected log line '[NUMA] migration cost exceeds gain threshold, skipping rebalance' not found");
+    int current_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &current_rank);
+    if (current_rank == 0) {
+        // Verify exact log line was emitted
+        const std::string expected_log = "[NUMA] migration cost exceeds gain threshold, skipping rebalance";
+        assert(out_str.find(expected_log) != std::string::npos &&
+               "Expected log line '[NUMA] migration cost exceeds gain threshold, skipping rebalance' not found");
+    }
 
     // 4. Now test the opposite case: fast PCIe bandwidth, migration cost is tiny compared to gain
     m.pcie_bandwidth_gbps = {100.0, 100.0}; // 100 GB/s -> transfer takes only ~4 microseconds
@@ -317,6 +321,65 @@ void test_numa_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
     std::cout << "  -> PASS" << std::endl;
 }
 
+void test_divergent_numa_consensus(dcl::Runtime& rt) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (size < 2) {
+        if (rank == 0) std::cout << "[TEST] Skipping test_divergent_numa_consensus, needs at least 2 ranks." << std::endl;
+        return;
+    }
+
+    if (rank == 0) std::cout << "[TEST] Running test_divergent_numa_consensus..." << std::endl;
+
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = 4;
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    dcl::FieldSpec fs;
+    fs.name = "consensus_field";
+    fs.global_elements = 1000000;
+    fs.units_per_element = 1;
+    fs.bytes_per_unit = 4;
+    fs.usage = dcl::BufferUsage::read_write;
+    fs.redistribution = dcl::RedistributionDependency::proportional;
+    dcl::FieldHandle fh = rt.create_field(fs);
+
+    dcl::TopoMetrics m;
+    m.pcie_latency_ns = {5000.0, 5000.0};
+    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
+    m.mpi_bandwidth_gbps = {0.0, 1.0, 1.0, 0.0};
+    m.numa_distance = {10, 20, 20, 10};
+    m.device_numa_node = {0, 0};
+
+    // Divergent configuration
+    if (rank == 0) {
+        m.pcie_bandwidth_gbps = {1000.0, 1000.0}; // Very fast, would accept rebalance
+    } else {
+        m.pcie_bandwidth_gbps = {0.001, 0.001};  // Very slow, would reject rebalance
+    }
+
+    rt.set_topo_metrics(m);
+
+    // Timings that suggest rebalance is beneficial
+    rt.set_simulated_times({0.0010, 0.010});
+
+    // The logic inside maybe_rebalance_from_timings will trigger global consensus.
+    // If one rank rejects, all ranks must reject to avoid deadlocks in subsequent collectives.
+    const bool rebalanced = rt.maybe_rebalance_from_timings({fh}, 0.01f, 0.50);
+
+    // Because rank 1 rejects, consensus means both should reject
+    assert(!rebalanced && "Expected divergent consensus to result in skipping rebalance globally");
+
+    rt.clear_simulated_times();
+
+    if (rank == 0) std::cout << "  -> PASS" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -326,6 +389,7 @@ int main(int argc, char** argv) {
     test_cross_vs_same_numa_migration_cost();
     test_invalid_device_numa_node_throws(rt);
     test_numa_skip_rebalance_when_cost_high(rt);
+    test_divergent_numa_consensus(rt);
 
     std::cout << "\nAll test_numa_cost unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();
