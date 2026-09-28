@@ -84,8 +84,11 @@ inline std::vector<T> parse_number_array(const std::string& str, std::size_t& po
         std::string num_str = str.substr(start, pos - start);
         std::istringstream iss(num_str);
         T val{};
-        if (!(iss >> val)) {
+        if (!(iss >> val) || !iss.eof()) {
             throw dcl::Error("JSON parse error: invalid number '" + num_str + "'");
+        }
+        if (!std::isfinite(static_cast<double>(val))) {
+            throw dcl::Error("JSON parse error: non-finite number '" + num_str + "'");
         }
         result.push_back(val);
 
@@ -113,17 +116,25 @@ inline void skip_json_value(const std::string& str, std::size_t& pos) {
         ++pos;
         int depth = 1;
         while (pos < str.size() && depth > 0) {
-            if (str[pos] == '[') ++depth;
-            else if (str[pos] == ']') --depth;
-            ++pos;
+            if (str[pos] == '"') {
+                (void)parse_string(str, pos);
+            } else {
+                if (str[pos] == '[') ++depth;
+                else if (str[pos] == ']') --depth;
+                ++pos;
+            }
         }
     } else if (c == '{') {
         ++pos;
         int depth = 1;
         while (pos < str.size() && depth > 0) {
-            if (str[pos] == '{') ++depth;
-            else if (str[pos] == '}') --depth;
-            ++pos;
+            if (str[pos] == '"') {
+                (void)parse_string(str, pos);
+            } else {
+                if (str[pos] == '{') ++depth;
+                else if (str[pos] == '}') --depth;
+                ++pos;
+            }
         }
     } else {
         while (pos < str.size() && str[pos] != ',' && str[pos] != '}' && str[pos] != ']' &&
@@ -162,9 +173,12 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
         throw dcl::Error("JSON parse error: expected '{' at start of file: " + json_path);
     }
 
+    bool closed = false;
     while (pos < content.size()) {
         detail::skip_whitespace(content, pos);
         if (pos < content.size() && content[pos] == '}') {
+            ++pos;
+            closed = true;
             break;
         }
         std::string key = detail::parse_string(content, pos);
@@ -198,11 +212,26 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
         detail::skip_whitespace(content, pos);
         if (pos < content.size() && content[pos] == ',') {
             ++pos;
+            detail::skip_whitespace(content, pos);
+            if (pos < content.size() && content[pos] == '}') {
+                throw dcl::Error("JSON parse error: trailing comma before '}'");
+            }
             continue;
         }
         if (pos < content.size() && content[pos] == '}') {
+            ++pos;
+            closed = true;
             break;
         }
+        throw dcl::Error("JSON parse error: expected ',' or '}' at position " + std::to_string(pos));
+    }
+
+    if (!closed) {
+        throw dcl::Error("JSON parse error: missing closing '}'");
+    }
+    detail::skip_whitespace(content, pos);
+    if (pos != content.size()) {
+        throw dcl::Error("JSON parse error: trailing characters after object");
     }
 
     return metrics;

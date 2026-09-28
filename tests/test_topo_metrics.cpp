@@ -145,9 +145,9 @@ void test_device_numa_node_validation(dcl::Runtime& rt) {
     std::cout << "  -> PASS" << std::endl;
 }
 
-void test_save_load_round_trip() {
+void test_save_load_round_trip(dcl::Runtime& rt) {
     std::cout << "[TEST] Running test_save_load_round_trip..." << std::endl;
-    const std::string test_file = "test_roundtrip.json";
+    const std::string test_file = "test_roundtrip_" + std::to_string(rt.rank()) + ".json";
 
     dcl::TopoMetrics original;
     original.pcie_latency_ns = {3120.25, 4560.75};
@@ -189,7 +189,7 @@ void test_save_load_round_trip() {
     std::cout << "  -> PASS" << std::endl;
 }
 
-void test_error_handling() {
+void test_error_handling(dcl::Runtime& rt) {
     std::cout << "[TEST] Running test_error_handling..." << std::endl;
     // Non-existent file
     bool caught = false;
@@ -200,20 +200,44 @@ void test_error_handling() {
     }
     assert(caught && "Expected dcl::Error on missing file");
 
-    // Malformed JSON
-    const std::string bad_file = "test_bad.json";
-    {
-        std::ofstream ofs(bad_file);
-        ofs << "{ \"pcie_latency_ns\": [ 123.4, abc ] }";
-    }
-    caught = false;
+    auto check_bad_json = [&](const std::string& json_content, const std::string& msg) {
+        const std::string bad_file = "test_bad_" + std::to_string(rt.rank()) + ".json";
+        std::ofstream(bad_file) << json_content;
+        bool caught = false;
+        try {
+            (void)dcl::load_topo_metrics(bad_file);
+        } catch (const dcl::Error&) {
+            caught = true;
+        }
+        std::remove(bad_file.c_str());
+        if (!caught) {
+            std::cerr << "Failed to catch error for: " << msg << std::endl;
+            assert(false && "Failed to catch expected parser error");
+        }
+    };
+
+    check_bad_json("{ \"pcie_latency_ns\": [ 123.4, abc ] }", "Expected dcl::Error on malformed JSON");
+    check_bad_json("{ \"pcie_latency_ns\": [ 123.4, 456.7 ", "Expected dcl::Error on broken array (truncated)");
+    check_bad_json("{ \"pcie_latency_ns\": [ NaN, 456.7 ] }", "Expected dcl::Error on NaN");
+    check_bad_json("{ \"pcie_latency_ns\": [ inf, 456.7 ] }", "Expected dcl::Error on infinity");
+    check_bad_json("{ \"pcie_latency_ns\": [ 1.2.3 ] }", "Expected dcl::Error on malformed number");
+    check_bad_json("{ \"numa_distance\": [ 1, 2.5, 3, 4 ] }", "Expected dcl::Error on float parsed as int");
+    check_bad_json("{ \"pcie_latency_ns\": [ 123.4 ] \"mpi_latency_ns\": [ 0.0 ] }", "Expected dcl::Error on missing comma between keys");
+    check_bad_json("{ \"pcie_latency_ns\": [ 123.4 ] } trailing_trash", "Expected dcl::Error on trailing characters");
+    check_bad_json("{ \"pcie_latency_ns\"", "Expected dcl::Error on truncated key/value");
+
+    // This should NOT throw an error, it's valid JSON!
+    // But check_bad_json expects an error. Let's write a positive test for skip_json_value.
+    const std::string good_file = "test_good_skip_" + std::to_string(rt.rank()) + ".json";
+    std::ofstream(good_file) << "{ \"unknown\": [\"[\", \"}\"], \"pcie_latency_ns\": [ 123.4 ] }";
     try {
-        (void)dcl::load_topo_metrics(bad_file);
-    } catch (const dcl::Error&) {
-        caught = true;
+        (void)dcl::load_topo_metrics(good_file);
+    } catch (const dcl::Error& e) {
+        std::cerr << "Failed to parse valid JSON with brackets in string: " << e.what() << std::endl;
+        assert(false && "Parser rejected valid JSON due to poor skip_json_value");
     }
-    assert(caught && "Expected dcl::Error on malformed JSON");
-    std::remove(bad_file.c_str());
+    std::remove(good_file.c_str());
+
     std::cout << "  -> PASS" << std::endl;
 }
 
@@ -273,8 +297,8 @@ int main(int argc, char** argv) {
     test_reject_wrong_dimensions(rt);
     test_contention_factor_validation(rt);
     test_device_numa_node_validation(rt);
-    test_save_load_round_trip();
-    test_error_handling();
+    test_save_load_round_trip(rt);
+    test_error_handling(rt);
     test_helpers();
     test_topology_larger_than_local(rt);
 
