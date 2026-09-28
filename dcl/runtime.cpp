@@ -83,6 +83,10 @@ void Runtime::set_simulated_devices_count(int count) noexcept {
     impl_->set_simulated_devices_count(count);
 }
 
+void Runtime::set_simulated_ranks_for_testing(int ranks) noexcept {
+    impl_->set_simulated_ranks_for_testing(ranks);
+}
+
 void Runtime::set_numa_cost_gain_ratio_threshold(double threshold) noexcept {
     impl_->set_numa_cost_gain_ratio_threshold(threshold);
 }

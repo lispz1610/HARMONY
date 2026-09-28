@@ -3219,6 +3219,8 @@ inline bool maybe_rebalance_from_timings(
                             topo_metrics_.value(),
                             src_dev,
                             dst_dev,
+                            src.owning_rank,
+                            dst.owning_rank,
                             bytes
                         );
                     }
@@ -4555,6 +4557,11 @@ public:
                 all_device_counts_ = {count};
             }
         }
+    }
+
+    void set_simulated_ranks_for_testing(int ranks) noexcept {
+        size_ = ranks;
+        all_device_counts_.clear();
     }
 
     void set_numa_cost_gain_ratio_threshold(double threshold) noexcept {

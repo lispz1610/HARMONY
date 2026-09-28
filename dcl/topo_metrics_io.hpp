@@ -286,6 +286,8 @@ inline int numa_distance_between(const TopoMetrics& metrics, int node_a, int nod
 inline double estimate_migration_cost_bytes(const TopoMetrics& metrics,
                                            int src_global_device,
                                            int dst_global_device,
+                                           int src_rank,
+                                           int dst_rank,
                                            std::size_t bytes,
                                            double numa_penalty_ns_per_hop = 50.0) {
     if (src_global_device < 0 || dst_global_device < 0) {
@@ -297,27 +299,66 @@ inline double estimate_migration_cost_bytes(const TopoMetrics& metrics,
                                ? metrics.pcie_bandwidth_gbps[s_idx]
                                : 10.0;
 
+    const std::size_t d_idx = static_cast<std::size_t>(dst_global_device);
+    const double pcie_lat_dst = (d_idx < metrics.pcie_latency_ns.size()) ? metrics.pcie_latency_ns[d_idx] : 5000.0;
+    const double pcie_bw_dst = (d_idx < metrics.pcie_bandwidth_gbps.size() && metrics.pcie_bandwidth_gbps[d_idx] > 0.0)
+                               ? metrics.pcie_bandwidth_gbps[d_idx]
+                               : 10.0;
+
     int src_node = 0;
     int dst_node = 0;
     if (s_idx < metrics.device_numa_node.size()) {
         src_node = metrics.device_numa_node[s_idx];
     }
-    const std::size_t d_idx = static_cast<std::size_t>(dst_global_device);
     if (d_idx < metrics.device_numa_node.size()) {
         dst_node = metrics.device_numa_node[d_idx];
     }
 
     double latency_s = 0.0;
-    if (src_node == dst_node) {
-        latency_s = pcie_lat * 1e-9;
+    double transfer_s = 0.0;
+
+    if (src_rank != dst_rank && src_rank >= 0 && dst_rank >= 0) {
+        // Inter-rank migration: PCIe src + MPI network + PCIe dst
+        latency_s = (pcie_lat + pcie_lat_dst) * 1e-9;
+        transfer_s = (static_cast<double>(bytes) / (pcie_bw * 1e9)) +
+                     (static_cast<double>(bytes) / (pcie_bw_dst * 1e9));
+
+        if (!metrics.mpi_latency_ns.empty()) {
+            std::size_t num_ranks = static_cast<std::size_t>(std::round(std::sqrt(metrics.mpi_latency_ns.size())));
+            if (num_ranks > 0) {
+                std::size_t mpi_idx = static_cast<std::size_t>(src_rank) * num_ranks + static_cast<std::size_t>(dst_rank);
+                if (mpi_idx < metrics.mpi_latency_ns.size()) {
+                    latency_s += metrics.mpi_latency_ns[mpi_idx] * 1e-9;
+                    double mpi_bw = metrics.mpi_bandwidth_gbps[mpi_idx];
+                    if (mpi_bw > 0.0) {
+                        transfer_s += static_cast<double>(bytes) / (mpi_bw * 1e9);
+                    } else {
+                        transfer_s += static_cast<double>(bytes) / (1.0 * 1e9);
+                    }
+                }
+            }
+        }
     } else {
-        const double extra_latency_ns =
-            static_cast<double>(numa_distance_between(metrics, src_node, dst_node)) * numa_penalty_ns_per_hop;
-        latency_s = (pcie_lat + extra_latency_ns) * 1e-9;
+        // Intra-rank migration: NUMA + PCIe
+        if (src_node == dst_node) {
+            latency_s = pcie_lat * 1e-9;
+        } else {
+            const double extra_latency_ns =
+                static_cast<double>(numa_distance_between(metrics, src_node, dst_node)) * numa_penalty_ns_per_hop;
+            latency_s = (pcie_lat + extra_latency_ns) * 1e-9;
+        }
+        transfer_s = static_cast<double>(bytes) / (pcie_bw * 1e9);
     }
 
-    const double transfer_s = static_cast<double>(bytes) / (pcie_bw * 1e9);
     return latency_s + transfer_s;
+}
+
+inline double estimate_migration_cost_bytes(const TopoMetrics& metrics,
+                                           int src_global_device,
+                                           int dst_global_device,
+                                           std::size_t bytes,
+                                           double numa_penalty_ns_per_hop = 50.0) {
+    return estimate_migration_cost_bytes(metrics, src_global_device, dst_global_device, -1, -1, bytes, numa_penalty_ns_per_hop);
 }
 
 inline double adjusted_capacity(const TopoMetrics& metrics, int global_device, double raw_throughput) {

@@ -89,8 +89,8 @@ void test_cross_vs_same_numa_migration_cost() {
 
     // Test 1: Zero bytes transfer
     {
-        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, 0, penalty_ns);
-        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, 0, penalty_ns);
+        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, -1, -1, 0, penalty_ns);
+        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, -1, -1, 0, penalty_ns);
         assert(cross_cost > same_cost);
         const double expected_diff = (25.0 * penalty_ns) * 1e-9;
         assert(std::fabs((cross_cost - same_cost) - expected_diff) < 1e-12);
@@ -99,8 +99,8 @@ void test_cross_vs_same_numa_migration_cost() {
     // Test 2: 1 MiB transfer (1048576 bytes)
     {
         const std::size_t bytes = 1048576;
-        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, bytes, penalty_ns);
-        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, bytes, penalty_ns);
+        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, -1, -1, bytes, penalty_ns);
+        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, -1, -1, bytes, penalty_ns);
 
         assert(cross_cost > same_cost);
 
@@ -112,16 +112,16 @@ void test_cross_vs_same_numa_migration_cost() {
     // Test 3: 16 MiB transfer
     {
         const std::size_t bytes = 16 * 1024 * 1024;
-        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, bytes, penalty_ns);
-        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, bytes, penalty_ns);
+        const double same_cost = dcl::estimate_migration_cost_bytes(m, 0, 0, -1, -1, bytes, penalty_ns);
+        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, -1, -1, bytes, penalty_ns);
         assert(cross_cost > same_cost);
     }
 
     // Test 4: Reverse direction (device 1 to device 0 vs device 1 to device 1)
     {
         const std::size_t bytes = 2 * 1024 * 1024;
-        const double same_cost = dcl::estimate_migration_cost_bytes(m, 1, 1, bytes, penalty_ns);
-        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 1, 0, bytes, penalty_ns);
+        const double same_cost = dcl::estimate_migration_cost_bytes(m, 1, 1, -1, -1, bytes, penalty_ns);
+        const double cross_cost = dcl::estimate_migration_cost_bytes(m, 1, 0, -1, -1, bytes, penalty_ns);
         assert(cross_cost > same_cost);
     }
 
@@ -129,12 +129,42 @@ void test_cross_vs_same_numa_migration_cost() {
     {
         bool caught = false;
         try {
-            (void)dcl::estimate_migration_cost_bytes(m, -1, 0, 1024);
+            (void)dcl::estimate_migration_cost_bytes(m, -1, 0, -1, -1, 1024);
         } catch (const dcl::Error&) {
             caught = true;
         }
         assert(caught && "Expected dcl::Error for negative device index");
     }
+
+    std::cout << "  -> PASS" << std::endl;
+}
+
+void test_mpi_network_cost_calculation() {
+    std::cout << "[TEST] Running test_mpi_network_cost_calculation..." << std::endl;
+
+    dcl::TopoMetrics m;
+    m.pcie_latency_ns = {4000.0, 4000.0};
+    m.pcie_bandwidth_gbps = {12.0, 12.0};
+    m.device_numa_node = {0, 0};
+    m.numa_distance = {10, 10, 10, 10};
+
+    // 2x2 MPI matrix (2 ranks)
+    // rank 0 to rank 1 has astronomical latency
+    m.mpi_latency_ns = {0.0, 1e9, 1e9, 0.0}; // 1 second latency!
+    m.mpi_bandwidth_gbps = {10.0, 10.0, 10.0, 10.0};
+
+    const double penalty_ns = 50.0;
+    const std::size_t bytes = 1048576; // 1 MiB
+
+    // Intra-rank cost
+    const double intra_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, 0, 0, bytes, penalty_ns);
+
+    // Inter-rank cost (rank 0 to rank 1)
+    const double inter_cost = dcl::estimate_migration_cost_bytes(m, 0, 1, 0, 1, bytes, penalty_ns);
+
+    assert(inter_cost > intra_cost);
+    // Should be at least 1 second due to MPI latency
+    assert(inter_cost >= 1.0);
 
     std::cout << "  -> PASS" << std::endl;
 }
@@ -321,6 +351,69 @@ void test_numa_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
     std::cout << "  -> PASS" << std::endl;
 }
 
+void test_mpi_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
+    std::cout << "[TEST] Running test_mpi_skip_rebalance_when_cost_high..." << std::endl;
+
+    // Trick the runtime into thinking there are 2 ranks for the purpose of partitioning
+    rt.set_simulated_ranks_for_testing(2);
+    rt.set_simulated_devices_count(2); // 2 devices across 2 ranks: {1, 1}
+
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = 4;
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    dcl::FieldSpec fs;
+    fs.name = "test_field_mpi";
+    fs.global_elements = 1000000;
+    fs.units_per_element = 1;
+    fs.bytes_per_unit = 4;
+    fs.usage = dcl::BufferUsage::read_write;
+    fs.redistribution = dcl::RedistributionDependency::proportional;
+    dcl::FieldHandle fh = rt.create_field(fs);
+
+    // Fast PCIe, no NUMA penalty, but astronomical MPI latency
+    dcl::TopoMetrics m;
+    m.pcie_latency_ns = {1.0, 1.0};
+    m.pcie_bandwidth_gbps = {1000.0, 1000.0};
+    m.mpi_latency_ns = {0.0, 10e9, 10e9, 0.0}; // 10 seconds latency
+    m.mpi_bandwidth_gbps = {10.0, 10.0, 10.0, 10.0};
+    m.numa_distance = {10, 10, 10, 10}; 
+    m.device_numa_node = {0, 0};          
+    rt.set_topo_metrics(m);
+
+    // Imbalance creates small gain (~0.009s) << 10s cost
+    rt.set_simulated_times({0.0010, 0.010});
+
+    std::stringstream captured;
+    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+
+    const bool rebalanced = rt.maybe_rebalance_from_timings({fh}, 0.01f, 0.50);
+
+    std::cout.rdbuf(old_buf);
+    const std::string out_str = captured.str();
+    std::cout << out_str;
+
+    assert(!rebalanced && "Expected rebalance to be skipped due to MPI network migration cost");
+
+    int current_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &current_rank);
+    if (current_rank == 0) {
+        const std::string expected_log = "[NUMA] migration cost exceeds gain threshold, skipping rebalance";
+        assert(out_str.find(expected_log) != std::string::npos &&
+               "Expected log line not found");
+    }
+
+    // Restore runtime back to 1 rank
+    rt.set_simulated_ranks_for_testing(1);
+    rt.set_simulated_devices_count(2);
+    rt.clear_simulated_times();
+
+    std::cout << "  -> PASS" << std::endl;
+}
+
 void test_divergent_numa_consensus(dcl::Runtime& rt) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -389,8 +482,10 @@ int main(int argc, char** argv) {
 
     test_numa_distance_matrix_and_helper();
     test_cross_vs_same_numa_migration_cost();
+    test_mpi_network_cost_calculation();
     test_invalid_device_numa_node_throws(rt);
     test_numa_skip_rebalance_when_cost_high(rt);
+    test_mpi_skip_rebalance_when_cost_high(rt);
     test_divergent_numa_consensus(rt);
 
     std::cout << "\nAll test_numa_cost unit tests PASSED successfully!" << std::endl;
