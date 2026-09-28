@@ -25,26 +25,36 @@
 namespace {
 
 struct LocalDeviceProbe {
-    double pcie_latency_ns{4500.0};
-    double pcie_bandwidth_gbps{15.75};
-    int numa_node{0};
+    double pcie_latency_ns{-1.0};
+    double pcie_bandwidth_gbps{-1.0};
+    int numa_node{-1};
 };
 
-std::vector<LocalDeviceProbe> probe_opencl_devices() {
+std::vector<LocalDeviceProbe> probe_opencl_devices(bool allow_synthetic) {
     std::vector<LocalDeviceProbe> devices;
 
     cl_uint num_platforms = 0;
     cl_int err = clGetPlatformIDs(0, nullptr, &num_platforms);
     if (err != CL_SUCCESS || num_platforms == 0) {
+        if (!allow_synthetic) {
+            std::cerr << "Error: clGetPlatformIDs failed or returned 0 platforms." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            exit(1);
+        }
         // Fallback to 1 synthetic device
-        devices.push_back(LocalDeviceProbe{});
+        devices.push_back(LocalDeviceProbe{4500.0, 15.75, 0});
         return devices;
     }
 
     std::vector<cl_platform_id> platforms(num_platforms);
     err = clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
     if (err != CL_SUCCESS) {
-        devices.push_back(LocalDeviceProbe{});
+        if (!allow_synthetic) {
+            std::cerr << "Error: clGetPlatformIDs failed to get platform IDs." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            exit(1);
+        }
+        devices.push_back(LocalDeviceProbe{4500.0, 15.75, 0});
         return devices;
     }
 
@@ -66,7 +76,6 @@ std::vector<LocalDeviceProbe> probe_opencl_devices() {
             cl_int c_err = CL_SUCCESS;
             cl_context ctx = clCreateContext(props, 1, &dev, nullptr, nullptr, &c_err);
             if (c_err != CL_SUCCESS || ctx == nullptr) {
-                devices.push_back(probe);
                 continue;
             }
 
@@ -74,7 +83,6 @@ std::vector<LocalDeviceProbe> probe_opencl_devices() {
             cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, dev, qprops, &c_err);
             if (c_err != CL_SUCCESS || queue == nullptr) {
                 clReleaseContext(ctx);
-                devices.push_back(probe);
                 continue;
             }
 
@@ -130,12 +138,29 @@ std::vector<LocalDeviceProbe> probe_opencl_devices() {
 
             clReleaseCommandQueue(queue);
             clReleaseContext(ctx);
+
+            if (probe.pcie_latency_ns < 0.0 || probe.pcie_bandwidth_gbps < 0.0) {
+                if (!allow_synthetic) {
+                    std::cerr << "Error: Measurement failed for a real GPU." << std::endl;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    exit(1);
+                }
+                probe.pcie_latency_ns = 4500.0;
+                probe.pcie_bandwidth_gbps = 15.75;
+            }
+            if (allow_synthetic) probe.numa_node = 0;
+
             devices.push_back(probe);
         }
     }
 
     if (devices.empty()) {
-        devices.push_back(LocalDeviceProbe{});
+        if (!allow_synthetic) {
+            std::cerr << "Error: No OpenCL devices successfully probed." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            exit(1);
+        }
+        devices.push_back(LocalDeviceProbe{4500.0, 15.75, 0});
     }
     return devices;
 }
@@ -155,15 +180,18 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     std::string output_json_path;
+    bool allow_synthetic = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--output-json" && i + 1 < argc) {
             output_json_path = argv[i + 1];
             ++i;
+        } else if (std::string(argv[i]) == "--synthetic") {
+            allow_synthetic = true;
         }
     }
 
     // 1. Measure PCIe metrics for local OpenCL devices
-    std::vector<LocalDeviceProbe> local_probes = probe_opencl_devices();
+    std::vector<LocalDeviceProbe> local_probes = probe_opencl_devices(allow_synthetic);
     int local_dev_count = static_cast<int>(local_probes.size());
 
     std::vector<int> all_dev_counts(static_cast<std::size_t>(size), 0);
@@ -197,62 +225,65 @@ int main(int argc, char** argv) {
     std::vector<double> rank_to_rank_bw(static_cast<std::size_t>(size * size), 0.0);
 
     if (size > 1) {
-        int next_rank = (rank + 1) % size;
-        int prev_rank = (rank - 1 + size) % size;
+        std::vector<double> local_pairs_lat(static_cast<std::size_t>(size), 0.0);
+        std::vector<double> local_pairs_bw(static_cast<std::size_t>(size), 0.0);
 
         // Small message (64 B) latency measurement
         const int small_bytes = 64;
         std::vector<char> s_send(small_bytes, 1);
         std::vector<char> s_recv(small_bytes, 0);
 
-        // Warmup
-        for (int w = 0; w < 5; ++w) {
-            MPI_Sendrecv(s_send.data(), small_bytes, MPI_CHAR, next_rank, 100,
-                         s_recv.data(), small_bytes, MPI_CHAR, prev_rank, 100,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-
-        const int mpi_lat_iters = 30;
-        MPI_Barrier(MPI_COMM_WORLD);
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int it = 0; it < mpi_lat_iters; ++it) {
-            MPI_Sendrecv(s_send.data(), small_bytes, MPI_CHAR, next_rank, 101,
-                         s_recv.data(), small_bytes, MPI_CHAR, prev_rank, 101,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double elapsed_ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
-        double neighbor_lat_ns = (elapsed_ns / static_cast<double>(mpi_lat_iters));
-
         // Large message (1 MiB) bandwidth measurement
         const int large_bytes = 1024 * 1024;
         std::vector<char> l_send(large_bytes, 2);
         std::vector<char> l_recv(large_bytes, 0);
 
-        // Warmup
-        MPI_Sendrecv(l_send.data(), large_bytes, MPI_CHAR, next_rank, 200,
-                     l_recv.data(), large_bytes, MPI_CHAR, prev_rank, 200,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (int step = 1; step < size; ++step) {
+            int next_rank = (rank + step) % size;
+            int prev_rank = (rank - step + size) % size;
 
-        const int mpi_bw_iters = 5;
-        MPI_Barrier(MPI_COMM_WORLD);
-        t0 = std::chrono::high_resolution_clock::now();
-        for (int it = 0; it < mpi_bw_iters; ++it) {
-            MPI_Sendrecv(l_send.data(), large_bytes, MPI_CHAR, next_rank, 201,
-                         l_recv.data(), large_bytes, MPI_CHAR, prev_rank, 201,
+            // Warmup
+            for (int w = 0; w < 5; ++w) {
+                MPI_Sendrecv(s_send.data(), small_bytes, MPI_CHAR, next_rank, 100,
+                             s_recv.data(), small_bytes, MPI_CHAR, prev_rank, 100,
+                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+
+            const int mpi_lat_iters = 30;
+            MPI_Barrier(MPI_COMM_WORLD);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int it = 0; it < mpi_lat_iters; ++it) {
+                MPI_Sendrecv(s_send.data(), small_bytes, MPI_CHAR, next_rank, 101,
+                             s_recv.data(), small_bytes, MPI_CHAR, prev_rank, 101,
+                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double elapsed_ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+            double neighbor_lat_ns = (elapsed_ns / static_cast<double>(mpi_lat_iters));
+
+            // Warmup
+            MPI_Sendrecv(l_send.data(), large_bytes, MPI_CHAR, next_rank, 200,
+                         l_recv.data(), large_bytes, MPI_CHAR, prev_rank, 200,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-        t1 = std::chrono::high_resolution_clock::now();
-        double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
-        double neighbor_bw_gbps = 0.0;
-        if (elapsed_sec > 0.0) {
-            neighbor_bw_gbps = (static_cast<double>(large_bytes) * static_cast<double>(mpi_bw_iters)) / (elapsed_sec * 1e9);
-        }
 
-        std::vector<double> local_pairs_lat(static_cast<std::size_t>(size), 0.0);
-        std::vector<double> local_pairs_bw(static_cast<std::size_t>(size), 0.0);
-        local_pairs_lat[static_cast<std::size_t>(next_rank)] = neighbor_lat_ns;
-        local_pairs_bw[static_cast<std::size_t>(next_rank)] = neighbor_bw_gbps;
+            const int mpi_bw_iters = 5;
+            MPI_Barrier(MPI_COMM_WORLD);
+            t0 = std::chrono::high_resolution_clock::now();
+            for (int it = 0; it < mpi_bw_iters; ++it) {
+                MPI_Sendrecv(l_send.data(), large_bytes, MPI_CHAR, next_rank, 201,
+                             l_recv.data(), large_bytes, MPI_CHAR, prev_rank, 201,
+                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+            t1 = std::chrono::high_resolution_clock::now();
+            double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+            double neighbor_bw_gbps = 0.0;
+            if (elapsed_sec > 0.0) {
+                neighbor_bw_gbps = (static_cast<double>(large_bytes) * static_cast<double>(mpi_bw_iters)) / (elapsed_sec * 1e9);
+            }
+
+            local_pairs_lat[static_cast<std::size_t>(next_rank)] = neighbor_lat_ns;
+            local_pairs_bw[static_cast<std::size_t>(next_rank)] = neighbor_bw_gbps;
+        }
 
         MPI_Allgather(local_pairs_lat.data(), size, MPI_DOUBLE,
                       rank_to_rank_lat.data(), size, MPI_DOUBLE, MPI_COMM_WORLD);
@@ -290,8 +321,15 @@ int main(int argc, char** argv) {
             } else {
                 double l = rank_to_rank_lat[static_cast<std::size_t>(src_r * size + dst_r)];
                 double b = rank_to_rank_bw[static_cast<std::size_t>(src_r * size + dst_r)];
-                if (l <= 0.0) l = 1500.0;
-                if (b <= 0.0) b = 3.5;
+                if (l <= 0.0 || b <= 0.0) {
+                    if (!allow_synthetic) {
+                        std::cerr << "Error: Failed to measure MPI route." << std::endl;
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    }
+                    if (l <= 0.0) l = 1500.0;
+                    if (b <= 0.0) b = 3.5;
+                }
                 metrics.mpi_latency_ns[idx] = l;
                 metrics.mpi_bandwidth_gbps[idx] = b;
             }
@@ -299,11 +337,13 @@ int main(int argc, char** argv) {
     }
 
     // Forward-compatible fields for R2/R5
-    metrics.numa_distance = {10};
-    metrics.device_numa_node.assign(static_cast<std::size_t>(total_devices), 0);
-    metrics.memory_contention_factor.assign(static_cast<std::size_t>(total_devices), 1.0);
-    metrics.thermal_tdp_watts.assign(static_cast<std::size_t>(total_devices), 250.0);
-    metrics.current_power_watts.assign(static_cast<std::size_t>(total_devices), 120.0);
+    if (allow_synthetic) {
+        metrics.numa_distance = {10};
+        metrics.device_numa_node.assign(static_cast<std::size_t>(total_devices), 0);
+        metrics.memory_contention_factor.assign(static_cast<std::size_t>(total_devices), 1.0);
+        metrics.thermal_tdp_watts.assign(static_cast<std::size_t>(total_devices), 250.0);
+        metrics.current_power_watts.assign(static_cast<std::size_t>(total_devices), 120.0);
+    }
 
     // 4. Output machine-readable key=value format on rank 0
     if (rank == 0) {
