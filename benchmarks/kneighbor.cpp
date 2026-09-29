@@ -237,17 +237,18 @@ int main(int argc, char** argv) {
                 const int work_passes = (dev_id == 0 ? 2 : 1);
                 
                 const auto t0_cpu = std::chrono::steady_clock::now();
-                const float inv_k = 1.0f / static_cast<float>(2 * k + 1);
                 for (int pass = 0; pass < work_passes; ++pass) {
                     for (std::size_t i = offset; i < offset + count; ++i) {
                         float sum = 0.0f;
+                        int valid_neighbors = 0;
                         for (int o = -k; o <= k; ++o) {
                             const long long idx = static_cast<long long>(i) + o;
                             if (idx >= 0 && idx < static_cast<long long>(n)) {
                                 sum += in_data[static_cast<std::size_t>(idx)];
+                                valid_neighbors++;
                             }
                         }
-                        out_data[i] = sum * inv_k;
+                        out_data[i] = sum / static_cast<float>(valid_neighbors);
                     }
                 }
                 const auto t1_cpu = std::chrono::steady_clock::now();
@@ -263,6 +264,31 @@ int main(int argc, char** argv) {
 
         std::vector<double> device_times(partitions.size(), 0.0);
         MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+        // M1 Verification on the last iteration
+        if (it == iterations - 1 && opencl_available) {
+            runtime.gather(h_out, out_data.data(), n * sizeof(float));
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank != rank) continue;
+                for (std::size_t i = p.global_offset; i < p.global_offset + p.element_count; ++i) {
+                    float sum = 0.0f;
+                    int valid_neighbors = 0;
+                    for (int o = -k; o <= k; ++o) {
+                        const long long idx = static_cast<long long>(i) + o;
+                        if (idx >= 0 && idx < static_cast<long long>(n)) {
+                            sum += in_data[static_cast<std::size_t>(idx)];
+                            valid_neighbors++;
+                        }
+                    }
+                    float cpu_val = sum / static_cast<float>(valid_neighbors);
+                    if (std::abs(out_data[i] - cpu_val) > 1e-5f) {
+                        std::cerr << "M1 Verification failed at index " << i << ": GPU=" << out_data[i] << " CPU=" << cpu_val << "\n";
+                        MPI_Abort(runtime.communicator(), 1);
+                    }
+                }
+            }
+        }
 
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});

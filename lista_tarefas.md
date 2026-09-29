@@ -111,7 +111,7 @@
   - Arquivo PBS passa a usar `set -euo pipefail`.
   - Checar as variáveis vitais (`PBS_NODEFILE`, `PBS_O_WORKDIR`) e abortar via `$?` estrito em falha nas chamadas.
 
-### [ ] M1 - Divergência Stencil CPU/GPU
+### [x] M1 - Divergência Stencil CPU/GPU
 * **Descrição:** Borda do alg CPU divide forçado por `2*k+1`, enquanto o Kernel adequadamente normaliza pelo vizinho disponível encontrado, falhando em bordas `0`.
 * **Citação da Auditoria:** Item "M1 — Médio — O stencil CPU diverge do kernel nas bordas".
 * **Arquivos e Linhas Afetados:** `benchmarks/kneighbor.cpp` (190–202) e `benchmarks/kneighbor.cl` (10–18).
