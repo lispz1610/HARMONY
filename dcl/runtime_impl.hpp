@@ -253,9 +253,53 @@ static inline float l2_norm_diff(const std::vector<float>& a, const std::vector<
     return static_cast<float>(std::sqrt(acc));
 }
 
+template<typename T, typename Deleter>
+class AutoCLHandle {
+    T handle_{nullptr};
+public:
+    AutoCLHandle() = default;
+    AutoCLHandle(T h) : handle_(h) {}
+    ~AutoCLHandle() { if (handle_) Deleter()(handle_); }
+    AutoCLHandle(const AutoCLHandle&) = delete;
+    AutoCLHandle& operator=(const AutoCLHandle&) = delete;
+    AutoCLHandle(AutoCLHandle&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+    AutoCLHandle& operator=(AutoCLHandle&& other) noexcept {
+        if (this != &other) {
+            if (handle_) Deleter()(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    AutoCLHandle& operator=(T h) {
+        if (handle_) Deleter()(handle_);
+        handle_ = h;
+        return *this;
+    }
+    operator T() const { return handle_; }
+    T get() const { return handle_; }
+    T* ptr() { return &handle_; }
+    bool operator==(T h) const { return handle_ == h; }
+    bool operator!=(T h) const { return handle_ != h; }
+};
+
+struct CLMemDeleter { void operator()(cl_mem m) const { if(m) clReleaseMemObject(m); } };
+struct CLContextDeleter { void operator()(cl_context m) const { if(m) clReleaseContext(m); } };
+struct CLQueueDeleter { void operator()(cl_command_queue m) const { if(m) clReleaseCommandQueue(m); } };
+struct CLProgramDeleter { void operator()(cl_program m) const { if(m) clReleaseProgram(m); } };
+struct CLKernelDeleter { void operator()(cl_kernel m) const { if(m) clReleaseKernel(m); } };
+
+using AutoMem = AutoCLHandle<cl_mem, CLMemDeleter>;
+using AutoContext = AutoCLHandle<cl_context, CLContextDeleter>;
+using AutoQueue = AutoCLHandle<cl_command_queue, CLQueueDeleter>;
+using AutoProgram = AutoCLHandle<cl_program, CLProgramDeleter>;
+using AutoKernel = AutoCLHandle<cl_kernel, CLKernelDeleter>;
+
 struct PlatformContext {
     cl_platform_id platform{nullptr};
-    cl_context context{nullptr};
+    AutoContext context;
     std::vector<cl_device_id> devices;
 };
 
@@ -267,8 +311,8 @@ struct LocalDevice {
 
     cl_device_id device{nullptr};
     cl_context context{nullptr};
-    cl_command_queue kernel_queue{nullptr};
-    cl_command_queue transfer_queue{nullptr};
+    AutoQueue kernel_queue;
+    AutoQueue transfer_queue;
 
     cl_uint compute_units{0};
     DeviceKind kind{DeviceKind::all};
@@ -277,13 +321,13 @@ struct LocalDevice {
 
 struct RegisteredField {
     FieldSpec spec;
-    std::vector<cl_mem> replicas;
+    std::vector<AutoMem> replicas;
 };
 
 struct RegisteredKernel {
     KernelSpec spec;
-    std::vector<cl_program> programs_per_platform;
-    std::vector<cl_kernel> kernels_per_local_device;
+    std::vector<AutoProgram> programs_per_platform;
+    std::vector<AutoKernel> kernels_per_local_device;
 };
 
 } // namespace detail
@@ -306,32 +350,7 @@ public:
         cppcheck_anchor_unused();
 #endif
         reset_balance_window_events();
-
-        for (const auto& kv : kernels_) {
-            const detail::RegisteredKernel& rk = kv.second;
-            for (cl_kernel k : rk.kernels_per_local_device) {
-                if (k != nullptr) clReleaseKernel(k);
-            }
-            for (cl_program p : rk.programs_per_platform) {
-                if (p != nullptr) clReleaseProgram(p);
-            }
-        }
-
-        for (const auto& kv : fields_) {
-            const detail::RegisteredField& rf = kv.second;
-            for (cl_mem mem : rf.replicas) {
-                if (mem != nullptr) clReleaseMemObject(mem);
-            }
-        }
-
-        for (std::size_t i = 0; i < local_devices_.size(); ++i) {
-            if (local_devices_[i].kernel_queue != nullptr) clReleaseCommandQueue(local_devices_[i].kernel_queue);
-            if (local_devices_[i].transfer_queue != nullptr) clReleaseCommandQueue(local_devices_[i].transfer_queue);
-        }
-
-        for (std::size_t i = 0; i < platforms_.size(); ++i) {
-            if (platforms_[i].context != nullptr) clReleaseContext(platforms_[i].context);
-        }
+        clear_runtime_state();
     }
 
     void initialize_mpi_from_runtime() {
@@ -352,148 +371,153 @@ public:
     void discover_devices(const DeviceSelection& selection) {
         clear_runtime_state();
 
-        cl_uint n_platforms = 0;
-        detail::check_cl(clGetPlatformIDs(0, nullptr, &n_platforms), "clGetPlatformIDs(count)");
-        if (n_platforms == 0) {
-            all_device_counts_.assign(size_, 0);
-            return;
-        }
-
-        std::vector<cl_platform_id> platform_ids(n_platforms);
-        detail::check_cl(clGetPlatformIDs(n_platforms, platform_ids.data(), nullptr), "clGetPlatformIDs(list)");
-
-        int next_local_index = 0;
-        const int max_per_rank = (selection.max_devices_per_rank <= 0)
-            ? std::numeric_limits<int>::max()
-            : selection.max_devices_per_rank;
-
-        for (cl_uint p = 0; p < n_platforms; ++p) {
-            cl_uint dev_count = 0;
-            cl_int err = clGetDeviceIDs(platform_ids[p], CL_DEVICE_TYPE_ALL, 0, nullptr, &dev_count);
-            if (err == CL_DEVICE_NOT_FOUND || dev_count == 0) continue;
-            detail::check_cl(err, "clGetDeviceIDs(count)");
-
-            std::vector<cl_device_id> platform_devices(dev_count);
-            detail::check_cl(
-                clGetDeviceIDs(platform_ids[p], CL_DEVICE_TYPE_ALL, dev_count, platform_devices.data(), nullptr),
-                "clGetDeviceIDs(list)"
-            );
-
-            std::vector<cl_device_id> selected_devices;
-            for (cl_uint i = 0; i < dev_count; ++i) {
-                if (next_local_index >= max_per_rank) break;
-                cl_device_type dtype = 0;
-                detail::check_cl(
-                    clGetDeviceInfo(platform_devices[i], CL_DEVICE_TYPE, sizeof(dtype), &dtype, nullptr),
-                    "clGetDeviceInfo(CL_DEVICE_TYPE)"
-                );
-                const DeviceKind kind = detail::classify_device_kind(dtype);
-                if (!detail::matches(selection.kind, kind)) continue;
-                selected_devices.push_back(platform_devices[i]);
-                ++next_local_index;
+        try {
+            cl_uint n_platforms = 0;
+            detail::check_cl(clGetPlatformIDs(0, nullptr, &n_platforms), "clGetPlatformIDs(count)");
+            if (n_platforms == 0) {
+                all_device_counts_.assign(size_, 0);
+                return;
             }
 
-            if (selected_devices.empty()) continue;
+            std::vector<cl_platform_id> platform_ids(n_platforms);
+            detail::check_cl(clGetPlatformIDs(n_platforms, platform_ids.data(), nullptr), "clGetPlatformIDs(list)");
 
-            detail::PlatformContext pc{};
-            pc.platform = platform_ids[p];
-            pc.devices = selected_devices;
+            int next_local_index = 0;
+            const int max_per_rank = (selection.max_devices_per_rank <= 0)
+                ? std::numeric_limits<int>::max()
+                : selection.max_devices_per_rank;
 
-            cl_context_properties props[] = {
-                CL_CONTEXT_PLATFORM,
-                reinterpret_cast<cl_context_properties>(platform_ids[p]),
-                0
-            };
+            for (cl_uint p = 0; p < n_platforms; ++p) {
+                cl_uint dev_count = 0;
+                cl_int err = clGetDeviceIDs(platform_ids[p], CL_DEVICE_TYPE_ALL, 0, nullptr, &dev_count);
+                if (err == CL_DEVICE_NOT_FOUND || dev_count == 0) continue;
+                detail::check_cl(err, "clGetDeviceIDs(count)");
 
-            cl_int ctx_err = CL_SUCCESS;
-            pc.context = clCreateContext(
-                props,
-                static_cast<cl_uint>(selected_devices.size()),
-                selected_devices.data(),
-                nullptr,
-                nullptr,
-                &ctx_err
-            );
-            detail::check_cl(ctx_err, "clCreateContext");
+                std::vector<cl_device_id> platform_devices(dev_count);
+                detail::check_cl(
+                    clGetDeviceIDs(platform_ids[p], CL_DEVICE_TYPE_ALL, dev_count, platform_devices.data(), nullptr),
+                    "clGetDeviceIDs(list)"
+                );
 
-            platforms_.push_back(pc);
-            const int platform_index = static_cast<int>(platforms_.size() - 1);
+                std::vector<cl_device_id> selected_devices;
+                for (cl_uint i = 0; i < dev_count; ++i) {
+                    if (next_local_index >= max_per_rank) break;
+                    cl_device_type dtype = 0;
+                    detail::check_cl(
+                        clGetDeviceInfo(platform_devices[i], CL_DEVICE_TYPE, sizeof(dtype), &dtype, nullptr),
+                        "clGetDeviceInfo(CL_DEVICE_TYPE)"
+                    );
+                    const DeviceKind kind = detail::classify_device_kind(dtype);
+                    if (!detail::matches(selection.kind, kind)) continue;
+                    selected_devices.push_back(platform_devices[i]);
+                    ++next_local_index;
+                }
 
-            for (std::size_t i = 0; i < selected_devices.size(); ++i) {
-                detail::LocalDevice ld{};
-                ld.platform_index = platform_index;
-                ld.device_index_in_platform = static_cast<int>(i);
-                ld.local_index = static_cast<int>(local_devices_.size());
-                ld.device = selected_devices[i];
-                ld.context = platforms_[platform_index].context;
+                if (selected_devices.empty()) continue;
 
-                char name_buf[512] = {};
-                cl_uint cus = 0;
-                cl_device_type dtype = 0;
+                detail::PlatformContext pc{};
+                pc.platform = platform_ids[p];
+                pc.devices = selected_devices;
 
-                detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_NAME, sizeof(name_buf), name_buf, nullptr), "clGetDeviceInfo(CL_DEVICE_NAME)");
-                detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, nullptr), "clGetDeviceInfo(CL_DEVICE_MAX_COMPUTE_UNITS)");
-                detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_TYPE, sizeof(dtype), &dtype, nullptr), "clGetDeviceInfo(CL_DEVICE_TYPE)");
-
-                ld.name = std::string(name_buf);
-                if (!ld.name.empty() && ld.name.back() == '\0') ld.name.pop_back();
-                ld.compute_units = static_cast<unsigned>(cus);
-                ld.kind = detail::classify_device_kind(dtype);
-
-                cl_int qerr = CL_SUCCESS;
-#if CL_TARGET_OPENCL_VERSION >= 200
-                const cl_queue_properties qprops[] = {
-                    CL_QUEUE_PROPERTIES,
-                    static_cast<cl_queue_properties>(CL_QUEUE_PROFILING_ENABLE),
+                cl_context_properties props[] = {
+                    CL_CONTEXT_PLATFORM,
+                    reinterpret_cast<cl_context_properties>(platform_ids[p]),
                     0
                 };
-                ld.kernel_queue = clCreateCommandQueueWithProperties(ld.context, ld.device, qprops, &qerr);
-                detail::check_cl(qerr, "clCreateCommandQueueWithProperties(kernel_queue)");
-                ld.transfer_queue = clCreateCommandQueueWithProperties(ld.context, ld.device, qprops, &qerr);
-                detail::check_cl(qerr, "clCreateCommandQueueWithProperties(transfer_queue)");
+
+                cl_int ctx_err = CL_SUCCESS;
+                pc.context = clCreateContext(
+                    props,
+                    static_cast<cl_uint>(selected_devices.size()),
+                    selected_devices.data(),
+                    nullptr,
+                    nullptr,
+                    &ctx_err
+                );
+                detail::check_cl(ctx_err, "clCreateContext");
+
+                platforms_.push_back(std::move(pc));
+                const int platform_index = static_cast<int>(platforms_.size() - 1);
+
+                for (std::size_t i = 0; i < selected_devices.size(); ++i) {
+                    detail::LocalDevice ld{};
+                    ld.platform_index = platform_index;
+                    ld.device_index_in_platform = static_cast<int>(i);
+                    ld.local_index = static_cast<int>(local_devices_.size());
+                    ld.device = selected_devices[i];
+                    ld.context = platforms_[platform_index].context;
+
+                    char name_buf[512] = {};
+                    cl_uint cus = 0;
+                    cl_device_type dtype = 0;
+
+                    detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_NAME, sizeof(name_buf), name_buf, nullptr), "clGetDeviceInfo(CL_DEVICE_NAME)");
+                    detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, nullptr), "clGetDeviceInfo(CL_DEVICE_MAX_COMPUTE_UNITS)");
+                    detail::check_cl(clGetDeviceInfo(ld.device, CL_DEVICE_TYPE, sizeof(dtype), &dtype, nullptr), "clGetDeviceInfo(CL_DEVICE_TYPE)");
+
+                    ld.name = std::string(name_buf);
+                    if (!ld.name.empty() && ld.name.back() == '\0') ld.name.pop_back();
+                    ld.compute_units = static_cast<unsigned>(cus);
+                    ld.kind = detail::classify_device_kind(dtype);
+
+                    cl_int qerr = CL_SUCCESS;
+#if CL_TARGET_OPENCL_VERSION >= 200
+                    const cl_queue_properties qprops[] = {
+                        CL_QUEUE_PROPERTIES,
+                        static_cast<cl_queue_properties>(CL_QUEUE_PROFILING_ENABLE),
+                        0
+                    };
+                    ld.kernel_queue = clCreateCommandQueueWithProperties(ld.context, ld.device, qprops, &qerr);
+                    detail::check_cl(qerr, "clCreateCommandQueueWithProperties(kernel_queue)");
+                    ld.transfer_queue = clCreateCommandQueueWithProperties(ld.context, ld.device, qprops, &qerr);
+                    detail::check_cl(qerr, "clCreateCommandQueueWithProperties(transfer_queue)");
 #else
-                ld.kernel_queue = clCreateCommandQueue(ld.context, ld.device, CL_QUEUE_PROFILING_ENABLE, &qerr);
-                detail::check_cl(qerr, "clCreateCommandQueue(kernel_queue)");
-                ld.transfer_queue = clCreateCommandQueue(ld.context, ld.device, CL_QUEUE_PROFILING_ENABLE, &qerr);
-                detail::check_cl(qerr, "clCreateCommandQueue(transfer_queue)");
+                    ld.kernel_queue = clCreateCommandQueue(ld.context, ld.device, CL_QUEUE_PROFILING_ENABLE, &qerr);
+                    detail::check_cl(qerr, "clCreateCommandQueue(kernel_queue)");
+                    ld.transfer_queue = clCreateCommandQueue(ld.context, ld.device, CL_QUEUE_PROFILING_ENABLE, &qerr);
+                    detail::check_cl(qerr, "clCreateCommandQueue(transfer_queue)");
 #endif
 
-                local_devices_.push_back(ld);
+                    local_devices_.push_back(std::move(ld));
 
-                DeviceInfo info{};
-                info.rank = rank_;
-                info.local_index = ld.local_index;
-                info.global_index = -1;
-                info.name = ld.name;
-                info.kind = ld.kind;
-                info.compute_units = ld.compute_units;
-                devices_.push_back(info);
+                    DeviceInfo info{};
+                    info.rank = rank_;
+                    info.local_index = ld.local_index;
+                    info.global_index = -1;
+                    info.name = ld.name;
+                    info.kind = ld.kind;
+                    info.compute_units = ld.compute_units;
+                    devices_.push_back(info);
+                }
+
+                if (next_local_index >= max_per_rank) break;
             }
 
-            if (next_local_index >= max_per_rank) break;
+            const int local_count = static_cast<int>(devices_.size());
+            all_device_counts_.assign(size_, 0);
+            detail::check_mpi(
+                MPI_Allgather(&local_count, 1, MPI_INT, all_device_counts_.data(), 1, MPI_INT, comm_),
+                "MPI_Allgather(device_counts)"
+            );
+
+            int global_base = 0;
+            for (int r = 0; r < rank_; ++r) global_base += all_device_counts_[r];
+            for (std::size_t i = 0; i < devices_.size(); ++i) {
+                devices_[i].global_index = global_base + static_cast<int>(i);
+                local_devices_[i].global_index = devices_[i].global_index;
+            }
+
+            device_timings_.assign(local_devices_.size(), DeviceTiming{});
+            last_elapsed_local_.assign(local_devices_.size(), 0.0);
+            balance_window_start_events_.assign(local_devices_.size(), nullptr);
+            balance_window_end_events_.assign(local_devices_.size(), nullptr);
+            balance_window_valid_.assign(local_devices_.size(), false);
+            balance_window_kernel_events_.assign(local_devices_.size(), {});
+            balance_window_begin_iteration_ = 0;
+        } catch (...) {
+            clear_runtime_state();
+            throw;
         }
-
-        const int local_count = static_cast<int>(devices_.size());
-        all_device_counts_.assign(size_, 0);
-        detail::check_mpi(
-            MPI_Allgather(&local_count, 1, MPI_INT, all_device_counts_.data(), 1, MPI_INT, comm_),
-            "MPI_Allgather(device_counts)"
-        );
-
-        int global_base = 0;
-        for (int r = 0; r < rank_; ++r) global_base += all_device_counts_[r];
-        for (std::size_t i = 0; i < devices_.size(); ++i) {
-            devices_[i].global_index = global_base + static_cast<int>(i);
-            local_devices_[i].global_index = devices_[i].global_index;
-        }
-
-        device_timings_.assign(local_devices_.size(), DeviceTiming{});
-        last_elapsed_local_.assign(local_devices_.size(), 0.0);
-        balance_window_start_events_.assign(local_devices_.size(), nullptr);
-        balance_window_end_events_.assign(local_devices_.size(), nullptr);
-        balance_window_valid_.assign(local_devices_.size(), false);
-        balance_window_kernel_events_.assign(local_devices_.size(), {});
-        balance_window_begin_iteration_ = 0;
     }
 
     const std::vector<DeviceInfo>& devices() const noexcept { return devices_; }
@@ -514,7 +538,7 @@ public:
         FieldHandle h{next_field_id_++};
         detail::RegisteredField rf;
         rf.spec = spec;
-        rf.replicas.resize(local_devices_.empty() ? static_cast<std::size_t>(simulated_total_devices_) : local_devices_.size(), nullptr);
+        rf.replicas.resize(local_devices_.empty() ? static_cast<std::size_t>(simulated_total_devices_) : local_devices_.size());
 
         const std::size_t total_bytes = spec.global_elements * spec.units_per_element * spec.bytes_per_unit;
         const cl_mem_flags flags = detail::to_opencl_flags(spec.usage);
@@ -525,7 +549,7 @@ public:
             detail::check_cl(err, "clCreateBuffer(create_field)");
         }
 
-        fields_.insert(std::make_pair(h.value, rf));
+        fields_.insert(std::make_pair(h.value, std::move(rf)));
         if (spec.host_ptr != nullptr && !local_devices_.empty()) write_initial_field_data(h, spec.host_ptr);
         return h;
     }
@@ -538,8 +562,8 @@ public:
         KernelHandle h{next_kernel_id_++};
         detail::RegisteredKernel rk;
         rk.spec = spec;
-        rk.programs_per_platform.resize(platforms_.size(), nullptr);
-        rk.kernels_per_local_device.resize(local_devices_.size(), nullptr);
+        rk.programs_per_platform.resize(platforms_.size());
+        rk.kernels_per_local_device.resize(local_devices_.size());
 
         const std::string src = detail::slurp_file(spec.source_file);
         const char* src_ptr = src.c_str();
@@ -547,7 +571,7 @@ public:
 
         for (std::size_t p = 0; p < platforms_.size(); ++p) {
             cl_int err = CL_SUCCESS;
-            cl_program program = clCreateProgramWithSource(platforms_[p].context, 1, &src_ptr, &src_len, &err);
+            detail::AutoProgram program = clCreateProgramWithSource(platforms_[p].context, 1, &src_ptr, &src_len, &err);
             detail::check_cl(err, "clCreateProgramWithSource");
 
             err = clBuildProgram(
@@ -569,21 +593,19 @@ public:
                     clGetProgramBuildInfo(program, platforms_[p].devices[i], CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
                     oss << "---- device " << i << " ----\n" << log.data() << "\n";
                 }
-                clReleaseProgram(program);
                 throw Error(oss.str());
             }
-            rk.programs_per_platform[p] = program;
+            rk.programs_per_platform[p] = std::move(program);
         }
 
         for (std::size_t d = 0; d < local_devices_.size(); ++d) {
             const int p = local_devices_[d].platform_index;
             cl_int err = CL_SUCCESS;
-            cl_kernel k = clCreateKernel(rk.programs_per_platform[p], spec.entry_point.c_str(), &err);
+            rk.kernels_per_local_device[d] = clCreateKernel(rk.programs_per_platform[p], spec.entry_point.c_str(), &err);
             detail::check_cl(err, "clCreateKernel");
-            rk.kernels_per_local_device[d] = k;
         }
 
-        kernels_.insert(std::make_pair(h.value, rk));
+        kernels_.insert(std::make_pair(h.value, std::move(rk)));
         active_kernel_ = h.value;
         return h;
     }
