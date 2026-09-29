@@ -1866,6 +1866,7 @@ void extract_rw_fields(
         for (std::size_t d = 0; d < local_devices_.size(); ++d) {
             if (d >= balance_window_kernel_events_.size()) continue;
 
+            detail::check_cl(clFlush(local_devices_[d].kernel_queue), "clFlush(kernel queue)");
             for (cl_event ev : balance_window_kernel_events_[d]) {
                 if (ev == nullptr) continue;
 
@@ -2149,6 +2150,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
         if (left.owning_rank == rank_) {
             const std::size_t dl = static_cast<std::size_t>(left.local_index);
             const std::vector<cl_event> deps = field_write_dependency(fh, dl);
+            if (!deps.empty()) detail::check_cl(clFlush(local_devices_[dl].kernel_queue), "clFlush(kernel queue)");
             detail::check_cl(
                 clEnqueueReadBuffer(
                     local_devices_[dl].transfer_queue,
@@ -2168,6 +2170,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
         if (right.owning_rank == rank_) {
             const std::size_t dr = static_cast<std::size_t>(right.local_index);
             const std::vector<cl_event> deps = field_write_dependency(fh, dr);
+            if (!deps.empty()) detail::check_cl(clFlush(local_devices_[dr].kernel_queue), "clFlush(kernel queue)");
             detail::check_cl(
                 clEnqueueReadBuffer(
                     local_devices_[dr].transfer_queue,
@@ -2191,6 +2194,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
             const std::size_t dr = static_cast<std::size_t>(right.local_index);
 
             if (read_left_to_right_ev != nullptr) {
+                detail::check_cl(clFlush(local_devices_[dl].transfer_queue), "clFlush(transfer queue local)");
                 detail::check_cl(
                     clWaitForEvents(1, &read_left_to_right_ev),
                     "clWaitForEvents(halo left->right read ready)"
@@ -2213,9 +2217,11 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
                     "clEnqueueWriteBuffer(halo left->right local)"
                 );
                 set_field_write_event(fh, dr, write_right_ev);
+                detail::check_cl(clFlush(local_devices_[dr].transfer_queue), "clFlush(transfer queue local)");
             }
 
             if (read_right_to_left_ev != nullptr) {
+                detail::check_cl(clFlush(local_devices_[dr].transfer_queue), "clFlush(transfer queue local)");
                 detail::check_cl(
                     clWaitForEvents(1, &read_right_to_left_ev),
                     "clWaitForEvents(halo right->left read ready)"
@@ -2238,6 +2244,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
                     "clEnqueueWriteBuffer(halo right->left local)"
                 );
                 set_field_write_event(fh, dl, write_left_ev);
+                detail::check_cl(clFlush(local_devices_[dl].transfer_queue), "clFlush(transfer queue local)");
             }
 
             if (write_right_ev != nullptr) {
@@ -2262,6 +2269,8 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
         }
 
         if (left.owning_rank == rank_ && read_left_to_right_ev != nullptr) {
+            const std::size_t dl = static_cast<std::size_t>(left.local_index);
+            detail::check_cl(clFlush(local_devices_[dl].transfer_queue), "clFlush(transfer queue)");
             detail::check_cl(
                 clWaitForEvents(1, &read_left_to_right_ev),
                 "clWaitForEvents(halo left->right send ready)"
@@ -2271,6 +2280,8 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
         }
 
         if (right.owning_rank == rank_ && read_right_to_left_ev != nullptr) {
+            const std::size_t dr = static_cast<std::size_t>(right.local_index);
+            detail::check_cl(clFlush(local_devices_[dr].transfer_queue), "clFlush(transfer queue)");
             detail::check_cl(
                 clWaitForEvents(1, &read_right_to_left_ev),
                 "clWaitForEvents(halo right->left send ready)"
@@ -2351,6 +2362,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
                 "clEnqueueWriteBuffer(halo left->right remote)"
             );
             set_field_write_event(fh, dr, write_right_ev);
+            detail::check_cl(clFlush(local_devices_[dr].transfer_queue), "clFlush(transfer queue)");
         }
 
         if (left.owning_rank == rank_) {
@@ -2370,6 +2382,7 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
                 "clEnqueueWriteBuffer(halo right->left remote)"
             );
             set_field_write_event(fh, dl, write_left_ev);
+            detail::check_cl(clFlush(local_devices_[dl].transfer_queue), "clFlush(transfer queue)");
         }
 
         if (write_right_ev != nullptr) {
