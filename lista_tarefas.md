@@ -138,7 +138,7 @@
 
 ## Fase 5: Estabilidade OpenCL e Riscos Herdados
 
-### [ ] H1 - Vazamento de Recursos OpenCL
+### [x] H1 - Vazamento de Recursos OpenCL
 * **Descrição:** Se houver erro num construtor de buffer OpenCL, o runtime sai por Throw e não deleta a Command Queue, Context e programas anteriores no vetor de recursos.
 * **Citação da Auditoria:** Item "H1 — Alto — Objetos OpenCL podem vazar em redescoberta ou falha parcial".
 * **Arquivos e Linhas Afetados:** `dcl/runtime_impl.hpp`, linhas 346–347, 500–525, 527–580 e 1301–1310.
