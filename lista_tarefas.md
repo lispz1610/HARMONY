@@ -127,7 +127,7 @@
   - Script passa sementes fixas para os executáveis por parãmetro ou env.
   - Roda `N` execuções computando mediana ou desvio padrão básico, com publicação na saída CSV.
 
-### [ ] P1 - Correção da Documentação Herdada
+### [x] P1 - Correção da Documentação Herdada
 * **Descrição:** O README mente sobre arquivos `.out` removidos afirmando que "nunca foram trackeados", prejudicando resgate de hashes comparativos antigos.
 * **Citação da Auditoria:** Item "P1 — Atenção — Dados históricos foram retirados e a descrição da remoção está incorreta".
 * **Arquivos e Linhas Afetados:** `.gitignore` (28-40) e `README.md` (251-253).

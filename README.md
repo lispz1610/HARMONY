@@ -250,7 +250,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 ### Removed Files
 
-No source files were removed. Binary artifacts (`*.out`, `*.o`) were never tracked in git (now explicitly excluded via `.gitignore`).
+No source files were removed. Binary artifacts (`*.out`, `*.o`) were previously tracked in the repository but were removed and added to `.gitignore` in commit `b3206cd`. If you need to consult old comparative hashes or historical outputs, please check out that commit (e.g., `git checkout b3206cd`).
 
 ---
 
