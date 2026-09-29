@@ -635,6 +635,40 @@ public:
 void execute(const ExecutionStep& step) {
     if (step.invocations.empty()) return;
 
+    if (step.halo.width_elements > 0 && partitions_.size() >= 2) {
+        bool needs_rebalance = false;
+        std::vector<float> abs_loads(partitions_.size(), 0.0f);
+        float prev = 0.0f;
+        for (std::size_t p = 0; p < partitions_.size(); ++p) {
+            abs_loads[p] = current_loads_[p] - prev;
+            prev = current_loads_[p];
+        }
+
+        for (std::size_t p = 0; p < partitions_.size(); ++p) {
+            if (partitions_[p].element_count > 0 && partitions_[p].element_count < step.halo.width_elements) {
+                needs_rebalance = true;
+                float micro = abs_loads[p];
+                abs_loads[p] = 0.0f;
+                if (p > 0) {
+                    abs_loads[p - 1] += micro;
+                } else if (p + 1 < partitions_.size()) {
+                    abs_loads[p + 1] += micro;
+                }
+            }
+        }
+
+        if (needs_rebalance) {
+            std::vector<float> new_cum(partitions_.size(), 0.0f);
+            float acc = 0.0f;
+            for (std::size_t p = 0; p < partitions_.size(); ++p) {
+                acc += abs_loads[p];
+                new_cum[p] = acc;
+            }
+            new_cum.back() = 1.0f;
+            rebalance_to(new_cum);
+        }
+    }
+
     const int every = (step.balance.interval <= 0) ? 1 : step.balance.interval;
 
     // Coleta eventos se o balanceamento está ativo OU se o usuário configurou
@@ -1462,9 +1496,9 @@ std::vector<DevicePartition> partitions_from_loads(const std::vector<float>& loa
                 static_cast<double>(cumulative[i]) * static_cast<double>(total_units);
             std::size_t cut = static_cast<std::size_t>(std::llround(raw));
 
-            const std::size_t min_cut = unit_cuts[i] + 1;
+            const std::size_t min_cut = unit_cuts[i];
             const std::size_t remaining_parts = cumulative.size() - (i + 1);
-            const std::size_t max_cut = total_units - remaining_parts;
+            const std::size_t max_cut = total_units;
 
             if (cut < min_cut) cut = min_cut;
             if (cut > max_cut) cut = max_cut;

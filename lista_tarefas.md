@@ -152,7 +152,7 @@
 * **Critérios de Aceite:**
   - Adição garantida da instrução `clFlush()` após agendar enfileiramentos cujos marcadores servem para interdependência em filas separadas (Transfer <> Execução).
 
-### [ ] H3 - Fatiamento Mínimo e Halo Border
+### [x] H3 - Fatiamento Mínimo e Halo Border
 * **Descrição:** O modo hierárquico pode ceder fatias de 1 item, que acabam podadas pelo filtro simplista de halo (`element_count < halo`), pulando-o e fundindo matrizes vizinhas que fisicamente não eram limítrofes.
 * **Citação da Auditoria:** Item "H3 — Médio — Partições menores que o halo saem da troca de fronteira".
 * **Arquivos e Linhas Afetados:** `dcl/runtime_impl.hpp` (2084-2094).
