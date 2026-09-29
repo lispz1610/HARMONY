@@ -129,6 +129,26 @@ int main(int argc, char** argv) {
         in_data[i] = static_cast<float>(i % 100) * 0.01f;
     }
 
+    dcl::FieldHandle h_in, h_out;
+    dcl::KernelHandle h_kernel;
+    dcl::KernelBinding binding;
+    if (opencl_available) {
+        dcl::FieldSpec f_in{"in_data", n, 1, sizeof(float), dcl::BufferUsage::read_only, in_data.data(), dcl::RedistributionDependency::proportional};
+        dcl::FieldSpec f_out{"out_data", n, 1, sizeof(float), dcl::BufferUsage::write_only, out_data.data(), dcl::RedistributionDependency::proportional};
+        h_in = runtime.create_field(f_in);
+        h_out = runtime.create_field(f_out);
+
+        dcl::KernelSpec k_spec{"benchmarks/kneighbor.cl", "kneighbor_stencil", ""};
+        h_kernel = runtime.create_kernel(k_spec);
+
+        binding = runtime.bind(h_kernel)
+            .arg(0, h_in)
+            .arg(1, h_out)
+            .arg(2, dcl::ScalarArg(static_cast<int>(n)))
+            .arg(3, dcl::ScalarArg(k))
+            .build();
+    }
+
     std::vector<StepRecord> records;
     records.reserve(static_cast<std::size_t>(iterations));
 
@@ -181,38 +201,68 @@ int main(int argc, char** argv) {
         }
 
         const auto& partitions = runtime.partitions();
-        std::vector<double> device_times(partitions.size(), 0.0);
+        std::vector<double> local_device_times(partitions.size(), 0.0);
 
-        // Execute synthetic k-nearest-neighbor stencil workload per partition
-        for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
-            const auto& p = partitions[p_idx];
-            const std::size_t offset = p.global_offset;
-            const std::size_t count = p.element_count;
-            const int dev_id = p.device_global_index;
+        const auto t0 = std::chrono::steady_clock::now();
 
-            // Model heterogeneous hardware: dev 0 has 2x compute cost per element
-            const int work_passes = (dev_id == 0 ? 2 : 1);
-
-            const auto t0 = std::chrono::steady_clock::now();
-            const float inv_k = 1.0f / static_cast<float>(2 * k + 1);
-
-            for (int pass = 0; pass < work_passes; ++pass) {
-                for (std::size_t i = offset; i < offset + count; ++i) {
-                    float sum = 0.0f;
-                    for (int o = -k; o <= k; ++o) {
-                        const long long idx = static_cast<long long>(i) + o;
-                        if (idx >= 0 && idx < static_cast<long long>(n)) {
-                            sum += in_data[static_cast<std::size_t>(idx)];
-                        }
+        if (opencl_available) {
+            auto builder = runtime.step("kneighbor_step");
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank == rank && p.element_count > 0) {
+                    int work_passes = (p.device_global_index == 0 ? 2 : 1);
+                    for(int pass=0; pass < work_passes; ++pass) {
+                        builder.invoke(binding, dcl::LaunchGeometry{p.global_offset, p.element_count, std::nullopt});
                     }
-                    out_data[i] = sum * inv_k;
                 }
             }
-            const auto t1 = std::chrono::steady_clock::now();
-            device_times[p_idx] = std::chrono::duration<double>(t1 - t0).count();
+            builder.synchronize_at_end(true);
+            runtime.execute(builder.build());
+            
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank == rank && p.local_index >= 0 && p.local_index < static_cast<int>(runtime.device_timings().size())) {
+                    local_device_times[p_idx] = runtime.device_timings()[p.local_index].kernel_seconds_last;
+                }
+            }
+        } else {
+            // CPU fallback simulation
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank != rank) continue;
+                
+                const std::size_t offset = p.global_offset;
+                const std::size_t count = p.element_count;
+                const int dev_id = p.device_global_index;
+                const int work_passes = (dev_id == 0 ? 2 : 1);
+                
+                const auto t0_cpu = std::chrono::steady_clock::now();
+                const float inv_k = 1.0f / static_cast<float>(2 * k + 1);
+                for (int pass = 0; pass < work_passes; ++pass) {
+                    for (std::size_t i = offset; i < offset + count; ++i) {
+                        float sum = 0.0f;
+                        for (int o = -k; o <= k; ++o) {
+                            const long long idx = static_cast<long long>(i) + o;
+                            if (idx >= 0 && idx < static_cast<long long>(n)) {
+                                sum += in_data[static_cast<std::size_t>(idx)];
+                            }
+                        }
+                        out_data[i] = sum * inv_k;
+                    }
+                }
+                const auto t1_cpu = std::chrono::steady_clock::now();
+                local_device_times[p_idx] = std::chrono::duration<double>(t1_cpu - t0_cpu).count();
+            }
         }
 
-        const double t_max_step = *std::max_element(device_times.begin(), device_times.end());
+        const auto t1 = std::chrono::steady_clock::now();
+        double local_step_time = std::chrono::duration<double>(t1 - t0).count();
+
+        double t_max_step = 0.0;
+        MPI_Allreduce(&local_step_time, &t_max_step, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+        std::vector<double> device_times(partitions.size(), 0.0);
+        MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});

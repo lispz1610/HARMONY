@@ -131,6 +131,32 @@ int main(int argc, char** argv) {
         pos_z[i] = std::cos(fi * 0.05f);
     }
 
+    dcl::FieldHandle h_pos_x, h_pos_y, h_pos_z, h_force;
+    dcl::KernelHandle h_kernel;
+    dcl::KernelBinding binding;
+    if (opencl_available) {
+        dcl::FieldSpec f_x{"pos_x", n, 1, sizeof(float), dcl::BufferUsage::read_only, pos_x.data(), dcl::RedistributionDependency::proportional};
+        dcl::FieldSpec f_y{"pos_y", n, 1, sizeof(float), dcl::BufferUsage::read_only, pos_y.data(), dcl::RedistributionDependency::proportional};
+        dcl::FieldSpec f_z{"pos_z", n, 1, sizeof(float), dcl::BufferUsage::read_only, pos_z.data(), dcl::RedistributionDependency::proportional};
+        dcl::FieldSpec f_f{"force_out", n, 1, sizeof(float), dcl::BufferUsage::write_only, force_out.data(), dcl::RedistributionDependency::proportional};
+        h_pos_x = runtime.create_field(f_x);
+        h_pos_y = runtime.create_field(f_y);
+        h_pos_z = runtime.create_field(f_z);
+        h_force = runtime.create_field(f_f);
+
+        dcl::KernelSpec k_spec{"benchmarks/leanmd.cl", "leanmd_pair_force", ""};
+        h_kernel = runtime.create_kernel(k_spec);
+
+        binding = runtime.bind(h_kernel)
+            .arg(0, h_pos_x)
+            .arg(1, h_pos_y)
+            .arg(2, h_pos_z)
+            .arg(3, h_force)
+            .arg(4, dcl::ScalarArg(static_cast<int>(n)))
+            .arg(5, dcl::ScalarArg(cutoff))
+            .build();
+    }
+
     std::vector<StepRecord> records;
     records.reserve(static_cast<std::size_t>(iterations));
 
@@ -183,49 +209,78 @@ int main(int argc, char** argv) {
         }
 
         const auto& partitions = runtime.partitions();
-        std::vector<double> device_times(partitions.size(), 0.0);
+        std::vector<double> local_device_times(partitions.size(), 0.0);
 
-        // Execute synthetic LeanMD Lennard-Jones pair force computation per partition
-        for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
-            const auto& p = partitions[p_idx];
-            const std::size_t offset = p.global_offset;
-            const std::size_t count = p.element_count;
-            const int dev_id = p.device_global_index;
+        const auto t0 = std::chrono::steady_clock::now();
 
-            // Model heterogeneous hardware: dev 0 has 2x compute cost
-            const int work_passes = (dev_id == 0 ? 2 : 1);
-
-            const auto t0 = std::chrono::steady_clock::now();
-
-            for (int pass = 0; pass < work_passes; ++pass) {
-                for (std::size_t i = offset; i < offset + count; ++i) {
-                    const float xi = pos_x[i];
-                    const float yi = pos_y[i];
-                    const float zi = pos_z[i];
-                    float f_total = 0.0f;
-
-                    const std::size_t s = (i > static_cast<std::size_t>(cutoff)) ? (i - cutoff) : 0;
-                    const std::size_t e = std::min(n - 1, i + cutoff);
-
-                    for (std::size_t j = s; j <= e; ++j) {
-                        if (i == j) continue;
-                        const float dx = xi - pos_x[j];
-                        const float dy = yi - pos_y[j];
-                        const float dz = zi - pos_z[j];
-                        const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
-                        const float r2inv = 1.0f / r2;
-                        const float r6inv = r2inv * r2inv * r2inv;
-                        f_total += r2inv * r6inv * (2.0f * r6inv - 1.0f);
+        if (opencl_available) {
+            auto builder = runtime.step("leanmd_step");
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank == rank && p.element_count > 0) {
+                    int work_passes = (p.device_global_index == 0 ? 2 : 1);
+                    for(int pass=0; pass < work_passes; ++pass) {
+                        builder.invoke(binding, dcl::LaunchGeometry{p.global_offset, p.element_count, std::nullopt});
                     }
-                    force_out[i] = f_total;
                 }
             }
+            builder.synchronize_at_end(true);
+            runtime.execute(builder.build());
+            
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank == rank && p.local_index >= 0 && p.local_index < static_cast<int>(runtime.device_timings().size())) {
+                    local_device_times[p_idx] = runtime.device_timings()[p.local_index].kernel_seconds_last;
+                }
+            }
+        } else {
+            // CPU fallback simulation
+            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+                const auto& p = partitions[p_idx];
+                if (p.owning_rank != rank) continue;
+                
+                const std::size_t offset = p.global_offset;
+                const std::size_t count = p.element_count;
+                const int dev_id = p.device_global_index;
+                const int work_passes = (dev_id == 0 ? 2 : 1);
+                
+                const auto t0_cpu = std::chrono::steady_clock::now();
+                for (int pass = 0; pass < work_passes; ++pass) {
+                    for (std::size_t i = offset; i < offset + count; ++i) {
+                        const float xi = pos_x[i];
+                        const float yi = pos_y[i];
+                        const float zi = pos_z[i];
+                        float f_total = 0.0f;
 
-            const auto t1 = std::chrono::steady_clock::now();
-            device_times[p_idx] = std::chrono::duration<double>(t1 - t0).count();
+                        const std::size_t s = (i > static_cast<std::size_t>(cutoff)) ? (i - cutoff) : 0;
+                        const std::size_t e = std::min(n - 1, i + cutoff);
+
+                        for (std::size_t j = s; j <= e; ++j) {
+                            if (i == j) continue;
+                            const float dx = xi - pos_x[j];
+                            const float dy = yi - pos_y[j];
+                            const float dz = zi - pos_z[j];
+                            const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
+                            const float r2inv = 1.0f / r2;
+                            const float r6inv = r2inv * r2inv * r2inv;
+                            f_total += r2inv * r6inv * (2.0f * r6inv - 1.0f);
+                        }
+                        force_out[i] = f_total;
+                    }
+                }
+                const auto t1_cpu = std::chrono::steady_clock::now();
+                local_device_times[p_idx] = std::chrono::duration<double>(t1_cpu - t0_cpu).count();
+            }
         }
 
-        const double t_max_step = *std::max_element(device_times.begin(), device_times.end());
+        const auto t1 = std::chrono::steady_clock::now();
+        double local_step_time = std::chrono::duration<double>(t1 - t0).count();
+
+        double t_max_step = 0.0;
+        MPI_Allreduce(&local_step_time, &t_max_step, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+        std::vector<double> device_times(partitions.size(), 0.0);
+        MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});
