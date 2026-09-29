@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 #----------------------------------------------------------
 # Job name
 #PBS -N hwtopolb_eval
@@ -14,11 +16,21 @@
 #PBS -l select=2:ncpus=16:mpiprocs=16
 #----------------------------------------------------------
 
+if [[ -z "${PBS_O_WORKDIR:-}" ]]; then
+    echo "Error: PBS_O_WORKDIR is not set."
+    exit 1
+fi
+
 # Change to submission directory
-cd $PBS_O_WORKDIR
+cd "$PBS_O_WORKDIR"
+
+if [[ -z "${PBS_NODEFILE:-}" ]]; then
+    echo "Error: PBS_NODEFILE is not set."
+    exit 1
+fi
 
 echo "=== Allocated Nodes ==="
-cat $PBS_NODEFILE
+cat "$PBS_NODEFILE"
 echo ""
 
 # Ensure proper modules are loaded as recommended by cluster guide v5.0 (Section 10.6)
@@ -36,14 +48,14 @@ echo "=== Step 1: Compiling and Running Unit Tests ==="
 for test_src in tests/test_*.cpp; do
     test_bin="${test_src%.cpp}.out"
     echo "Compiling ${test_src}..."
-    mpic++ -std=c++20 -Wall -Wextra -O2 "${test_src}" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${test_bin}"
+    mpic++ -std=c++20 -Wall -Wextra -O2 "${test_src}" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${test_bin}" || exit $?
     
     echo "Running ${test_bin}..."
     if [[ "${test_bin}" == *"hierarchical"* ]]; then
         # Hierarchical test requires at least 2 ranks
-        mpirun -n 2 "./${test_bin}"
+        mpirun -n 2 "./${test_bin}" || exit $?
     else
-        mpirun -n 1 "./${test_bin}"
+        mpirun -n 1 "./${test_bin}" || exit $?
     fi
     echo ""
 done
@@ -52,8 +64,8 @@ done
 # Step 2: Measure Cluster Topology (PCIe & MPI Interconnect)
 # ---------------------------------------------------------
 echo "=== Step 2: Running Topology Probe ==="
-mpic++ -std=c++20 -Wall -Wextra -O2 topo_probe.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o topo_probe.out
-mpirun ./topo_probe.out --output-json topo_metrics_cluster.json
+mpic++ -std=c++20 -Wall -Wextra -O2 topo_probe.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o topo_probe.out || exit $?
+mpirun ./topo_probe.out --output-json topo_metrics_cluster.json || exit $?
 echo ""
 
 # ---------------------------------------------------------
@@ -61,7 +73,7 @@ echo ""
 # ---------------------------------------------------------
 echo "=== Step 3: Running ERAD vs HWTOPOLB Comparison ==="
 export MPI_LAUNCHER="mpirun"
-bash ./benchmarks/compare_algos.sh
+bash ./benchmarks/compare_algos.sh || exit $?
 
 echo ""
 echo "=== All Evaluations Completed Successfully ==="

@@ -103,7 +103,7 @@
   - Trocar chamadas sequenciais para executar a API integral (`execute`, `create_kernel`, `create_field`) focado exclusivamente em fatias com permissão local de owning.
   - Tempos consolidados utilizam chamadas tipo `MPI_Reduce(MPI_MAX)` calculando Wall Time total real do cluster e não a soma simples do vetor rank por rank.
 
-### [ ] A8 - Enforce no Pipeline do PBS Job
+### [x] A8 - Enforce no Pipeline do PBS Job
 * **Descrição:** Um erro de `mpirun` pode ocorrer e o job atual ainda printará _"All Evaluations Completed Successfully"_, corrompendo a matriz de análise do CI/PBS.
 * **Citação da Auditoria:** Item "A8 — Alto — Falhas no job PBS são anunciadas como sucesso".
 * **Arquivos e Linhas Afetados:** `job_hwtopolb.pbs`, linhas 24–27 e 36–67.
