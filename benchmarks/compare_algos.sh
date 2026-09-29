@@ -17,66 +17,83 @@ if [[ ! -x "${LEANMD_BIN}" ]]; then
     mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 "${ROOT_DIR}/benchmarks/leanmd.cpp" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${LEANMD_BIN}"
 fi
 
-CSV_KN_ERAD="${SCRIPT_DIR}/kneighbor_erad.csv"
-CSV_KN_HW="${SCRIPT_DIR}/kneighbor_hwtopolb.csv"
-CSV_MD_ERAD="${SCRIPT_DIR}/leanmd_erad.csv"
-CSV_MD_HW="${SCRIPT_DIR}/leanmd_hwtopolb.csv"
-
 MPI_LAUNCHER=${MPI_LAUNCHER:-}
 
-echo "=== Running R4 Benchmarks (ERAD vs HWTOPOLB) ==="
-echo "Running kneighbor (erad)..."
-${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_KN_ERAD}" > /dev/null
+echo "=== Running R4 Benchmarks (ERAD vs HWTOPOLB) with multiple seeds ==="
+SEEDS=(42 123 456)
 
-echo "Running kneighbor (hwtopolb)..."
-${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_KN_HW}" > /dev/null
-
-echo "Running leanmd (erad)..."
-${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --output-csv "${CSV_MD_ERAD}" > /dev/null
-
-echo "Running leanmd (hwtopolb)..."
-${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --output-csv "${CSV_MD_HW}" > /dev/null
+for seed in "${SEEDS[@]}"; do
+    echo "Running seed ${seed}..."
+    ${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --seed ${seed} --output-csv "${SCRIPT_DIR}/kneighbor_erad_${seed}.csv" > /dev/null
+    ${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --seed ${seed} --output-csv "${SCRIPT_DIR}/kneighbor_hwtopolb_${seed}.csv" > /dev/null
+    ${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --seed ${seed} --output-csv "${SCRIPT_DIR}/leanmd_erad_${seed}.csv" > /dev/null
+    ${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --seed ${seed} --output-csv "${SCRIPT_DIR}/leanmd_hwtopolb_${seed}.csv" > /dev/null
+done
 
 echo ""
 python3 - "${ROOT_DIR}" << 'PYEOF'
 import csv
 import sys
 import os
+import statistics
 
 root_dir = sys.argv[1]
+seeds = [42, 123, 456]
 runs = [
-    ("kneighbor", "erad", os.path.join(root_dir, "benchmarks", "kneighbor_erad.csv")),
-    ("kneighbor", "hwtopolb", os.path.join(root_dir, "benchmarks", "kneighbor_hwtopolb.csv")),
-    ("leanmd", "erad", os.path.join(root_dir, "benchmarks", "leanmd_erad.csv")),
-    ("leanmd", "hwtopolb", os.path.join(root_dir, "benchmarks", "leanmd_hwtopolb.csv")),
+    ("kneighbor", "erad"),
+    ("kneighbor", "hwtopolb"),
+    ("leanmd", "erad"),
+    ("leanmd", "hwtopolb"),
 ]
 
 table_rows = []
-for bench, algo, csv_path in runs:
-    total_time = 0.0
-    num_rebalances = 0
-    sum_gain = 0.0
+for bench, algo in runs:
+    times = []
+    rebalances = []
+    gains = []
     
-    with open(csv_path, 'r', newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            step_t = float(row['step_time_s'])
-            total_time += step_t
-            rebal = int(row['rebalanced'])
-            if rebal == 1:
-                num_rebalances += 1
-                sum_gain += float(row['rebalance_gain'])
+    for seed in seeds:
+        csv_path = os.path.join(root_dir, "benchmarks", f"{bench}_{algo}_{seed}.csv")
+        total_time = 0.0
+        num_rebalances = 0
+        sum_gain = 0.0
+        
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                step_t = float(row['step_time_s'])
+                total_time += step_t
+                rebal = int(row['rebalanced'])
+                if rebal == 1:
+                    num_rebalances += 1
+                    sum_gain += float(row['rebalance_gain'])
+        
+        times.append(total_time)
+        rebalances.append(num_rebalances)
+        if num_rebalances > 0:
+            gains.append(sum_gain / num_rebalances)
+        else:
+            gains.append(0.0)
+            
+    median_time = statistics.median(times)
+    std_time = statistics.stdev(times) if len(times) > 1 else 0.0
+    avg_rebalances = sum(rebalances) / len(rebalances)
+    avg_gain = sum(gains) / len(gains)
     
-    avg_gain = (sum_gain / num_rebalances) if num_rebalances > 0 else 0.0
-    table_rows.append((bench, algo, f"{total_time:.6f}", str(num_rebalances), f"{avg_gain:.6f}"))
+    table_rows.append((bench, algo, f"{median_time:.6f}", f"{std_time:.6f}", f"{avg_rebalances:.1f}", f"{avg_gain:.6f}"))
 
-# Print summary table
-header = "benchmark | algo | total_time_s | num_rebalances | avg_rebalance_gain"
-sep = "-" * len(header)
-print(header)
-print(sep)
+csv_out = os.path.join(root_dir, "benchmarks", "comparison_summary.csv")
+with open(csv_out, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(["benchmark", "algo", "median_time_s", "stddev_time_s", "avg_rebalances", "avg_rebalance_gain"])
+    for r in table_rows:
+        writer.writerow(r)
+
+print("benchmark,algo,median_time_s,stddev_time_s,avg_rebalances,avg_rebalance_gain")
 for r in table_rows:
-    print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]}")
+    print(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]}")
+
+
 PYEOF
 
 exit 0

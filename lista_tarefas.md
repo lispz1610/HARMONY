@@ -119,7 +119,7 @@
   - Versão CPU deve espelhar kernel somando um contador limítrofe (`valid_neighbors`).
   - Toleração estrita a diferenças (`tolerance = 1e-5`) introduzida após o passo CPU comparar com Output GPU.
 
-### [ ] M2 - Estatística Reprodutível
+### [x] M2 - Estatística Reprodutível
 * **Descrição:** A comparação só gera 1 seed volátil reportando erro decimal flutuante sem base amostral para relatório de performance final.
 * **Citação da Auditoria:** Item "M2 — Médio — A comparação estocástica não é reprodutível".
 * **Arquivos e Linhas Afetados:** `dcl/algorithms.hpp` (121-145), `compare_algos.sh` (27-38), `comparison_report.md` (15-25).

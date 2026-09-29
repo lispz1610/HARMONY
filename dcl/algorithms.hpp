@@ -120,13 +120,18 @@ inline std::vector<float> hwtopolb_loads(
         }
     }
 
-    std::mt19937 gen;
-    if (seed != 0) {
+    static std::mt19937 gen;
+    static unsigned int last_seed = 0;
+    
+    if (seed != 0 && seed != last_seed) {
         gen.seed(seed);
-    } else {
+        last_seed = seed;
+    } else if (seed == 0 && last_seed == 0) {
         std::random_device rd;
         gen.seed(rd());
+        last_seed = 1; // Mark as initialized
     }
+    
     std::uniform_real_distribution<float> dist(-perturbation_factor, perturbation_factor);
 
     std::vector<float> perturbed_share(n, 0.0f);

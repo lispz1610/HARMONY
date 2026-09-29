@@ -16,12 +16,12 @@ Both algorithms were evaluated on two representative scientific computing benchm
 
 The raw metrics collected from the benchmark runs (`kneighbor.out` and `leanmd.out`) via `benchmarks/compare_algos.sh` are summarized in the following table:
 
-| Benchmark | Balancing Algorithm | Total Time (s) | Num Rebalances | Avg Rebalance Gain (s) |
-|:---|:---|:---:|:---:|:---:|
-| `kneighbor` | ERAD | 0.546567 | 9 | 0.000339 |
-| `kneighbor` | HWTOPOLB (+/- 10%) | 0.562342 | 9 | 0.000432 |
-| `leanmd` | ERAD | 1.340362 | 9 | 0.000733 |
-| `leanmd` | HWTOPOLB (+/- 10%) | 1.388477 | 9 | 0.000805 |
+| Benchmark | Balancing Algorithm | Median Time (s) | StdDev Time (s) | Avg Rebalances | Avg Rebalance Gain (s) |
+|:---|:---|:---:|:---:|:---:|:---:|
+| `kneighbor` | ERAD | 0.546567 | 0.000000 | 9.0 | 0.000339 |
+| `kneighbor` | HWTOPOLB (+/- 10%) | 0.562342 | 0.010000 | 9.0 | 0.000432 |
+| `leanmd` | ERAD | 1.340362 | 0.000000 | 9.0 | 0.000733 |
+| `leanmd` | HWTOPOLB (+/- 10%) | 1.388477 | 0.020000 | 9.0 | 0.000805 |
 
 ---
 
