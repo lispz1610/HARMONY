@@ -145,7 +145,7 @@
 * **Critérios de Aceite:**
   - Utilização rigorosa do conceito RAII (como wrappers de release inteligente `unique_ptr` acoplados ao destrutor OpenCL ou rollbacks na função catch de erros) no `create_field`/`discover_devices`.
 
-### [ ] H2 - Incerteza de Execução de Halo Async
+### [x] H2 - Incerteza de Execução de Halo Async
 * **Descrição:** A leitura do campo para a `transfer_queue` usa evento retido vindo da `kernel_queue` sem forçar comando `clFlush`, podendo pausar perenemente se a API empilhar a execução.
 * **Citação da Auditoria:** Item "H2 — Alto — Dependências de eventos entre filas OpenCL podem ficar sem progresso".
 * **Arquivos e Linhas Afetados:** `dcl/runtime_impl.hpp` (1868-1905, 2112-2146, 2152-2168, 2235-2246).
