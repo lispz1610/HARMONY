@@ -165,12 +165,14 @@ void test_apply_power_cap() {
         m.thermal_tdp_watts = {200.0, 200.0};
         m.current_power_watts = {200.0, 200.0}; // total = 400W
 
-        // Cap system to 300W total budget
-        const std::vector<float> capped = dcl::apply_power_cap(initial_loads, m, 300.0);
-        assert(capped.size() == 2);
-        assert(capped[0] > 0.0f);
-        assert(capped[0] < capped[1]);
-        assert(std::fabs(capped.back() - 1.0f) < 1e-6f);
+        // A 300W budget is infeasible when every device needs 400W at full load.
+        bool rejected = false;
+        try {
+            (void)dcl::apply_power_cap(initial_loads, m, 300.0);
+        } catch (const dcl::Error&) {
+            rejected = true;
+        }
+        assert(rejected);
     }
 
     // Edge cases
@@ -195,16 +197,13 @@ void test_apply_power_cap() {
         m.thermal_tdp_watts = {200.0, 200.0};
         m.current_power_watts = {400.0, 400.0}; // Both saturated at 2x
         
-        double throttle = 1.0;
-        const std::vector<float> capped = dcl::apply_power_cap(initial_loads, m, 0.0, &throttle);
-        
-        // Distribution should remain exactly the same to not break elements coverage (integrity)
-        assert(capped.size() == 2);
-        assert(std::fabs(capped[0] - 0.5f) < 1e-5f);
-        assert(std::fabs(capped[1] - 1.0f) < 1e-5f);
-        
-        // But the time MUST be throttled by exactly 2.0x
-        assert(std::fabs(throttle - 2.0) < 1e-5f);
+        bool rejected = false;
+        try {
+            (void)dcl::apply_power_cap(initial_loads, m, 0.0);
+        } catch (const dcl::Error&) {
+            rejected = true;
+        }
+        assert(rejected);
     }
 
     std::cout << "  -> PASS" << std::endl;
@@ -217,8 +216,8 @@ void test_contention_factor_validation(dcl::Runtime& rt) {
     dcl::TopoMetrics base;
     base.pcie_latency_ns = {4000.0, 4000.0};
     base.pcie_bandwidth_gbps = {15.0, 15.0};
-    base.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    base.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    base.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    base.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
 
     // Factor 0.8 < 1.0 must fail
     {
@@ -295,8 +294,8 @@ void test_autobalance_integration(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {4000.0, 4000.0};
     m.pcie_bandwidth_gbps = {15.0, 15.0};
-    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
     m.memory_contention_factor = {1.0, 2.0};
     m.thermal_tdp_watts = {200.0, 200.0};
     m.current_power_watts = {150.0, 150.0};
@@ -325,7 +324,7 @@ void test_autobalance_integration(dcl::Runtime& rt) {
     //    Now Device 0 is thermally overloaded (300W > 200W TDP)
     //    Device 1 is cool (100W < 200W TDP)
     //    Power capping must reduce Device 0 share and shift load back to Device 1.
-    m.current_power_watts = {300.0, 100.0};
+    m.current_power_watts = {220.0, 50.0};
     rt.set_topo_metrics(m);
     rt.set_simulated_times({0.010, 0.005});
 
@@ -346,10 +345,7 @@ void test_autobalance_integration(dcl::Runtime& rt) {
     const bool overload_call = rt.maybe_rebalance_from_timings({fh}, 0.01f, 0.50, true, true, 0.0);
     (void)overload_call;
 
-    // 6. Test strict rate limit (A4): Total TDP saturation decoupling time
-    // If all devices exceed TDP (e.g. current_power = 400W, limit = 200W -> 2x overloaded),
-    // the system must maintain the exact same proportional load distribution (so we don't skew or drop data),
-    // but the elapsed time MUST be artificially inflated (throttled) to respect the TDP limit (time * 2.0).
+    // 6. An infeasible cap must fail collectively instead of delaying the process.
     m.current_power_watts = {400.0, 400.0}; 
     rt.set_topo_metrics(m);
     
@@ -358,14 +354,13 @@ void test_autobalance_integration(dcl::Runtime& rt) {
     policy.use_power_cap = true;
     policy.use_contention_adjustment = false;
     
-    // We expect the balance function to run. It won't change the shape of the loads 
-    // because both are equally overloaded, but it WILL scale simulated_times_ by 2.0.
-    rt.maybe_rebalance_from_timings({fh}, policy);
-    
-    // Since both were scaled by 2.0 (400 / 200), the times should now be 0.020.
-    // However, wait! Is simulated_times_ exposed in Runtime? 
-    // Wait, the runtime doesn't expose simulated_times_ directly. But if we run again without changing it,
-    // we can observe the effect if we had a getter, OR we can test apply_power_cap directly!
+    bool rejected = false;
+    try {
+        rt.maybe_rebalance_from_timings({fh}, policy);
+    } catch (const dcl::Error&) {
+        rejected = true;
+    }
+    assert(rejected);
 
     // Cleanup simulated times
     rt.clear_simulated_times();

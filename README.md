@@ -69,8 +69,8 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 - **`dcl/types.hpp`** — Extended with `struct TopoMetrics`, a flat data container for all topology measurements:
   - `pcie_latency_ns` — Per-device PCIe round-trip latency (nanoseconds)
   - `pcie_bandwidth_gbps` — Per-device PCIe peak transfer bandwidth (GB/s)
-  - `mpi_latency_ns` — Flat N×N matrix of one-way MPI latency between all device pairs (ns)
-  - `mpi_bandwidth_gbps` — Flat N×N matrix of MPI bandwidth between all device pairs (GB/s)
+  - `mpi_latency_ns` — Flat R×R matrix of MPI latency between rank pairs (ns), where R is the MPI rank count
+  - `mpi_bandwidth_gbps` — Flat R×R matrix of MPI bandwidth between rank pairs (GB/s)
 
 - **`dcl/topo_metrics_io.hpp`** *(new)* — Header-only JSON serialization/deserialization for `TopoMetrics`. Provides `load_topo_metrics(path)` and `save_topo_metrics(metrics, path)` with a hand-written JSON parser (no external JSON library dependency).
 
@@ -123,8 +123,8 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 - **`dcl/runtime.hpp`**, **`dcl/runtime.cpp`**, **`dcl/runtime_impl.hpp`** — Implemented `maybe_rebalance_hierarchical(rebalance_fields)`:
   1. **Intra-node phase**: Each MPI rank independently computes a local partition rebalancing among its own devices using throughput-proportional shares. No MPI communication occurs in this phase.
-  2. `MPI_Barrier` — All ranks synchronize after local rebalancing.
-  3. **Inter-node phase**: All ranks participate in `MPI_Allgatherv` to collect global per-device timing data. Rank 0 computes the globally optimal partition and broadcasts (`MPI_Bcast`) the new assignment. All ranks apply the global partition.
+  2. Ranks gather measured throughput and rank 0 broadcasts the proposed rank boundaries.
+  3. When rank boundaries remain fixed, ranks migrate fields locally and publish the resulting partition map with one reduction. When boundaries change, ranks exchange the global partition map and migrate the selected fields across ranks.
 
   Rank 0 emits diagnostic logs at each phase:
   ```
@@ -197,12 +197,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 - **`dcl/topo_metrics_io.hpp`** — Added `adjusted_capacity(metrics, global_device, raw_throughput)`. Divides raw throughput by the device's `memory_contention_factor`, yielding a corrected effective capacity for use in load share computation.
 
-- **`dcl/algorithms.hpp`** — `apply_power_cap(loads, metrics, power_budget_watts)`:
-  1. Converts cumulative load vector to per-device share fractions.
-  2. Computes effective power limits per device (the minimum of TDP and the budget-proportional cap).
-  3. Identifies overloaded devices (`current_power_watts > effective_limit`) and scales their shares down proportionally.
-  4. Redistributes freed load shares to underloaded devices, weighted by available thermal headroom; falls back to existing-share weighting or equal distribution when headroom data is absent.
-  5. Returns a valid cumulative load vector (monotone non-decreasing, last element = 1.0f).
+- **`dcl/algorithms.hpp`** — `apply_power_cap()` uses measured power and the current partition shares to estimate a linear watts-per-share slope for each device. It redistributes work only within modeled TDP limits and checks the total budget. It raises an error when the model has insufficient measured capacity. This is a planning constraint, not hardware power enforcement; actual draw must be measured on the target devices.
 
 - **`dcl/runtime_impl.hpp`** — `maybe_rebalance_from_timings()` integrates both adjustments:
   - When `use_contention_adjustment` is set, throughput is divided by `memory_contention_factor` before computing shares.
@@ -250,7 +245,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 ### Removed Files
 
-No source files were removed. Binary artifacts (`*.out`, `*.o`) were previously tracked in the repository but were removed and added to `.gitignore` in commit `b3206cd`. If you need to consult old comparative hashes or historical outputs, please check out that commit (e.g., `git checkout b3206cd`).
+No source files were removed in the cleanup commit `14dfb9d`. That commit removed 804 tracked files under `Results/` and tracked binary artifacts such as `HIS.out`, `job_mpiocl.out`, and `profiling.out` from the working tree. The historical files remain available in the parent commit `b3206cd` through Git history (for example, `git show b3206cd:Results/np4/summary/summary_np4.csv`). The old timing tables are not a current performance baseline; regenerate results with the benchmark script and retain its metadata with each run.
 
 ---
 
@@ -347,6 +342,27 @@ mpirun -n 1 ./tests/test_algorithms.out
 mpirun -n 1 ./tests/test_contention_power.out
 ```
 
+The NUMA, algorithm, and contention/power suites also include two-rank
+consensus cases; run them with `mpirun -n 2` when two ranks are available.
+
+For the probe/runtime JSON contract and the asynchronous GPU halo path:
+
+```bash
+mpic++ -std=c++20 -Wall -Wextra -O2 \
+  tests/test_probe_runtime_integration.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_probe_runtime_integration.out
+mpic++ -std=c++20 -Wall -Wextra -O2 \
+  tests/test_async_halo_opencl.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_async_halo_opencl.out
+
+mpirun -n 2 ./tests/test_probe_runtime_integration.out topo_metrics_cluster.json
+timeout 60s mpirun -n 2 ./tests/test_async_halo_opencl.out
+```
+
+The asynchronous halo test prints `SKIP` and exits with status 77 if the job
+exposes fewer than two OpenCL GPU partitions. Only `PASS` with status 0 is
+device validation.
+
 ### Compiling the Topology Probe
 
 ```bash
@@ -360,6 +376,9 @@ Run on the cluster to generate `topo_metrics_cluster.json`:
 ```bash
 mpirun -n 4 ./topo_probe.out --output-json topo_metrics_cluster.json
 ```
+
+Without an OpenCL platform, the probe exits with an error. Use `--synthetic`
+only for test data; the generated JSON records `"synthetic": true`.
 
 ### Compiling the Benchmarks
 
@@ -410,58 +429,64 @@ step.with_balance(policy);
 
 ## 7. Running on a PBS Cluster
 
-The provided `job_hwtopolb.pbs` script automates the full evaluation workflow:
+The jobs follow the LIMC cluster guide v5.0. Both reserve one full A100 GPU
+and one MPI rank on each of `compute-1-0[0]` and `compute-1-1[0]`, with four
+CPUs and 8 GB RAM per chunk. Check the current vnode inventory with
+`pbsnodes -a` before submitting; the cluster configuration can change.
+Both jobs load `gcc/13.2.0` and `openmpi5/5.0.5`, build with C++20 and the
+OpenCL ICD loader, and run from `PBS_O_WORKDIR`. The cluster's `prun` launcher
+uses the two allocated MPI slots. The OpenCL probe must find GPUs; neither job
+uses its synthetic mode.
+
+Copy the complete source tree to the cluster first. An ordinary clone will
+not include local uncommitted changes. From the login node, submit the short
+main-program smoke test before the longer evaluation:
+
+```bash
+qsub job_harmony_smoke.pbs
+qstat -f JOB_ID
+qstat -xf JOB_ID
+```
+
+The smoke job probes OpenCL and executes `main_high_order_residual.cpp` on two
+ranks with a small mesh and two iterations. Its merged PBS output is
+`harmony_smoke.out`. A zero exit code confirms that this path ran; it does
+not establish numerical agreement with a reference solution.
+
+After the smoke job succeeds, submit the evaluation job:
 
 ```bash
 qsub job_hwtopolb.pbs
+qstat -f JOB_ID
+qstat -xf JOB_ID
 ```
 
-**Resource allocation**: `select=2:ncpus=16:mpiprocs=16` (2 nodes × 16 MPI ranks each = 32 total)
+The evaluation job runs the five core suites at their documented rank counts,
+measures GPU/MPI topology, validates the generated JSON contract, runs the
+two-rank asynchronous OpenCL halo test, and compares the two algorithms. It
+fails if the device test skips or a benchmark falls back to CPU simulation.
+The merged PBS output is `hwtopolb_eval.out`; the probe writes
+`topo_metrics_cluster.json`, and benchmark CSVs and logs are under
+`benchmarks/`.
 
-**Modules loaded**:
-- `gcc/13.2.0`
-- `openmpi5/5.0.5`
-
-**Execution steps**:
-1. Compiles `topo_probe.cpp` and runs it with `mpirun`, writing `topo_metrics_cluster.json`
-2. Executes `benchmarks/compare_algos.sh` (compiles and runs kNeighbor + LeanMD under both ERAD and HWTOPOLB)
-
-Output is written to `hwtopolb_eval.out` (stdout+stderr merged via `#PBS -j oe`).
+The benchmark drivers currently compare `erad_loads()` and `hwtopolb_loads()`
+without loading `topo_metrics_cluster.json` into their runtime. Treat the
+probe as a separate topology measurement, not as an input to that comparison.
+The job compiles its sources on allocated nodes for reproducibility, so allow
+for build time when setting `walltime`. The PBS jobs cannot be fully validated
+without access to the cluster, its installed modules, and its OpenCL GPUs.
 
 ---
 
-## 8. Test Results & Verification
+## 8. Current Validation
 
-All unit tests were compiled with `-std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter` and executed via `mpirun`.
+The five documented test executables compile with C++20, MPI, and OpenCL 3.0. Run the topology, NUMA, algorithm, and contention/power suites with one rank and the hierarchical suite with two ranks. The NUMA, algorithm, and contention/power suites also have two-rank consensus cases. The integration test `tests/test_probe_runtime_integration.cpp` accepts a JSON file produced by `topo_probe.cpp` and checks the rank-to-rank matrix contract.
 
-| Test Suite | Requirement | Tests | Result |
-|:---|:---|:---:|:---:|
-| `test_topo_metrics` | R1 — Topology metrics injection | 7 | ✅ 7/7 |
-| `test_numa_cost` | R2 — NUMA migration cost gating | 4 | ✅ 4/4 |
-| `test_hierarchical` | R3 — Hierarchical balancing | 6 | ✅ 6/6 |
-| `test_algorithms` | R4 — ERAD/HWTOPOLB algorithms | 3 | ✅ 3/3 |
-| `test_contention_power` | R5 — Contention & power cap | 4 | ✅ 4/4 |
-| **Total** | | **24** | **✅ 24/24** |
+A short two-rank CPU simulation has passed for both benchmark drivers and the comparison script. These runs do not validate OpenCL kernels, GPU halo exchanges, OpenCL resource lifetime under a driver, or hardware power control. Run the corresponding cases on a GPU OpenCL platform before making device correctness or performance claims. See `benchmarks/comparison_report.md` for benchmark interpretation and `future_work_colab.md` for the remote GPU workflow.
 
----
+## 9. Static Analysis
 
-## 9. Static Analysis Baseline
-
-Two mandatory static checks are run before any functional testing:
-
-**Syntax check** (full C++20 compilation pipeline, no linking):
-```bash
-mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter \
-  -fsyntax-only dcl/runtime_impl.hpp
-```
-→ **EXIT 0, 0 warnings**
-
-**Cppcheck** (static analysis, all checks enabled):
-```bash
-cppcheck --enable=all --std=c++20 --error-exitcode=1 \
-  --suppress=missingIncludeSystem dcl/
-```
-→ **EXIT 0, 0 violations**
+`git diff --check` passes for the current changes. A broad optional cppcheck run in the constrained local environment reached the last benchmark file without reporting a finding, then hit its 40-second limit; it is not a complete static-analysis pass. Use a full C++20 build and a complete static-analysis run in CI or a less constrained machine.
 
 ---
 

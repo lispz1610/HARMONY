@@ -9,6 +9,7 @@
 #define CL_TARGET_OPENCL_VERSION 300
 #endif
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -290,6 +292,10 @@ struct CLContextDeleter { void operator()(cl_context m) const { if(m) clReleaseC
 struct CLQueueDeleter { void operator()(cl_command_queue m) const { if(m) clReleaseCommandQueue(m); } };
 struct CLProgramDeleter { void operator()(cl_program m) const { if(m) clReleaseProgram(m); } };
 struct CLKernelDeleter { void operator()(cl_kernel m) const { if(m) clReleaseKernel(m); } };
+struct EventGuard {
+    cl_event& event;
+    ~EventGuard() { if (event != nullptr) clReleaseEvent(event); }
+};
 
 using AutoMem = AutoCLHandle<cl_mem, CLMemDeleter>;
 using AutoContext = AutoCLHandle<cl_context, CLContextDeleter>;
@@ -372,15 +378,19 @@ public:
         clear_runtime_state();
 
         try {
+            std::exception_ptr local_discovery_error;
+            try {
             cl_uint n_platforms = 0;
-            detail::check_cl(clGetPlatformIDs(0, nullptr, &n_platforms), "clGetPlatformIDs(count)");
-            if (n_platforms == 0) {
-                all_device_counts_.assign(size_, 0);
-                return;
+            const cl_int platform_status = clGetPlatformIDs(0, nullptr, &n_platforms);
+            if (platform_status != CL_PLATFORM_NOT_FOUND_KHR) {
+                detail::check_cl(platform_status, "clGetPlatformIDs(count)");
             }
 
             std::vector<cl_platform_id> platform_ids(n_platforms);
-            detail::check_cl(clGetPlatformIDs(n_platforms, platform_ids.data(), nullptr), "clGetPlatformIDs(list)");
+            if (n_platforms > 0) {
+                detail::check_cl(clGetPlatformIDs(n_platforms, platform_ids.data(), nullptr),
+                                 "clGetPlatformIDs(list)");
+            }
 
             int next_local_index = 0;
             const int max_per_rank = (selection.max_devices_per_rank <= 0)
@@ -479,18 +489,33 @@ public:
 #endif
 
                     local_devices_.push_back(std::move(ld));
+                    const auto& owned_device = local_devices_.back();
 
                     DeviceInfo info{};
                     info.rank = rank_;
-                    info.local_index = ld.local_index;
+                    info.local_index = owned_device.local_index;
                     info.global_index = -1;
-                    info.name = ld.name;
-                    info.kind = ld.kind;
-                    info.compute_units = ld.compute_units;
+                    info.name = owned_device.name;
+                    info.kind = owned_device.kind;
+                    info.compute_units = owned_device.compute_units;
                     devices_.push_back(info);
                 }
 
                 if (next_local_index >= max_per_rank) break;
+            }
+            } catch (...) {
+                local_discovery_error = std::current_exception();
+            }
+
+            int local_ok = local_discovery_error ? 0 : 1;
+            int all_ok = 0;
+            detail::check_mpi(
+                MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, comm_),
+                "MPI_Allreduce(device discovery status)"
+            );
+            if (all_ok == 0) {
+                if (local_discovery_error) std::rethrow_exception(local_discovery_error);
+                throw Error("Device discovery failed on another MPI rank");
             }
 
             const int local_count = static_cast<int>(devices_.size());
@@ -528,7 +553,10 @@ public:
     MPI_Comm communicator() const noexcept { return comm_; }
 
     FieldHandle create_field(const FieldSpec& spec) {
-        if (local_devices_.empty() && simulated_total_devices_ <= 0) {
+        const int global_devices =
+            std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0);
+        if (local_devices_.empty() && simulated_total_devices_ <= 0 &&
+            global_devices <= 0) {
             throw Error("discover_devices() must be called before create_field()");
         }
         if (spec.global_elements == 0) throw Error("FieldSpec.global_elements must be > 0");
@@ -538,7 +566,9 @@ public:
         FieldHandle h{next_field_id_++};
         detail::RegisteredField rf;
         rf.spec = spec;
-        rf.replicas.resize(local_devices_.empty() ? static_cast<std::size_t>(simulated_total_devices_) : local_devices_.size());
+        rf.replicas.resize(local_devices_.empty() && simulated_total_devices_ > 0
+            ? static_cast<std::size_t>(simulated_total_devices_)
+            : local_devices_.size());
 
         const std::size_t total_bytes = spec.global_elements * spec.units_per_element * spec.bytes_per_unit;
         const cl_mem_flags flags = detail::to_opencl_flags(spec.usage);
@@ -550,12 +580,22 @@ public:
         }
 
         fields_.insert(std::make_pair(h.value, std::move(rf)));
-        if (spec.host_ptr != nullptr && !local_devices_.empty()) write_initial_field_data(h, spec.host_ptr);
+        try {
+            if (spec.host_ptr != nullptr && !local_devices_.empty()) {
+                write_initial_field_data(h, spec.host_ptr);
+            }
+        } catch (...) {
+            fields_.erase(h.value);
+            throw;
+        }
         return h;
     }
 
     KernelHandle create_kernel(const KernelSpec& spec) {
-        if (local_devices_.empty()) throw Error("discover_devices() must be called before create_kernel()");
+        if (local_devices_.empty() &&
+            std::accumulate(all_device_counts_.begin(), all_device_counts_.end(), 0) <= 0) {
+            throw Error("discover_devices() must be called before create_kernel()");
+        }
         if (spec.source_file.empty()) throw Error("KernelSpec.source_file is empty");
         if (spec.entry_point.empty()) throw Error("KernelSpec.entry_point is empty");
 
@@ -635,36 +675,93 @@ public:
 void execute(const ExecutionStep& step) {
     if (step.invocations.empty()) return;
 
-    if (step.halo.width_elements > 0 && partitions_.size() >= 2) {
-        bool needs_rebalance = false;
-        std::vector<float> abs_loads(partitions_.size(), 0.0f);
-        float prev = 0.0f;
-        for (std::size_t p = 0; p < partitions_.size(); ++p) {
-            abs_loads[p] = current_loads_[p] - prev;
-            prev = current_loads_[p];
-        }
+    if (step.halo.width_elements > 0 && !step.halo.fields.empty() &&
+        partitions_.size() >= 2) {
+        auto has_unsafe_micro = [&](const std::vector<DevicePartition>& parts) {
+            std::size_t active = 0;
+            for (const auto& part : parts) active += part.element_count > 0 ? 1u : 0u;
+            if (active < 2) return false;
+            for (const auto& part : parts) {
+                if (part.element_count > 0 && part.element_count < step.halo.width_elements) {
+                    return true;
+                }
+            }
+            return false;
+        };
 
-        for (std::size_t p = 0; p < partitions_.size(); ++p) {
-            if (partitions_[p].element_count > 0 && partitions_[p].element_count < step.halo.width_elements) {
-                needs_rebalance = true;
-                float micro = abs_loads[p];
-                abs_loads[p] = 0.0f;
-                if (p > 0) {
-                    abs_loads[p - 1] += micro;
-                } else if (p + 1 < partitions_.size()) {
-                    abs_loads[p + 1] += micro;
+        std::vector<DevicePartition> projected = partitions_;
+        std::vector<float> new_cum;
+        for (std::size_t pass = 0;
+             pass < partitions_.size() && has_unsafe_micro(projected);
+             ++pass) {
+            std::vector<std::size_t> counts;
+            counts.reserve(projected.size());
+            for (const auto& part : projected) counts.push_back(part.element_count);
+
+            for (std::size_t p = 0; p < counts.size(); ++p) {
+                if (counts[p] == 0 || counts[p] >= step.halo.width_elements) continue;
+                std::size_t recipient = counts.size();
+                for (std::size_t q = p; q > 0; --q) {
+                    if (counts[q - 1] > 0) {
+                        recipient = q - 1;
+                        break;
+                    }
+                }
+                if (recipient == counts.size()) {
+                    for (std::size_t q = p + 1; q < counts.size(); ++q) {
+                        if (counts[q] > 0) {
+                            recipient = q;
+                            break;
+                        }
+                    }
+                }
+                if (recipient == counts.size()) break;
+                counts[recipient] += counts[p];
+                counts[p] = 0;
+            }
+
+            new_cum.resize(counts.size());
+            std::size_t covered = 0;
+            for (std::size_t p = 0; p < counts.size(); ++p) {
+                covered += counts[p];
+                new_cum[p] = static_cast<float>(
+                    static_cast<double>(covered) /
+                    static_cast<double>(partition_->global_elements)
+                );
+            }
+            new_cum.back() = 1.0f;
+            projected = partitions_from_loads(new_cum);
+        }
+        const int local_invalid =
+            (projected.size() != partitions_.size() || has_unsafe_micro(projected)) ? 1 : 0;
+        int local_rebalance = 0;
+        if (!local_invalid) {
+            for (std::size_t p = 0; p < projected.size(); ++p) {
+                if (projected[p].global_offset != partitions_[p].global_offset ||
+                    projected[p].element_count != partitions_[p].element_count) {
+                    local_rebalance = 1;
+                    break;
                 }
             }
         }
-
-        if (needs_rebalance) {
-            std::vector<float> new_cum(partitions_.size(), 0.0f);
-            float acc = 0.0f;
-            for (std::size_t p = 0; p < partitions_.size(); ++p) {
-                acc += abs_loads[p];
-                new_cum[p] = acc;
-            }
-            new_cum.back() = 1.0f;
+        const int local_state[2] = {local_invalid, local_rebalance};
+        int minimum_state[2] = {};
+        int maximum_state[2] = {};
+        detail::check_mpi(
+            MPI_Allreduce(local_state, minimum_state, 2, MPI_INT, MPI_MIN, comm_),
+            "MPI_Allreduce(halo state minimum)"
+        );
+        detail::check_mpi(
+            MPI_Allreduce(local_state, maximum_state, 2, MPI_INT, MPI_MAX, comm_),
+            "MPI_Allreduce(halo state maximum)"
+        );
+        if (maximum_state[0]) {
+            throw Error("execute(): halo partitions cannot satisfy the minimum width");
+        }
+        if (minimum_state[1] != maximum_state[1]) {
+            throw Error("execute(): inconsistent halo partitions across ranks");
+        }
+        if (local_rebalance) {
             rebalance_to(new_cum);
         }
     }
@@ -695,52 +792,41 @@ void execute(const ExecutionStep& step) {
 
         if (step.halo.width_elements > 0 && !step.halo.fields.empty()) {
             std::vector<std::pair<std::size_t, cl_event>> interior_events;
-
-            run_interior_phase(
-                rk,
-                ki,
-                interior_events,
-                step.halo.width_elements
-            );
-
-            if (collect_balance_window) {
-                update_balance_window_events(interior_events, {});
-                append_balance_window_kernel_events(interior_events);
-            }
-
-            record_field_write_events(output_fields, interior_events);
-
-            exchange_halo_set(step.halo);
-
             std::vector<std::pair<std::size_t, cl_event>> border_events;
-
-            run_border_phase(
-                rk,
-                ki,
-                border_events,
-                step.halo.width_elements
-            );
-
-            if (collect_balance_window) {
-                update_balance_window_events({}, border_events);
-                append_balance_window_kernel_events(border_events);
+            try {
+                run_interior_phase(rk, ki, interior_events, step.halo.width_elements);
+                if (collect_balance_window) {
+                    update_balance_window_events(interior_events, {});
+                    append_balance_window_kernel_events(interior_events);
+                }
+                record_field_write_events(output_fields, interior_events);
+                exchange_halo_set(step.halo);
+                run_border_phase(rk, ki, border_events, step.halo.width_elements);
+                if (collect_balance_window) {
+                    update_balance_window_events({}, border_events);
+                    append_balance_window_kernel_events(border_events);
+                }
+                record_field_write_events(output_fields, border_events);
+            } catch (...) {
+                release_kernel_events(interior_events);
+                release_kernel_events(border_events);
+                throw;
             }
-
-            record_field_write_events(output_fields, border_events);
-
             release_kernel_events(interior_events);
             release_kernel_events(border_events);
         } else {
             std::vector<std::pair<std::size_t, cl_event>> full_events;
-
-            run_full_phase(rk, ki, full_events);
-
-            if (collect_balance_window) {
-                update_balance_window_events(full_events, full_events);
-                append_balance_window_kernel_events(full_events);
+            try {
+                run_full_phase(rk, ki, full_events);
+                if (collect_balance_window) {
+                    update_balance_window_events(full_events, full_events);
+                    append_balance_window_kernel_events(full_events);
+                }
+                record_field_write_events(output_fields, full_events);
+            } catch (...) {
+                release_kernel_events(full_events);
+                throw;
             }
-
-            record_field_write_events(output_fields, full_events);
             release_kernel_events(full_events);
         }
 
@@ -880,22 +966,32 @@ void execute(const ExecutionStep& step) {
     }
 }
     void rebalance_to(const std::vector<float>& loads) {
-    if (!partition_.has_value()) {
-        throw Error("rebalance_to(): partition must be configured before rebalancing");
-    }
+    int local_invalid = (!partition_.has_value() || partitions_.empty() ||
+        (rank_ == 0 && loads.empty()) ||
+        (!loads.empty() && loads.size() != partitions_.size())) ? 1 : 0;
+    int any_invalid = 0;
+    detail::check_mpi(
+        MPI_Allreduce(&local_invalid, &any_invalid, 1, MPI_INT, MPI_MAX, comm_),
+        "MPI_Allreduce(rebalance input status)"
+    );
+    if (any_invalid) throw Error("rebalance_to(): inconsistent partition or load input");
 
-    if (partitions_.empty()) {
-        throw Error("rebalance_to(): no partitions available");
-    }
-
-    if (rank_ == 0) {
-        if (loads.empty()) {
-            throw Error("rebalance_to(): loads vector is empty");
-        }
-    }
-    
-    if (!loads.empty() && loads.size() != partitions_.size()) {
-        throw Error("rebalance_to(): loads size must match number of partitions");
+    unsigned long long local_shape[2] = {
+        static_cast<unsigned long long>(partitions_.size()),
+        static_cast<unsigned long long>(partition_->global_elements)
+    };
+    unsigned long long min_shape[2] = {};
+    unsigned long long max_shape[2] = {};
+    detail::check_mpi(
+        MPI_Allreduce(local_shape, min_shape, 2, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+        "MPI_Allreduce(rebalance minimum shape)"
+    );
+    detail::check_mpi(
+        MPI_Allreduce(local_shape, max_shape, 2, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+        "MPI_Allreduce(rebalance maximum shape)"
+    );
+    if (min_shape[0] != max_shape[0] || min_shape[1] != max_shape[1]) {
+        throw Error("rebalance_to(): partition shape differs across ranks");
     }
 
     std::vector<float> synced_loads = loads;
@@ -903,7 +999,10 @@ void execute(const ExecutionStep& step) {
         synced_loads.resize(partitions_.size(), 0.0f);
     }
     
-    MPI_Bcast(synced_loads.data(), static_cast<int>(partitions_.size()), MPI_FLOAT, 0, comm_);
+    detail::check_mpi(
+        MPI_Bcast(synced_loads.data(), static_cast<int>(partitions_.size()), MPI_FLOAT, 0, comm_),
+        "MPI_Bcast(rebalance loads)"
+    );
 
     // From now on, loads is cumulative: [0.10, 0.20, ..., 1.00].
     std::vector<float> cumulative = synced_loads;
@@ -937,6 +1036,35 @@ void execute(const ExecutionStep& step) {
 
     if (new_parts.size() != old_parts.size()) {
         throw Error("rebalance_to(): rounded partition count mismatch");
+    }
+    auto partition_signature = [](const std::vector<DevicePartition>& parts) {
+        unsigned long long hash = 1469598103934665603ULL;
+        for (const auto& part : parts) {
+            for (unsigned long long value : {
+                    static_cast<unsigned long long>(part.global_offset),
+                    static_cast<unsigned long long>(part.element_count),
+                    static_cast<unsigned long long>(part.owning_rank),
+                    static_cast<unsigned long long>(part.device_global_index)}) {
+                hash = (hash ^ value) * 1099511628211ULL;
+            }
+        }
+        return hash;
+    };
+    unsigned long long local_hash[2] = {
+        partition_signature(old_parts), partition_signature(new_parts)
+    };
+    unsigned long long min_hash[2] = {};
+    unsigned long long max_hash[2] = {};
+    detail::check_mpi(
+        MPI_Allreduce(local_hash, min_hash, 2, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+        "MPI_Allreduce(rebalance minimum partition signature)"
+    );
+    detail::check_mpi(
+        MPI_Allreduce(local_hash, max_hash, 2, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+        "MPI_Allreduce(rebalance maximum partition signature)"
+    );
+    if (min_hash[0] != max_hash[0] || min_hash[1] != max_hash[1]) {
+        throw Error("rebalance_to(): partition map differs across ranks");
     }
 
     bool same = true;
@@ -1372,13 +1500,14 @@ public:
     void clear_runtime_state() {
         release_tracked_field_events();
         reset_balance_window_events();
-        platforms_.clear();
+        // Fields and kernels release their device resources before queues and contexts.
+        fields_.clear();
+        kernels_.clear();
         local_devices_.clear();
+        platforms_.clear();
         devices_.clear();
         partitions_.clear();
         all_device_counts_.clear();
-        fields_.clear();
-        kernels_.clear();
         current_loads_.clear();
         device_timings_.clear();
         last_elapsed_local_.clear();
@@ -1497,7 +1626,6 @@ std::vector<DevicePartition> partitions_from_loads(const std::vector<float>& loa
             std::size_t cut = static_cast<std::size_t>(std::llround(raw));
 
             const std::size_t min_cut = unit_cuts[i];
-            const std::size_t remaining_parts = cumulative.size() - (i + 1);
             const std::size_t max_cut = total_units;
 
             if (cut < min_cut) cut = min_cut;
@@ -1571,7 +1699,14 @@ std::vector<float> loads_from_partitions(const std::vector<DevicePartition>& par
 
         detail::RegisteredField& rf = it->second;
         const std::size_t total_bytes = rf.spec.global_elements * rf.spec.units_per_element * rf.spec.bytes_per_unit;
-        std::vector<cl_event> write_events;
+        struct EventOwner {
+            std::vector<cl_event> events;
+            ~EventOwner() {
+                for (cl_event event : events) {
+                    if (event != nullptr) clReleaseEvent(event);
+                }
+            }
+        } write_events;
 
         for (std::size_t d = 0; d < local_devices_.size(); ++d) {
             cl_event ev = nullptr;
@@ -1589,13 +1724,14 @@ std::vector<float> loads_from_partitions(const std::vector<DevicePartition>& par
                 ),
                 "clEnqueueWriteBuffer(write_initial_field_data)"
             );
-            write_events.push_back(ev);
+            write_events.events.push_back(ev);
+            detail::check_cl(clFlush(local_devices_[d].transfer_queue),
+                             "clFlush(initial field write)");
         }
 
-        for (cl_event ev : write_events) {
+        for (cl_event ev : write_events.events) {
             if (ev != nullptr) {
                 detail::check_cl(clWaitForEvents(1, &ev), "clWaitForEvents(write_initial_field_data)");
-                clReleaseEvent(ev);
             }
         }
     }
@@ -1721,9 +1857,6 @@ void extract_rw_fields(
     ) const {
         std::vector<cl_event> deps;
         for (std::size_t i = 0; i < binding.args.size(); ++i) {
-            const unsigned idx = binding.args[i].first;
-            if (idx == 0) continue;
-
             const KernelArg& arg = binding.args[i].second;
             const FieldHandle* fh = std::get_if<FieldHandle>(&arg);
             if (fh == nullptr) continue;
@@ -1739,6 +1872,12 @@ void extract_rw_fields(
             const bool seen = std::any_of(deps.begin(), deps.end(),
                                           [ev](cl_event existing) { return existing == ev; });
             if (!seen) deps.push_back(ev);
+        }
+        if (!deps.empty() && local_device < local_devices_.size()) {
+            detail::check_cl(clFlush(local_devices_[local_device].kernel_queue),
+                             "clFlush(kernel dependency producer)");
+            detail::check_cl(clFlush(local_devices_[local_device].transfer_queue),
+                             "clFlush(transfer dependency producer)");
         }
         return deps;
     }
@@ -1807,6 +1946,8 @@ void extract_rw_fields(
             cl_event ev = kernel_events[i].second;
             if (ev == nullptr) continue;
 
+            detail::check_cl(clFlush(local_devices_[d].kernel_queue),
+                             "clFlush(kernel profiling)");
             detail::check_cl(clWaitForEvents(1, &ev), "clWaitForEvents(kernel profiling)");
 
             cl_ulong t0 = 0;
@@ -1953,6 +2094,14 @@ void extract_rw_fields(
 
         std::vector<cl_event> marker_events;
         marker_events.reserve(local_devices_.size() * 2);
+        struct MarkerOwner {
+            std::vector<cl_event>& events;
+            ~MarkerOwner() {
+                for (cl_event event : events) {
+                    if (event != nullptr) clReleaseEvent(event);
+                }
+            }
+        } owned_markers{marker_events};
 
         for (std::size_t d = 0; d < local_devices_.size(); ++d) {
             if (local_devices_[d].kernel_queue != nullptr) {
@@ -1963,6 +2112,8 @@ void extract_rw_fields(
                 detail::check_cl(clEnqueueMarker(local_devices_[d].kernel_queue, &ev), "clEnqueueMarker(kernel queue)");
 #endif
                 marker_events.push_back(ev);
+                detail::check_cl(clFlush(local_devices_[d].kernel_queue),
+                                 "clFlush(kernel queue marker)");
             }
 
             if (local_devices_[d].transfer_queue != nullptr) {
@@ -1973,13 +2124,14 @@ void extract_rw_fields(
                 detail::check_cl(clEnqueueMarker(local_devices_[d].transfer_queue, &ev), "clEnqueueMarker(transfer queue)");
 #endif
                 marker_events.push_back(ev);
+                detail::check_cl(clFlush(local_devices_[d].transfer_queue),
+                                 "clFlush(transfer queue marker)");
             }
         }
 
         for (cl_event ev : marker_events) {
             if (ev != nullptr) {
                 detail::check_cl(clWaitForEvents(1, &ev), "clWaitForEvents(queue marker)");
-                clReleaseEvent(ev);
             }
         }
         release_tracked_field_events();
@@ -1991,6 +2143,7 @@ void extract_rw_fields(
         for (std::size_t p = 0; p < partitions_.size(); ++p) {
             const DevicePartition& dp = partitions_[p];
             if (dp.owning_rank != rank_ || dp.local_index < 0) continue;
+            if (dp.element_count == 0) continue;
 
             const std::size_t d = static_cast<std::size_t>(dp.local_index);
             cl_kernel kernel = rk.kernels_per_local_device[d];
@@ -2180,6 +2333,20 @@ inline void exchange_halos_for_field(FieldHandle fh, std::size_t halo) {
         cl_event read_right_to_left_ev = nullptr;
         cl_event write_left_ev = nullptr;
         cl_event write_right_ev = nullptr;
+        struct HaloEventOwner {
+            cl_event& read_left;
+            cl_event& read_right;
+            cl_event& write_left;
+            cl_event& write_right;
+            ~HaloEventOwner() {
+                for (cl_event event : {read_left, read_right, write_left, write_right}) {
+                    if (event != nullptr) clReleaseEvent(event);
+                }
+            }
+        } owned_events{
+            read_left_to_right_ev, read_right_to_left_ev,
+            write_left_ev, write_right_ev
+        };
 
         if (left.owning_rank == rank_) {
             const std::size_t dl = static_cast<std::size_t>(left.local_index);
@@ -2507,6 +2674,7 @@ inline void redistribute_field_intersection(
                 const std::size_t chunk_off = byte_off + done;
 
                 cl_event read_ev = nullptr;
+                detail::EventGuard read_guard{read_ev};
                 if (rank_src == rank_ && old_parts[src].local_index >= 0) {
                     const std::size_t dsrc =
                         static_cast<std::size_t>(old_parts[src].local_index);
@@ -2531,10 +2699,13 @@ inline void redistribute_field_intersection(
                     );
 
                     detail::check_cl(
+                        clFlush(local_devices_[dsrc].transfer_queue),
+                        "clFlush(redistribute read)"
+                    );
+                    detail::check_cl(
                         clWaitForEvents(1, &read_ev),
                         "clWaitForEvents(redistribute read)"
                     );
-                    clReleaseEvent(read_ev);
                 }
 
                 if (rank_src == rank_ && rank_dst == rank_) {
@@ -3009,6 +3180,40 @@ inline bool maybe_rebalance_from_timings(
     const double balance_t0 = MPI_Wtime();
 
     const std::vector<float> old_loads = current_loads_;
+    const std::vector<FieldHandle> fields_to_move =
+        unique_existing_proportional_fields(rebalance_fields);
+    unsigned long long field_signature = 1469598103934665603ULL;
+    for (FieldHandle field : fields_to_move) {
+        field_signature ^= static_cast<unsigned long long>(field.value);
+        field_signature *= 1099511628211ULL;
+    }
+
+    // Every rank must enter the same collective path, including early exits.
+    // A mixed timing source or field list would otherwise make one rank enter
+    // a reduction while another rank skips directly to metrics or migration.
+    const unsigned long long local_state[6] = {
+        partition_.has_value() ? 1ULL : 0ULL,
+        static_cast<unsigned long long>(partitions_.size()),
+        static_cast<unsigned long long>(simulated_times_.size()),
+        static_cast<unsigned long long>(fields_to_move.size()),
+        static_cast<unsigned long long>(current_loads_.size()),
+        field_signature
+    };
+    unsigned long long minimum_state[6] = {};
+    unsigned long long maximum_state[6] = {};
+    detail::check_mpi(
+        MPI_Allreduce(local_state, minimum_state, 6, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+        "MPI_Allreduce(balance input minima)"
+    );
+    detail::check_mpi(
+        MPI_Allreduce(local_state, maximum_state, 6, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+        "MPI_Allreduce(balance input maxima)"
+    );
+    for (int i = 0; i < 6; ++i) {
+        if (minimum_state[i] != maximum_state[i]) {
+            throw Error("maybe_rebalance_from_timings(): inconsistent inputs across ranks");
+        }
+    }
 
     if (!partition_.has_value()) {
         const std::vector<double> global_times =
@@ -3047,9 +3252,6 @@ inline bool maybe_rebalance_from_timings(
 
         return false;
     }
-
-    const std::vector<FieldHandle> fields_to_move =
-        unique_existing_proportional_fields(rebalance_fields);
 
     if (fields_to_move.empty()) {
         const std::vector<double> global_times =
@@ -3118,27 +3320,44 @@ inline bool maybe_rebalance_from_timings(
         );
     }
 
-    double throttle = 1.0;
-    if (!proposed_loads.empty() && policy.use_power_cap && topo_metrics_.has_value()) {
-        proposed_loads = apply_power_cap(proposed_loads, *topo_metrics_, policy.power_budget_watts, &throttle);
+    int power_cap_error = 0;
+    if (rank_ == 0 && !proposed_loads.empty() && policy.use_power_cap) {
+        try {
+            if (!topo_metrics_.has_value()) {
+                throw Error("Power cap requires topology power measurements");
+            }
+            proposed_loads = apply_power_cap(
+                proposed_loads, *topo_metrics_, policy.power_budget_watts,
+                nullptr, &current_loads_
+            );
+        } catch (...) {
+            power_cap_error = 1;
+        }
+    }
+    detail::check_mpi(
+        MPI_Bcast(&power_cap_error, 1, MPI_INT, 0, comm_),
+        "MPI_Bcast(power cap status)"
+    );
+    if (power_cap_error != 0) {
+        throw Error("Power cap infeasible or measurements unavailable");
     }
 
-    if (throttle > 1.0) {
-        if (!simulated_times_.empty()) {
-            for (auto& t : simulated_times_) {
-                t *= throttle;
-            }
-        } else {
-            double max_t = 0.0;
-            for (double t : global_times) {
-                if (t > max_t) max_t = t;
-            }
-            double delay = max_t * (throttle - 1.0);
-            if (delay > 0.0) {
-                double start_delay = MPI_Wtime();
-                while (MPI_Wtime() - start_delay < delay) {}
-            }
-        }
+    // The proposal must be identical before any rank can take a local early
+    // return or enter the NUMA consensus collective. Topology estimates may
+    // differ across ranks, so rank zero chooses the global proposal.
+    int proposed_count = (rank_ == 0) ? static_cast<int>(proposed_loads.size()) : 0;
+    detail::check_mpi(
+        MPI_Bcast(&proposed_count, 1, MPI_INT, 0, comm_),
+        "MPI_Bcast(balance proposal size)"
+    );
+    if (rank_ != 0) {
+        proposed_loads.resize(static_cast<std::size_t>(proposed_count));
+    }
+    if (proposed_count > 0) {
+        detail::check_mpi(
+            MPI_Bcast(proposed_loads.data(), proposed_count, MPI_FLOAT, 0, comm_),
+            "MPI_Bcast(balance proposal)"
+        );
     }
 
     if (proposed_loads.empty()) {
@@ -3485,16 +3704,20 @@ inline bool maybe_rebalance_hierarchical(
         local_times[li] = std::max(local_times[li], 1.0e-9);
     }
 
-    // Compute intra-node load proportions (inverse-time)
+    // Compute per-device throughput from work completed in the measured interval.
     std::vector<double> p_local(L_r, 0.0);
+    double local_capacity = 0.0;
     if (L_r > 0) {
-        double local_cap_total = 0.0;
         for (std::size_t li = 0; li < L_r; ++li) {
-            local_cap_total += (1.0 / local_times[li]);
+            const int g = local_global_indices[li];
+            const double elements =
+                static_cast<double>(old_parts[static_cast<std::size_t>(g)].element_count);
+            p_local[li] = elements / local_times[li];
+            local_capacity += p_local[li];
         }
-        if (local_cap_total > 0.0) {
+        if (local_capacity > 0.0) {
             for (std::size_t li = 0; li < L_r; ++li) {
-                p_local[li] = (1.0 / local_times[li]) / local_cap_total;
+                p_local[li] /= local_capacity;
             }
         } else {
             for (std::size_t li = 0; li < L_r; ++li) {
@@ -3514,13 +3737,8 @@ inline bool maybe_rebalance_hierarchical(
         std::cout << "]" << std::endl;
     }
 
-    // R3.3: Two-Level Barrier Safety
-    // Synchronize local devices, then MPI_Barrier between intra-node and inter-node phases
+    // Finish local work before entering the rank-capacity collective.
     this->synchronize_all_local_devices(false);
-    detail::check_mpi(
-        MPI_Barrier(comm_),
-        "MPI_Barrier(hierarchical intra-to-inter)"
-    );
 
     // R3.2: Inter-node Balancing Phase
     std::size_t rank_elements_count = 0;
@@ -3539,15 +3757,17 @@ inline bool maybe_rebalance_hierarchical(
     }
     // Ranks with L_r == 0 keep local_max_time = 0.0 → zero capacity → zero elements.
 
-    double local_data[2] = {static_cast<double>(rank_elements_count), local_max_time};
-    std::vector<double> rank_data(static_cast<std::size_t>(size_) * 2, 0.0);
+    double local_data[3] = {
+        static_cast<double>(rank_elements_count), local_max_time, local_capacity
+    };
+    std::vector<double> rank_data(static_cast<std::size_t>(size_) * 3, 0.0);
     detail::check_mpi(
         MPI_Gather(
             local_data,
-            2,
+            3,
             MPI_DOUBLE,
             rank_data.data(),
-            2,
+            3,
             MPI_DOUBLE,
             0,
             comm_
@@ -3564,9 +3784,8 @@ inline bool maybe_rebalance_hierarchical(
         std::vector<double> capacities(static_cast<std::size_t>(size_), 0.0);
 
         for (int r = 0; r < size_; ++r) {
-            double r_elements = rank_data[static_cast<std::size_t>(r * 2)];
-            double r_max_time = rank_data[static_cast<std::size_t>(r * 2 + 1)];
-            double r_capacity = (r_max_time > 0.0) ? (std::max(1.0, r_elements) / r_max_time) : 0.0;
+            double r_max_time = rank_data[static_cast<std::size_t>(r * 3 + 1)];
+            double r_capacity = rank_data[static_cast<std::size_t>(r * 3 + 2)];
             total_capacity += r_capacity;
             global_max_time = std::max(global_max_time, r_max_time);
             capacities[static_cast<std::size_t>(r)] = r_capacity;
@@ -3591,7 +3810,7 @@ inline bool maybe_rebalance_hierarchical(
         if (abort_migration) {
             double elements_accum = 0.0;
             for (int r = 0; r < size_; ++r) {
-                elements_accum += rank_data[static_cast<std::size_t>(r * 2)];
+                elements_accum += rank_data[static_cast<std::size_t>(r * 3)];
                 inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(elements_accum / static_cast<double>(partition_->global_elements));
             }
             inter_cum_loads.back() = 1.0f;
@@ -3823,31 +4042,78 @@ inline bool maybe_rebalance_hierarchical(
             }
         }
     } else {
+        // Every rank owns disjoint entries. One reduction publishes the local
+        // cuts to all ranks without an Allgatherv or a global barrier.
+        const std::size_t total_devices = new_parts.size();
+        std::vector<unsigned long long> local_metadata(total_devices * 2, 0ULL);
+        std::vector<unsigned long long> global_metadata(total_devices * 2, 0ULL);
         for (std::size_t li = 0; li < L_r; ++li) {
-            int g = local_global_indices[li];
-            new_parts[static_cast<std::size_t>(g)].global_offset = static_cast<std::size_t>(local_offsets[li]);
-            new_parts[static_cast<std::size_t>(g)].element_count = static_cast<std::size_t>(local_counts[li]);
+            const std::size_t g = static_cast<std::size_t>(local_global_indices[li]);
+            local_metadata[g * 2] = local_offsets[li];
+            local_metadata[g * 2 + 1] = local_counts[li];
         }
+        detail::check_mpi(
+            MPI_Allreduce(
+                local_metadata.data(), global_metadata.data(),
+                static_cast<int>(global_metadata.size()), MPI_UNSIGNED_LONG_LONG,
+                MPI_SUM, comm_
+            ),
+            "MPI_Allreduce(hierarchical local partition metadata)"
+        );
+        for (std::size_t g = 0; g < total_devices; ++g) {
+            new_parts[g].global_offset = static_cast<std::size_t>(global_metadata[g * 2]);
+            new_parts[g].element_count = static_cast<std::size_t>(global_metadata[g * 2 + 1]);
+        }
+    }
+
+    int local_invalid_partition = 0;
+    std::size_t covered_elements = 0;
+    for (const auto& part : new_parts) {
+        if (part.global_offset != covered_elements ||
+            part.element_count > partition_->global_elements - covered_elements) {
+            local_invalid_partition = 1;
+            break;
+        }
+        covered_elements += part.element_count;
+    }
+    if (covered_elements != partition_->global_elements) local_invalid_partition = 1;
+    int any_invalid_partition = 0;
+    detail::check_mpi(
+        MPI_Allreduce(&local_invalid_partition, &any_invalid_partition, 1,
+                      MPI_INT, MPI_MAX, comm_),
+        "MPI_Allreduce(hierarchical partition coverage)"
+    );
+    if (any_invalid_partition != 0) {
+        throw Error("Hierarchical partition has a gap, overlap, or missing elements");
     }
 
     // Apply partition update
     const std::vector<FieldHandle> fields_to_move =
         unique_existing_proportional_fields(rebalance_fields);
 
-    this->synchronize(true);
+    if (abort_migration_flag) {
+        this->synchronize_all_local_devices(true);
+    } else {
+        this->synchronize(true);
+    }
 
     if (!fields_to_move.empty()) {
         this->redistribute_selected_registered_fields(
             fields_to_move,
             old_parts,
-            new_parts
+            new_parts,
+            !abort_migration_flag
         );
     }
 
     partitions_ = new_parts;
     current_loads_ = loads_from_partitions(partitions_);
 
-    this->synchronize(true);
+    if (abort_migration_flag) {
+        this->synchronize_all_local_devices(true);
+    } else {
+        this->synchronize(true);
+    }
 
     // R3.4: Print on rank 0: [HIER] final partition: [...]
     if (rank_ == 0) {
@@ -4438,6 +4704,7 @@ inline void transfer_field_range(
             const std::size_t dsrc = static_cast<std::size_t>(src_part.local_index);
 
             cl_event read_ev = nullptr;
+            detail::EventGuard read_guard{read_ev};
             detail::check_cl(
                 clEnqueueReadBuffer(
                     local_devices_[dsrc].transfer_queue,
@@ -4454,10 +4721,13 @@ inline void transfer_field_range(
             );
 
             detail::check_cl(
+                clFlush(local_devices_[dsrc].transfer_queue),
+                "clFlush(transfer_field_range read)"
+            );
+            detail::check_cl(
                 clWaitForEvents(1, &read_ev),
                 "clWaitForEvents(transfer_field_range read)"
             );
-            clReleaseEvent(read_ev);
         }
 
         // Caso remoto: envio unidirecional por chunks
@@ -4478,6 +4748,7 @@ inline void transfer_field_range(
             const std::size_t ddst = static_cast<std::size_t>(dst_part.local_index);
 
             cl_event write_ev = nullptr;
+            detail::EventGuard write_guard{write_ev};
             detail::check_cl(
                 clEnqueueWriteBuffer(
                     local_devices_[ddst].transfer_queue,
@@ -4496,12 +4767,15 @@ inline void transfer_field_range(
             );
 
             detail::check_cl(
+                clFlush(local_devices_[ddst].transfer_queue),
+                "clFlush(transfer_field_range write)"
+            );
+            detail::check_cl(
                 clWaitForEvents(1, &write_ev),
                 src_part.owning_rank == rank_
                     ? "clWaitForEvents(transfer_field_range local)"
                     : "clWaitForEvents(transfer_field_range remote)"
             );
-            clReleaseEvent(write_ev);
         }
     }
 }
@@ -4594,7 +4868,8 @@ inline void redistribute_field_proportional_delta(
 inline void redistribute_selected_registered_fields(
     const std::vector<FieldHandle>& selected_fields,
     const std::vector<DevicePartition>& old_parts,
-    const std::vector<DevicePartition>& new_parts
+    const std::vector<DevicePartition>& new_parts,
+    bool synchronize_ranks = true
 ) {
     const std::vector<FieldHandle> fields_to_move =
         unique_existing_proportional_fields(selected_fields);
@@ -4606,10 +4881,12 @@ inline void redistribute_selected_registered_fields(
             new_parts
         );
 
-        detail::check_mpi(
-            MPI_Barrier(comm_),
-            "MPI_Barrier(redistribute selected proportional field)"
-        );
+        if (synchronize_ranks) {
+            detail::check_mpi(
+                MPI_Barrier(comm_),
+                "MPI_Barrier(redistribute selected proportional field)"
+            );
+        }
     }
 }
 
@@ -4758,7 +5035,8 @@ public:
             total_devices = metrics.pcie_latency_ns.size();
         }
 
-        const std::size_t expected_matrix_size = total_devices * total_devices;
+        const std::size_t expected_matrix_size =
+            static_cast<std::size_t>(size_) * static_cast<std::size_t>(size_);
         if (metrics.mpi_latency_ns.size() != expected_matrix_size ||
             metrics.mpi_bandwidth_gbps.size() != expected_matrix_size) {
             throw dcl::Error("Invalid matrix dimensions");
@@ -4781,6 +5059,33 @@ public:
         }
         if (!metrics.current_power_watts.empty() && metrics.current_power_watts.size() != total_devices) {
             throw dcl::Error("Invalid current_power_watts dimensions");
+        }
+        auto require_finite_range = [](const std::vector<double>& values,
+                                       double minimum, bool strict,
+                                       const char* name) {
+            for (double value : values) {
+                if (!std::isfinite(value) ||
+                    (strict ? value <= minimum : value < minimum)) {
+                    throw dcl::Error(std::string("Invalid ") + name + " value");
+                }
+            }
+        };
+        require_finite_range(metrics.pcie_latency_ns, 0.0, false, "pcie_latency_ns");
+        require_finite_range(metrics.pcie_bandwidth_gbps, 0.0, true, "pcie_bandwidth_gbps");
+        require_finite_range(metrics.mpi_latency_ns, 0.0, false, "mpi_latency_ns");
+        require_finite_range(metrics.mpi_bandwidth_gbps, 0.0, false, "mpi_bandwidth_gbps");
+        require_finite_range(metrics.memory_contention_factor, 1.0, false,
+                             "memory_contention_factor");
+        require_finite_range(metrics.thermal_tdp_watts, 0.0, true, "thermal_tdp_watts");
+        require_finite_range(metrics.current_power_watts, 0.0, false,
+                             "current_power_watts");
+        for (int source = 0; source < size_; ++source) {
+            for (int target = 0; target < size_; ++target) {
+                if (source != target &&
+                    metrics.mpi_bandwidth_gbps[static_cast<std::size_t>(source * size_ + target)] <= 0.0) {
+                    throw dcl::Error("Off-diagonal MPI bandwidth must be positive");
+                }
+            }
         }
 
         if (std::any_of(metrics.memory_contention_factor.begin(), metrics.memory_contention_factor.end(),

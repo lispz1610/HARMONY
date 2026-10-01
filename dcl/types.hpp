@@ -180,10 +180,11 @@ struct TopoMetrics {
     std::vector<double> pcie_latency_ns;
     // Per-device PCIe peak bandwidth in gigabytes per second (GB/s)
     std::vector<double> pcie_bandwidth_gbps;
-    // Per-neighbor-pair MPI one-way latency in nanoseconds (ns), flat matrix indexed by [src_global_device * total_devices + dst_global_device]
+    // Rank-to-rank MPI latency in nanoseconds, indexed by [src_rank * rank_count + dst_rank].
     std::vector<double> mpi_latency_ns;
-    // Per-neighbor-pair MPI bandwidth in gigabytes per second (GB/s), flat matrix indexed by [src_global_device * total_devices + dst_global_device]
+    // Rank-to-rank MPI bandwidth in gigabytes per second with the same indexing.
     std::vector<double> mpi_bandwidth_gbps;
+    bool synthetic{false};
 
     // Forward-compatible fields for NUMA-aware load balancing (R2)
     // Flat N x N matrix of NUMA distances (where N is the number of NUMA nodes), unitless distance metrics

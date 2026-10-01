@@ -175,160 +175,107 @@ inline std::vector<float> apply_power_cap(
     const std::vector<float>& loads,
     const TopoMetrics& metrics,
     double power_budget_watts = 0.0,
-    double* out_throttle_factor = nullptr
+    double* out_throttle_factor = nullptr,
+    const std::vector<float>* current_loads = nullptr
 ) {
-    if (loads.empty()) {
-        return {};
-    }
-    if (loads.size() == 1) {
-        return {1.0f};
-    }
-
-    const std::size_t n = loads.size();
-
-    // If power metrics are not configured, return input loads as-is
+    if (loads.empty()) return {};
+    if (out_throttle_factor) *out_throttle_factor = 1.0;
     if (metrics.current_power_watts.empty() || metrics.thermal_tdp_watts.empty()) {
         return loads;
     }
 
-    // 1. Convert cumulative loads to per-device individual load shares:
-    //    p[i] = loads[i] - (i > 0 ? loads[i-1] : 0.0f)
-    std::vector<double> shares(n, 0.0);
-    double prev = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double cur = static_cast<double>(loads[i]);
-        shares[i] = std::max(0.0, cur - prev);
-        prev = cur;
+    const std::size_t n = loads.size();
+    const auto& measured_loads = current_loads ? *current_loads : loads;
+    if (measured_loads.size() != n || metrics.current_power_watts.size() != n ||
+        metrics.thermal_tdp_watts.size() != n ||
+        !std::isfinite(power_budget_watts) || power_budget_watts < 0.0) {
+        throw Error("Invalid power cap input dimensions or budget");
     }
 
-    const double sum_initial = std::accumulate(shares.begin(), shares.end(), 0.0);
-    if (sum_initial <= 0.0) {
-        for (std::size_t i = 0; i < n; ++i) {
-            shares[i] = 1.0 / static_cast<double>(n);
+    std::vector<double> desired(n), capacity(n), slope(n), shares(n);
+    double previous_desired = 0.0;
+    double previous_current = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double proposed = loads[i];
+        const double measured = measured_loads[i];
+        const double watts = metrics.current_power_watts[i];
+        const double tdp = metrics.thermal_tdp_watts[i];
+        if (!std::isfinite(proposed) || !std::isfinite(measured) ||
+            !std::isfinite(watts) || !std::isfinite(tdp) ||
+            proposed < previous_desired || measured < previous_current ||
+            watts < 0.0 || tdp <= 0.0) {
+            throw Error("Invalid power cap measurement or load vector");
         }
-    } else {
-        for (std::size_t i = 0; i < n; ++i) {
-            shares[i] /= sum_initial;
-        }
-    }
-
-    // 2. Compute effective per-device limits taking power_budget_watts into account
-    std::vector<double> effective_limit(n, 0.0);
-    double total_tdp = 0.0;
-    double total_curr_power = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double tdp = (i < metrics.thermal_tdp_watts.size()) ? metrics.thermal_tdp_watts[i] : 0.0;
-        const double curr = (i < metrics.current_power_watts.size()) ? metrics.current_power_watts[i] : 0.0;
-        total_tdp += tdp;
-        total_curr_power += curr;
-    }
-
-    for (std::size_t i = 0; i < n; ++i) {
-        double limit = (i < metrics.thermal_tdp_watts.size()) ? metrics.thermal_tdp_watts[i] : 0.0;
-        if (power_budget_watts > 0.0) {
-            if (total_tdp > power_budget_watts && total_tdp > 0.0) {
-                limit = std::min(limit, limit * (power_budget_watts / total_tdp));
+        desired[i] = proposed - previous_desired;
+        const double current_share = measured - previous_current;
+        previous_desired = proposed;
+        previous_current = measured;
+        if (current_share <= 0.0 || watts <= 0.0) {
+            if (desired[i] > 0.0) {
+                throw Error("Power cap requires measured positive load and power on every proposed device");
             }
-            if (total_curr_power > power_budget_watts && total_curr_power > 0.0 &&
-                i < metrics.current_power_watts.size()) {
-                limit = std::min(limit, metrics.current_power_watts[i] * (power_budget_watts / total_curr_power));
-            }
-        }
-        effective_limit[i] = limit;
-    }
-
-    // 3. Identify overloaded devices: current_power_watts[i] > effective_limit[i]
-    //    and scale down their load shares proportionally
-    double freed_load = 0.0;
-    std::vector<double> headroom_share(n, 0.0);
-    double total_headroom_share = 0.0;
-    std::vector<std::size_t> underloaded_indices;
-
-    for (std::size_t i = 0; i < n; ++i) {
-        const double curr_pwr = (i < metrics.current_power_watts.size()) ? metrics.current_power_watts[i] : 0.0;
-        const double limit = effective_limit[i];
-
-        if (limit > 0.0 && curr_pwr > limit) {
-            const double scale = limit / curr_pwr;
-            const double new_share = shares[i] * scale;
-            freed_load += (shares[i] - new_share);
-            shares[i] = new_share;
+            capacity[i] = 0.0;
+            slope[i] = 0.0;
         } else {
-            underloaded_indices.push_back(i);
-            
-            double hs = 0.0;
-            if (curr_pwr > 1e-12 && shares[i] > 1e-12) {
-                hs = shares[i] * (limit / curr_pwr) - shares[i];
-            } else if (limit > 1e-12) {
-                hs = 1.0; 
-            }
-            headroom_share[i] = std::max(0.0, hs);
-            total_headroom_share += headroom_share[i];
+            slope[i] = watts / current_share;
+            capacity[i] = std::min(1.0, tdp / slope[i]);
         }
+        shares[i] = std::min(desired[i], capacity[i]);
+    }
+    if (std::fabs(previous_desired - 1.0) > 1e-5 ||
+        std::fabs(previous_current - 1.0) > 1e-5) {
+        throw Error("Power cap loads must cover all elements");
     }
 
-    // 4. Redistribute the freed excess load to underloaded devices
-    double s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
-    double throttle = 1.0;
-
-    if (freed_load > 0.0 && !underloaded_indices.empty()) {
-        const double absorbable = std::min(freed_load, total_headroom_share);
-        
-        if (absorbable > 1e-12 && total_headroom_share > 1e-12) {
-            for (std::size_t idx : underloaded_indices) {
-                shares[idx] += absorbable * (headroom_share[idx] / total_headroom_share);
-            }
-        }
-        
-        // After redistribution, re-evaluate sum and throttle
-        s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
-        if (s_sum > 0.0 && s_sum < 0.99999) {
-            throttle = 1.0 / s_sum;
-        }
-    } else if (freed_load > 0.0 && underloaded_indices.empty()) {
-        // All devices were overloaded; their shares were reduced proportionally.
-        s_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
-        if (s_sum > 0.0) {
-            throttle = 1.0 / s_sum;
-        }
+    const double total_capacity = std::accumulate(capacity.begin(), capacity.end(), 0.0);
+    if (total_capacity < 1.0 - 1e-9) {
+        throw Error("Power cap is infeasible without actual device throttling");
     }
 
-    if (out_throttle_factor) {
-        *out_throttle_factor = throttle;
-    }
-
-    // Normalize so shares sum to 1.0. 
-    // This maintains the 100% data coverage requirement, while the throttle factor
-    // informs the runtime to stretch the execution time (decouple time) to respect TDP.
-    if (s_sum > 0.0) {
+    double missing = 1.0 - std::accumulate(shares.begin(), shares.end(), 0.0);
+    while (missing > 1e-10) {
+        double headroom = 0.0;
+        for (std::size_t i = 0; i < n; ++i) headroom += capacity[i] - shares[i];
+        if (headroom < missing - 1e-9) {
+            throw Error("Power cap has insufficient remaining capacity");
+        }
+        const double requested = missing;
         for (std::size_t i = 0; i < n; ++i) {
-            shares[i] /= s_sum;
+            const double room = capacity[i] - shares[i];
+            shares[i] += std::min(room, requested * room / headroom);
+        }
+        missing = 1.0 - std::accumulate(shares.begin(), shares.end(), 0.0);
+    }
+
+    const auto predicted_power = [&]() {
+        double total = 0.0;
+        for (std::size_t i = 0; i < n; ++i) total += slope[i] * shares[i];
+        return total;
+    };
+    if (power_budget_watts > 0.0 && predicted_power() > power_budget_watts + 1e-8) {
+        // Find the minimum-power feasible allocation before rejecting the budget.
+        std::vector<std::size_t> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+            [&](std::size_t a, std::size_t b) { return slope[a] < slope[b]; });
+        std::fill(shares.begin(), shares.end(), 0.0);
+        double remaining = 1.0;
+        for (std::size_t i : order) {
+            shares[i] = std::min(remaining, capacity[i]);
+            remaining -= shares[i];
+        }
+        if (remaining > 1e-9 || predicted_power() > power_budget_watts + 1e-8) {
+            throw Error("Power budget is infeasible without actual device throttling");
         }
     }
 
-    // Ensure sum is exactly 1.0
-    const double final_sum = std::accumulate(shares.begin(), shares.end(), 0.0);
-    if (final_sum > 0.0) {
-        for (std::size_t i = 0; i < n; ++i) {
-            shares[i] /= final_sum;
-        }
-    }
-
-    // 5. Convert back to a valid cumulative load vector (strictly monotone non-decreasing, last element = 1.0f)
     std::vector<float> result(n, 0.0f);
     double cumulative = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
         cumulative += shares[i];
         result[i] = static_cast<float>(cumulative);
     }
-
-    for (std::size_t i = 1; i < n; ++i) {
-        if (result[i] < result[i - 1]) {
-            result[i] = result[i - 1];
-        }
-    }
     result.back() = 1.0f;
-
     return result;
 }
 

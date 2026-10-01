@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 namespace {
 
@@ -23,8 +24,8 @@ void test_accept_correct_dimensions(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {4200.5, 4350.2};
     m.pcie_bandwidth_gbps = {15.8, 15.6};
-    m.mpi_latency_ns = {0.0, 1250.0, 1250.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 3.8, 3.8, 0.0};
+    m.mpi_latency_ns = {0.0};
+    m.mpi_bandwidth_gbps = {0.0};
     m.memory_contention_factor = {1.0, 1.25};
 
     rt.set_topo_metrics(m);
@@ -33,8 +34,7 @@ void test_accept_correct_dimensions(dcl::Runtime& rt) {
     assert(stored.has_value());
     assert(stored->pcie_latency_ns.size() == 2);
     assert(std::fabs(stored->pcie_latency_ns[0] - 4200.5) < 1e-6);
-    assert(stored->mpi_latency_ns.size() == 4);
-    assert(std::fabs(stored->mpi_latency_ns[1] - 1250.0) < 1e-6);
+    assert(stored->mpi_latency_ns.size() == 1);
     std::cout << "  -> PASS" << std::endl;
 }
 
@@ -45,8 +45,8 @@ void test_reject_wrong_dimensions(dcl::Runtime& rt) {
     dcl::TopoMetrics base;
     base.pcie_latency_ns = {4200.0, 4300.0};
     base.pcie_bandwidth_gbps = {15.0, 15.0};
-    base.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    base.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    base.mpi_latency_ns = {0.0};
+    base.mpi_bandwidth_gbps = {0.0};
 
     // Case 1: mpi_latency_ns wrong size (3 instead of 4)
     {
@@ -109,8 +109,8 @@ void test_contention_factor_validation(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {4000.0, 4000.0};
     m.pcie_bandwidth_gbps = {15.0, 15.0};
-    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
     m.memory_contention_factor = {0.95, 1.0}; // 0.95 < 1.0 must fail
 
     bool caught = false;
@@ -120,6 +120,14 @@ void test_contention_factor_validation(dcl::Runtime& rt) {
         caught = true;
     }
     assert(caught && "Expected dcl::Error for memory_contention_factor < 1.0");
+    m.memory_contention_factor = {std::numeric_limits<double>::quiet_NaN(), 1.0};
+    caught = false;
+    try {
+        rt.set_topo_metrics(m);
+    } catch (const dcl::Error&) {
+        caught = true;
+    }
+    assert(caught && "Expected dcl::Error for non-finite contention");
     std::cout << "  -> PASS" << std::endl;
 }
 
@@ -130,8 +138,8 @@ void test_device_numa_node_validation(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {4000.0, 4000.0};
     m.pcie_bandwidth_gbps = {15.0, 15.0};
-    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
     m.numa_distance = {10, 20, 20, 10}; // 2x2 -> num_nodes = 2
     m.device_numa_node = {0, 5}; // node 5 is out of range [0, 2)
 
@@ -159,9 +167,11 @@ void test_save_load_round_trip(dcl::Runtime& rt) {
     original.memory_contention_factor = {1.0, 1.5};
     original.thermal_tdp_watts = {250.0, 300.0};
     original.current_power_watts = {115.5, 198.2};
+    original.synthetic = true;
 
     dcl::save_topo_metrics(original, test_file);
     dcl::TopoMetrics loaded = dcl::load_topo_metrics(test_file);
+    assert(loaded.synthetic);
 
     assert(loaded.pcie_latency_ns.size() == original.pcie_latency_ns.size());
     for (std::size_t i = 0; i < loaded.pcie_latency_ns.size(); ++i) {
@@ -225,6 +235,12 @@ void test_error_handling(dcl::Runtime& rt) {
     check_bad_json("{ \"pcie_latency_ns\": [ 123.4 ] \"mpi_latency_ns\": [ 0.0 ] }", "Expected dcl::Error on missing comma between keys");
     check_bad_json("{ \"pcie_latency_ns\": [ 123.4 ] } trailing_trash", "Expected dcl::Error on trailing characters");
     check_bad_json("{ \"pcie_latency_ns\"", "Expected dcl::Error on truncated key/value");
+    check_bad_json("{ \"pcie_latency_ns\": [1,] }", "Trailing array comma");
+    check_bad_json("{ \"pcie_latency_ns\": [+1] }", "Leading plus sign");
+    check_bad_json("{ \"pcie_latency_ns\": [01] }", "Leading zero");
+    check_bad_json("{ \"pcie_latency_ns\": [1], \"pcie_latency_ns\": [2] }", "Duplicate key");
+    check_bad_json("{ \"unknown\": [true,] }", "Invalid unknown value");
+    check_bad_json("{ \"unknown\": \"bad\\q\" }", "Invalid string escape");
 
     // This should NOT throw an error, it's valid JSON!
     // But check_bad_json expects an error. Let's write a positive test for skip_json_value.
@@ -271,10 +287,8 @@ void test_topology_larger_than_local(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {4000.0, 4000.0, 4000.0, 4000.0};
     m.pcie_bandwidth_gbps = {15.0, 15.0, 15.0, 15.0};
-    m.mpi_latency_ns.assign(16, 1000.0);
-    for (int i = 0; i < 4; ++i) m.mpi_latency_ns[i * 4 + i] = 0.0;
-    m.mpi_bandwidth_gbps.assign(16, 3.0);
-    for (int i = 0; i < 4; ++i) m.mpi_bandwidth_gbps[i * 4 + i] = 0.0;
+    m.mpi_latency_ns = {0.0};
+    m.mpi_bandwidth_gbps = {0.0};
     m.memory_contention_factor = {1.0, 1.0, 1.0, 1.0};
 
     // Before the fix, this would fail if the local rank had fewer than 4 devices

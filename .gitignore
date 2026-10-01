@@ -30,6 +30,8 @@ job_mpiocl.out
 
 # ─── Benchmark CSV results (generated at runtime) ─────────────────────────────
 benchmarks/*.csv
+benchmarks/*.log
+benchmarks/comparison_metadata.json
 
 # ─── Topology probe JSON (generated at runtime) ───────────────────────────────
 test_probe.json

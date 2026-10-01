@@ -1,99 +1,109 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd "${script_dir}/.." && pwd)"
+output_dir="${BENCH_OUTPUT_DIR:-${script_dir}}"
+mkdir -p "${output_dir}"
 
-KNEIGHBOR_BIN="${ROOT_DIR}/kneighbor.out"
-LEANMD_BIN="${ROOT_DIR}/leanmd.out"
+cxx_flags="-std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 -DCL_TARGET_OPENCL_VERSION=300"
+kneighbor_bin="${output_dir}/kneighbor.out"
+leanmd_bin="${output_dir}/leanmd.out"
+mpic++ ${cxx_flags} "${root_dir}/benchmarks/kneighbor.cpp" -lOpenCL -o "${kneighbor_bin}"
+mpic++ ${cxx_flags} "${root_dir}/benchmarks/leanmd.cpp" -lOpenCL -o "${leanmd_bin}"
 
-if [[ ! -x "${KNEIGHBOR_BIN}" ]]; then
-    echo "Compiling kneighbor.out..."
-    mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 "${ROOT_DIR}/benchmarks/kneighbor.cpp" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${KNEIGHBOR_BIN}"
-fi
+read -r -a launcher <<< "${MPI_LAUNCHER:-}"
+bench_n="${BENCH_N:-1000000}"
+bench_iterations="${BENCH_ITERATIONS:-100}"
+bench_interval="${BENCH_BALANCE_INTERVAL:-10}"
+seeds=(42 123 456)
 
-if [[ ! -x "${LEANMD_BIN}" ]]; then
-    echo "Compiling leanmd.out..."
-    mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 "${ROOT_DIR}/benchmarks/leanmd.cpp" -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 -o "${LEANMD_BIN}"
-fi
-
-MPI_LAUNCHER=${MPI_LAUNCHER:-}
-
-echo "=== Running R4 Benchmarks (ERAD vs HWTOPOLB) with multiple seeds ==="
-SEEDS=(42 123 456)
-
-for seed in "${SEEDS[@]}"; do
-    echo "Running seed ${seed}..."
-    ${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --seed ${seed} --output-csv "${SCRIPT_DIR}/kneighbor_erad_${seed}.csv" > /dev/null
-    ${MPI_LAUNCHER} "${KNEIGHBOR_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --seed ${seed} --output-csv "${SCRIPT_DIR}/kneighbor_hwtopolb_${seed}.csv" > /dev/null
-    ${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo erad --seed ${seed} --output-csv "${SCRIPT_DIR}/leanmd_erad_${seed}.csv" > /dev/null
-    ${MPI_LAUNCHER} "${LEANMD_BIN}" --n 1000000 --iterations 100 --balance-interval 10 --balance-algo hwtopolb --perturbation 0.10 --seed ${seed} --output-csv "${SCRIPT_DIR}/leanmd_hwtopolb_${seed}.csv" > /dev/null
+for seed in "${seeds[@]}"; do
+    for bench in kneighbor leanmd; do
+        if [[ "${bench}" == kneighbor ]]; then binary="${kneighbor_bin}"; else binary="${leanmd_bin}"; fi
+        for algo in erad hwtopolb; do
+            prefix="${output_dir}/${bench}_${algo}_${seed}"
+            "${launcher[@]}" "${binary}" --n "${bench_n}" --iterations "${bench_iterations}" \
+                --balance-interval "${bench_interval}" --balance-algo "${algo}" \
+                --perturbation 0.10 --seed "${seed}" --output-csv "${prefix}.csv" \
+                > "${prefix}.log"
+        done
+    done
 done
 
-echo ""
-python3 - "${ROOT_DIR}" << 'PYEOF'
+python3 - "${output_dir}" "${root_dir}" "${bench_n}" "${bench_iterations}" "${bench_interval}" "${MPI_LAUNCHER:-direct}" "${cxx_flags}" <<'PY'
 import csv
-import sys
+import hashlib
+import json
 import os
+import platform
+import re
 import statistics
+import subprocess
+import sys
 
-root_dir = sys.argv[1]
-seeds = [42, 123, 456]
-runs = [
-    ("kneighbor", "erad"),
-    ("kneighbor", "hwtopolb"),
-    ("leanmd", "erad"),
-    ("leanmd", "hwtopolb"),
-]
+output_dir, root_dir, n, iterations, interval, launcher, flags = sys.argv[1:]
+seeds = (42, 123, 456)
+rows = []
+for bench in ('kneighbor', 'leanmd'):
+    for algo in ('erad', 'hwtopolb'):
+        runs = []
+        for seed in seeds:
+            prefix = os.path.join(output_dir, f'{bench}_{algo}_{seed}')
+            with open(prefix + '.csv', newline='') as stream:
+                records = list(csv.DictReader(stream))
+            if len(records) != int(iterations):
+                raise RuntimeError(f'Incomplete benchmark: {prefix}')
+            modes = {row['execution_mode'] for row in records}
+            if len(modes) != 1:
+                raise RuntimeError(f'Mixed execution modes: {prefix}')
+            with open(prefix + '.log') as stream:
+                log = stream.read()
+            match = re.search(r'total_time_s=([0-9.eE+-]+)', log)
+            if not match:
+                raise RuntimeError(f'Missing global wall time: {prefix}')
+            runs.append((float(match.group(1)), modes.pop(),
+                         sum(int(row['rebalanced']) for row in records), seed))
+        modes = {run[1] for run in runs}
+        if len(modes) != 1:
+            raise RuntimeError(f'Mixed execution modes across runs: {bench}/{algo}')
+        times = [run[0] for run in runs]
+        rows.append([bench, algo, modes.pop(), statistics.median(times),
+                     statistics.stdev(times), statistics.mean(run[2] for run in runs),
+                     ','.join(str(run[3]) for run in runs)])
 
-table_rows = []
-for bench, algo in runs:
-    times = []
-    rebalances = []
-    gains = []
-    
-    for seed in seeds:
-        csv_path = os.path.join(root_dir, "benchmarks", f"{bench}_{algo}_{seed}.csv")
-        total_time = 0.0
-        num_rebalances = 0
-        sum_gain = 0.0
-        
-        with open(csv_path, 'r', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                step_t = float(row['step_time_s'])
-                total_time += step_t
-                rebal = int(row['rebalanced'])
-                if rebal == 1:
-                    num_rebalances += 1
-                    sum_gain += float(row['rebalance_gain'])
-        
-        times.append(total_time)
-        rebalances.append(num_rebalances)
-        if num_rebalances > 0:
-            gains.append(sum_gain / num_rebalances)
-        else:
-            gains.append(0.0)
-            
-    median_time = statistics.median(times)
-    std_time = statistics.stdev(times) if len(times) > 1 else 0.0
-    avg_rebalances = sum(rebalances) / len(rebalances)
-    avg_gain = sum(gains) / len(gains)
-    
-    table_rows.append((bench, algo, f"{median_time:.6f}", f"{std_time:.6f}", f"{avg_rebalances:.1f}", f"{avg_gain:.6f}"))
+summary = os.path.join(output_dir, 'comparison_summary.csv')
+with open(summary, 'w', newline='') as stream:
+    writer = csv.writer(stream)
+    writer.writerow(['benchmark', 'algo', 'execution_mode', 'median_total_wall_s',
+                     'stddev_total_wall_s', 'avg_rebalances', 'seeds'])
+    writer.writerows(rows)
 
-csv_out = os.path.join(root_dir, "benchmarks", "comparison_summary.csv")
-with open(csv_out, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(["benchmark", "algo", "median_time_s", "stddev_time_s", "avg_rebalances", "avg_rebalance_gain"])
-    for r in table_rows:
-        writer.writerow(r)
-
-print("benchmark,algo,median_time_s,stddev_time_s,avg_rebalances,avg_rebalance_gain")
-for r in table_rows:
-    print(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]}")
-
-
-PYEOF
-
-exit 0
+metadata = {
+    'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root_dir, text=True).strip(),
+    'working_tree_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=root_dir, text=True).strip()),
+    'hostname': platform.node(),
+    'platform': platform.platform(),
+    'compiler': subprocess.check_output(['mpic++', '--version'], text=True).splitlines()[0],
+    'compiler_flags': flags,
+    'mpi_launcher': launcher,
+    'global_elements': int(n),
+    'iterations': int(iterations),
+    'rebalance_interval': int(interval),
+    'warmup_iterations': 0,
+    'seeds': list(seeds),
+    'execution_modes': sorted({row[2] for row in rows}),
+}
+source_digest = hashlib.sha256()
+for relative_path in (
+        'dcl/algorithms.hpp', 'dcl/runtime_impl.hpp', 'dcl/topo_metrics_io.hpp',
+        'dcl/types.hpp', 'benchmarks/kneighbor.cpp', 'benchmarks/kneighbor.cl',
+        'benchmarks/leanmd.cpp', 'benchmarks/leanmd.cl'):
+    with open(os.path.join(root_dir, relative_path), 'rb') as stream:
+        source_digest.update(relative_path.encode() + b'\0' + stream.read())
+metadata['source_sha256'] = source_digest.hexdigest()
+with open(os.path.join(output_dir, 'comparison_metadata.json'), 'w') as stream:
+    json.dump(metadata, stream, indent=2)
+print(f'Summary: {summary}')
+print(f'Metadata: {os.path.join(output_dir, "comparison_metadata.json")}')
+PY

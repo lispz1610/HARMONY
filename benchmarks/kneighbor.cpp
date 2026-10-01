@@ -25,6 +25,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -71,20 +72,22 @@ int main(int argc, char** argv) {
 
     dcl::Runtime runtime = dcl::Runtime::create(argc, argv);
     const int rank = runtime.rank();
+    if (n == 0 || n > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        k < 0 || iterations <= 0) {
+        if (rank == 0) std::cerr << "Invalid benchmark dimensions or iteration count\n";
+        MPI_Finalize();
+        return 1;
+    }
 
-    // Check OpenCL hardware availability
-    bool opencl_available = false;
-    try {
-        cl_uint n_platforms = 0;
-        cl_int cl_res = clGetPlatformIDs(0, nullptr, &n_platforms);
-        if (cl_res == CL_SUCCESS && n_platforms > 0) {
-            runtime.discover_devices({dcl::DeviceKind::all, 0});
-            if (!runtime.devices().empty()) {
-                opencl_available = true;
-            }
-        }
-    } catch (...) {
-        opencl_available = false;
+    runtime.discover_devices({dcl::DeviceKind::gpu, 0});
+    int local_devices = static_cast<int>(runtime.devices().size());
+    int total_devices = 0;
+    MPI_Allreduce(&local_devices, &total_devices, 1, MPI_INT, MPI_SUM, runtime.communicator());
+    const bool opencl_available = total_devices > 0;
+    for (const auto& device : runtime.devices()) {
+        std::cout << "[device] rank=" << rank
+                  << " global_index=" << device.global_index
+                  << " name=" << device.name << "\n";
     }
 
     if (!opencl_available) {
@@ -156,6 +159,7 @@ int main(int argc, char** argv) {
     const auto total_bench_start = std::chrono::steady_clock::now();
 
     for (int it = 0; it < iterations; ++it) {
+        const auto step_start = std::chrono::steady_clock::now();
         bool do_rebalance = (balance_interval > 0 && it > 0 && (it % balance_interval == 0) && !prev_device_times.empty());
         double gain = 0.0;
 
@@ -203,19 +207,15 @@ int main(int argc, char** argv) {
         const auto& partitions = runtime.partitions();
         std::vector<double> local_device_times(partitions.size(), 0.0);
 
-        const auto t0 = std::chrono::steady_clock::now();
-
         if (opencl_available) {
             auto builder = runtime.step("kneighbor_step");
-            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
-                const auto& p = partitions[p_idx];
-                if (p.owning_rank == rank && p.element_count > 0) {
-                    int work_passes = (p.device_global_index == 0 ? 2 : 1);
-                    for(int pass=0; pass < work_passes; ++pass) {
-                        builder.invoke(binding, dcl::LaunchGeometry{p.global_offset, p.element_count, std::nullopt});
-                    }
-                }
-            }
+            dcl::AutoBalancePolicy timing_policy;
+            timing_policy.mode = dcl::BalanceMode::off;
+            timing_policy.interval = 1;
+            builder.with_balance(timing_policy);
+            builder.tag_field(h_in, dcl::StepFieldRole::read_source);
+            builder.tag_field(h_out, dcl::StepFieldRole::write_target);
+            builder.invoke(binding, dcl::LaunchGeometry{0, n, std::nullopt});
             builder.synchronize_at_end(true);
             runtime.execute(builder.build());
             
@@ -256,8 +256,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        const auto t1 = std::chrono::steady_clock::now();
-        double local_step_time = std::chrono::duration<double>(t1 - t0).count();
+        const auto step_end = std::chrono::steady_clock::now();
+        double local_step_time = std::chrono::duration<double>(step_end - step_start).count();
 
         double t_max_step = 0.0;
         MPI_Allreduce(&local_step_time, &t_max_step, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
@@ -265,13 +265,15 @@ int main(int argc, char** argv) {
         std::vector<double> device_times(partitions.size(), 0.0);
         MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
-        // M1 Verification on the last iteration
-        if (it == iterations - 1 && opencl_available) {
-            runtime.gather(h_out, out_data.data(), n * sizeof(float));
-            for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
-                const auto& p = partitions[p_idx];
-                if (p.owning_rank != rank) continue;
-                for (std::size_t i = p.global_offset; i < p.global_offset + p.element_count; ++i) {
+        // Verify all computed elements against the scalar stencil reference.
+        if (it == iterations - 1) {
+            if (opencl_available) runtime.gather(h_out, out_data.data(), n * sizeof(float));
+            int local_mismatch = 0;
+            for (const auto& part : partitions) {
+                if (!opencl_available && part.owning_rank != rank) continue;
+                if (opencl_available && rank != 0) continue;
+                for (std::size_t i = part.global_offset;
+                     i < part.global_offset + part.element_count; ++i) {
                     float sum = 0.0f;
                     int valid_neighbors = 0;
                     for (int o = -k; o <= k; ++o) {
@@ -283,10 +285,19 @@ int main(int argc, char** argv) {
                     }
                     float cpu_val = sum / static_cast<float>(valid_neighbors);
                     if (std::abs(out_data[i] - cpu_val) > 1e-5f) {
-                        std::cerr << "M1 Verification failed at index " << i << ": GPU=" << out_data[i] << " CPU=" << cpu_val << "\n";
-                        MPI_Abort(runtime.communicator(), 1);
+                        std::cerr << "Stencil verification failed at index " << i
+                                  << ": actual=" << out_data[i]
+                                  << " reference=" << cpu_val << "\n";
+                        local_mismatch = 1;
+                        break;
                     }
                 }
+            }
+            int any_mismatch = 0;
+            MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
+                          runtime.communicator());
+            if (any_mismatch != 0) {
+                MPI_Abort(runtime.communicator(), 1);
             }
         }
 
@@ -297,11 +308,13 @@ int main(int argc, char** argv) {
         }
 
         prev_device_times = device_times;
-        runtime.set_simulated_times(device_times);
+        if (!opencl_available) runtime.set_simulated_times(device_times);
     }
 
     const auto total_bench_end = std::chrono::steady_clock::now();
-    const double total_duration_s = std::chrono::duration<double>(total_bench_end - total_bench_start).count();
+    const double local_duration_s = std::chrono::duration<double>(total_bench_end - total_bench_start).count();
+    double total_duration_s = 0.0;
+    MPI_Allreduce(&local_duration_s, &total_duration_s, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
     if (rank == 0) {
         std::ofstream csv(output_csv);
@@ -311,16 +324,17 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        csv << "iteration,step_time_s,action,rebalanced,rebalance_gain\n";
+        csv << "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n";
         int num_rebalances = 0;
         double sum_gain = 0.0;
 
         for (const auto& rec : records) {
             csv << rec.iteration << ","
-                << std::fixed << std::setprecision(6) << rec.step_time_s << ","
+                << std::fixed << std::setprecision(9) << rec.step_time_s << ","
                 << rec.action << ","
                 << rec.rebalanced << ","
-                << std::fixed << std::setprecision(6) << rec.rebalance_gain << "\n";
+                << std::fixed << std::setprecision(9) << rec.rebalance_gain << ","
+                << (opencl_available ? "gpu_opencl" : "cpu_simulation") << "\n";
             if (rec.rebalanced == 1) {
                 num_rebalances++;
                 sum_gain += rec.rebalance_gain;
@@ -330,6 +344,7 @@ int main(int argc, char** argv) {
 
         const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
         std::cout << "[kneighbor] algo=" << balance_algo
+                  << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
                   << " total_time_s=" << total_duration_s
                   << " num_rebalances=" << num_rebalances
                   << " avg_rebalance_gain=" << avg_gain << "\n";

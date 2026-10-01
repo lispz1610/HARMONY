@@ -213,6 +213,33 @@ void test_hwtopolb_stochastic_perturbation() {
     std::cout << "  -> PASS" << std::endl;
 }
 
+void test_runtime_rebalance_consensus(int& argc, char**& argv) {
+    dcl::Runtime runtime = dcl::Runtime::create(argc, argv);
+    if (runtime.size() != 2) return;
+    runtime.set_simulated_devices_count(2);
+    dcl::PartitionSpec spec;
+    spec.global_elements = 100;
+    spec.units_per_element = 1;
+    spec.bytes_per_unit = sizeof(float);
+    runtime.set_partition(spec);
+
+    const std::vector<float> local_proposal =
+        runtime.rank() == 0 ? std::vector<float>{0.7f, 1.0f}
+                            : std::vector<float>{0.2f, 1.0f};
+    runtime.rebalance_to(local_proposal);
+    assert(runtime.partitions()[0].element_count == 70);
+    assert(runtime.partitions()[1].element_count == 30);
+
+    bool rejected = false;
+    try {
+        runtime.rebalance_to(runtime.rank() == 0
+            ? std::vector<float>{} : std::vector<float>{0.5f, 1.0f});
+    } catch (const dcl::Error&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -221,6 +248,7 @@ int main(int argc, char** argv) {
     test_erad_matches_throughput();
     test_hwtopolb_zero_perturbation();
     test_hwtopolb_stochastic_perturbation();
+    test_runtime_rebalance_consensus(argc, argv);
 
     std::cout << "\nAll test_algorithms unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();

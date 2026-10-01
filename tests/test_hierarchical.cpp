@@ -491,6 +491,116 @@ void test_c1_no_element_loss_with_more_ranks_than_devices(int argc, char** argv)
     if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
+void test_local_rebalance_keeps_global_partition_view(int argc, char** argv) {
+    int size = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size != 2) return;
+
+    dcl::Runtime rt = dcl::Runtime::create(argc, argv);
+    const int rank = rt.rank();
+    rt.set_simulated_devices_count(4);
+
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = sizeof(float);
+    ps.granularity = 1;
+    rt.set_partition(ps);
+    rt.set_simulated_times(rank == 0
+        ? std::vector<double>{0.01, 0.02, 0.01, 0.01}
+        : std::vector<double>{0.01, 0.01, 0.02, 0.01});
+
+    assert(rt.maybe_rebalance_hierarchical());
+    const auto& partitions = rt.partitions();
+    assert(partitions.size() == 4);
+
+    unsigned long long local[8] = {};
+    unsigned long long minimum[8] = {};
+    unsigned long long maximum[8] = {};
+    std::size_t next_offset = 0;
+    for (std::size_t i = 0; i < partitions.size(); ++i) {
+        local[2 * i] = static_cast<unsigned long long>(partitions[i].global_offset);
+        local[2 * i + 1] = static_cast<unsigned long long>(partitions[i].element_count);
+        assert(partitions[i].global_offset == next_offset);
+        next_offset += partitions[i].element_count;
+    }
+    assert(next_offset == ps.global_elements);
+
+    MPI_Allreduce(local, minimum, 8, MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+    MPI_Allreduce(local, maximum, 8, MPI_UNSIGNED_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+    for (int i = 0; i < 8; ++i) {
+        assert(minimum[i] == maximum[i] && "Ranks must share a global partition map");
+    }
+    if (rank == 0) std::cout << "[TEST] Local rebalance preserves global partition view: PASS\n";
+}
+
+void test_consecutive_micro_partitions_are_removed_before_halo(int argc, char** argv) {
+    dcl::Runtime rt = dcl::Runtime::create(argc, argv);
+    rt.set_simulated_devices_count(3);
+    dcl::PartitionSpec ps;
+    ps.global_elements = 10;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = sizeof(float);
+    ps.granularity = 1;
+    rt.set_partition(ps);
+    rt.rebalance_to({0.1f, 0.2f, 1.0f});
+    assert(rt.partitions()[0].element_count == 1);
+    assert(rt.partitions()[1].element_count == 1);
+
+    dcl::ExecutionStep step;
+    step.invocations.push_back(dcl::KernelInvocation{});
+    step.halo.width_elements = 3;
+    step.halo.fields.push_back(dcl::FieldHandle{});
+    bool reached_kernel_validation = false;
+    try {
+        rt.execute(step);
+    } catch (const dcl::Error& error) {
+        reached_kernel_validation = std::string(error.what()).find("Unknown kernel") != std::string::npos;
+    }
+    assert(reached_kernel_validation);
+
+    std::size_t covered = 0;
+    for (const auto& part : rt.partitions()) {
+        assert(part.element_count == 0 || part.element_count >= step.halo.width_elements);
+        assert(part.global_offset == covered);
+        covered += part.element_count;
+    }
+    assert(covered == ps.global_elements);
+    if (rt.rank() == 0) std::cout << "[TEST] Consecutive micro partitions removed before halo: PASS\n";
+}
+
+void test_constant_throughput_converges(int& argc, char**& argv) {
+    dcl::Runtime rt = dcl::Runtime::create(argc, argv);
+    if (rt.size() != 2) return;
+    rt.set_simulated_devices_count(4);
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1200000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = sizeof(float);
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    const std::vector<double> speeds = {60e6, 30e6, 20e6, 10e6};
+    auto observed_times = [&]() {
+        std::vector<double> times;
+        for (std::size_t i = 0; i < speeds.size(); ++i) {
+            times.push_back(static_cast<double>(rt.partitions()[i].element_count) / speeds[i]);
+        }
+        return times;
+    };
+    rt.set_simulated_times(observed_times());
+    assert(rt.maybe_rebalance_hierarchical());
+    std::vector<std::size_t> first_counts;
+    for (const auto& part : rt.partitions()) first_counts.push_back(part.element_count);
+
+    rt.set_simulated_times(observed_times());
+    assert(rt.maybe_rebalance_hierarchical());
+    for (std::size_t i = 0; i < first_counts.size(); ++i) {
+        assert(rt.partitions()[i].element_count == first_counts[i]);
+    }
+    if (rt.rank() == 0) std::cout << "[TEST] Constant throughput converges: PASS\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -505,6 +615,9 @@ int main(int argc, char** argv) {
     test_hierarchical_with_registered_field(rt);
     test_hysteresis_prevents_oscillation(rt);
     test_c1_no_element_loss_with_more_ranks_than_devices(argc, argv);
+    test_local_rebalance_keeps_global_partition_view(argc, argv);
+    test_consecutive_micro_partitions_are_removed_before_halo(argc, argv);
+    test_constant_throughput_converges(argc, argv);
 
     if (rank == 0) std::cout << "\nAll test_hierarchical unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();

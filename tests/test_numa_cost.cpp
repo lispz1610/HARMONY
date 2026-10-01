@@ -176,8 +176,8 @@ void test_invalid_device_numa_node_throws(dcl::Runtime& rt) {
     dcl::TopoMetrics base;
     base.pcie_latency_ns = {4000.0, 4000.0};
     base.pcie_bandwidth_gbps = {15.0, 15.0};
-    base.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    base.mpi_bandwidth_gbps = {0.0, 3.0, 3.0, 0.0};
+    base.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    base.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
     base.numa_distance = {10, 20, 20, 10}; // 2-node system: valid nodes are 0, 1
 
     // Case 1: device_numa_node contains node index >= num_nodes
@@ -296,8 +296,8 @@ void test_numa_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {5000.0, 5000.0};
     m.pcie_bandwidth_gbps = {0.001, 0.001}; // 1 MB/s -> 400 KB takes 0.4 seconds!
-    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 1.0, 1.0, 0.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1.0, 1.0, 0.0});
     m.numa_distance = {10, 100, 100, 10}; // 2 nodes, large distance
     m.device_numa_node = {0, 1};          // dev 0 on node 0, dev 1 on node 1
     rt.set_topo_metrics(m);
@@ -352,6 +352,7 @@ void test_numa_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
 }
 
 void test_mpi_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
+    if (rt.size() < 2) return;
     std::cout << "[TEST] Running test_mpi_skip_rebalance_when_cost_high..." << std::endl;
 
     // Trick the runtime into thinking there are 2 ranks for the purpose of partitioning
@@ -378,8 +379,8 @@ void test_mpi_skip_rebalance_when_cost_high(dcl::Runtime& rt) {
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {1.0, 1.0};
     m.pcie_bandwidth_gbps = {1000.0, 1000.0};
-    m.mpi_latency_ns = {0.0, 10e9, 10e9, 0.0}; // 10 seconds latency
-    m.mpi_bandwidth_gbps = {10.0, 10.0, 10.0, 10.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 10e9, 10e9, 0.0}); // 10 seconds latency
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{10.0, 10.0, 10.0, 10.0});
     m.numa_distance = {10, 10, 10, 10}; 
     m.device_numa_node = {0, 0};          
     rt.set_topo_metrics(m);
@@ -446,8 +447,8 @@ void test_divergent_numa_consensus(dcl::Runtime& rt) {
 
     dcl::TopoMetrics m;
     m.pcie_latency_ns = {5000.0, 5000.0};
-    m.mpi_latency_ns = {0.0, 1000.0, 1000.0, 0.0};
-    m.mpi_bandwidth_gbps = {0.0, 1.0, 1.0, 0.0};
+    m.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    m.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1.0, 1.0, 0.0});
     m.numa_distance = {10, 20, 20, 10};
     m.device_numa_node = {0, 0};
 
@@ -475,6 +476,116 @@ void test_divergent_numa_consensus(dcl::Runtime& rt) {
     if (rank == 0) std::cout << "  -> PASS" << std::endl;
 }
 
+void test_divergent_contention_proposal(dcl::Runtime& rt) {
+    int rank = 0;
+    int size = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) return;
+
+    rt.set_simulated_devices_count(2);
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = sizeof(float);
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    dcl::FieldSpec fs;
+    fs.name = "divergent_contention_field";
+    fs.global_elements = ps.global_elements;
+    fs.units_per_element = 1;
+    fs.bytes_per_unit = sizeof(float);
+    fs.redistribution = dcl::RedistributionDependency::proportional;
+    const dcl::FieldHandle field = rt.create_field(fs);
+
+    dcl::TopoMetrics metrics;
+    metrics.pcie_latency_ns = {4000.0, 4000.0};
+    metrics.pcie_bandwidth_gbps = {15.0, 15.0};
+    metrics.mpi_latency_ns = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 1000.0, 1000.0, 0.0});
+    metrics.mpi_bandwidth_gbps = (rt.size() == 1 ? std::vector<double>{0.0} : std::vector<double>{0.0, 3.0, 3.0, 0.0});
+    metrics.memory_contention_factor = rank == 0
+        ? std::vector<double>{1.0, 1.0}
+        : std::vector<double>{1.0, 100.0};
+    rt.set_topo_metrics(metrics);
+    rt.set_simulated_times({1.0, 1.0});
+
+    dcl::AutoBalancePolicy policy;
+    policy.mode = dcl::BalanceMode::dynamic_threshold;
+    policy.threshold = 0.01f;
+    policy.use_contention_adjustment = true;
+    const bool changed = rt.maybe_rebalance_from_timings({field}, policy);
+    assert(!changed);
+    assert(rt.partitions()[0].element_count == 500000);
+    assert(rt.partitions()[1].element_count == 500000);
+    rt.clear_simulated_times();
+
+    if (rank == 0) std::cout << "[TEST] Divergent contention proposal reached a common decision: PASS\n";
+}
+
+void test_divergent_balance_inputs_fail_collectively(dcl::Runtime& rt) {
+    int rank = 0;
+    int size = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) return;
+
+    rt.set_simulated_devices_count(2);
+    dcl::PartitionSpec ps;
+    ps.global_elements = 1000;
+    ps.units_per_element = 1;
+    ps.bytes_per_unit = sizeof(float);
+    ps.granularity = 1;
+    rt.set_partition(ps);
+
+    dcl::FieldSpec fs;
+    fs.name = "collective_input_field";
+    fs.global_elements = ps.global_elements;
+    fs.units_per_element = 1;
+    fs.bytes_per_unit = sizeof(float);
+    fs.redistribution = dcl::RedistributionDependency::proportional;
+    const dcl::FieldHandle field = rt.create_field(fs);
+
+    dcl::AutoBalancePolicy policy;
+    policy.mode = dcl::BalanceMode::dynamic_threshold;
+    policy.threshold = 0.01f;
+
+    if (rank == 0) rt.set_simulated_times({1.0, 1.0});
+    bool caught = false;
+    try {
+        rt.maybe_rebalance_from_timings({field}, policy);
+    } catch (const dcl::Error&) {
+        caught = true;
+    }
+    assert(caught && "Mismatched timing sources must fail on every rank");
+    rt.clear_simulated_times();
+
+    caught = false;
+    try {
+        rt.maybe_rebalance_from_timings(rank == 0 ? std::vector<dcl::FieldHandle>{field}
+                                                  : std::vector<dcl::FieldHandle>{}, policy);
+    } catch (const dcl::Error&) {
+        caught = true;
+    }
+    assert(caught && "Mismatched field lists must fail on every rank");
+
+    dcl::FieldSpec other_spec = fs;
+    other_spec.name = "other_collective_input_field";
+    const dcl::FieldHandle other_field = rt.create_field(other_spec);
+    caught = false;
+    try {
+        rt.maybe_rebalance_from_timings(
+            rank == 0 ? std::vector<dcl::FieldHandle>{field}
+                      : std::vector<dcl::FieldHandle>{other_field},
+            policy
+        );
+    } catch (const dcl::Error&) {
+        caught = true;
+    }
+    assert(caught && "Different fields with the same count must fail on every rank");
+    if (rank == 0) std::cout << "[TEST] Divergent balance inputs failed collectively: PASS\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -487,6 +598,8 @@ int main(int argc, char** argv) {
     test_numa_skip_rebalance_when_cost_high(rt);
     test_mpi_skip_rebalance_when_cost_high(rt);
     test_divergent_numa_consensus(rt);
+    test_divergent_contention_proposal(rt);
+    test_divergent_balance_inputs_fail_collectively(rt);
 
     std::cout << "\nAll test_numa_cost unit tests PASSED successfully!" << std::endl;
     MPI_Finalize();

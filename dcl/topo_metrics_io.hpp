@@ -4,10 +4,13 @@
 #include "types.hpp"
 #include <cmath>
 #include <cctype>
+#include <charconv>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 namespace dcl {
@@ -41,11 +44,23 @@ inline std::string parse_string(const std::string& str, std::size_t& pos) {
         if (c == '"') {
             return result;
         }
+        if (static_cast<unsigned char>(c) < 0x20) {
+            throw dcl::Error("JSON parse error: unescaped control character");
+        }
         if (c == '\\') {
             if (pos >= str.size()) {
                 throw dcl::Error("JSON parse error: trailing escape backslash");
             }
             c = str[pos++];
+            switch (c) {
+                case '"': case '\\': case '/': break;
+                case 'b': c = '\b'; break;
+                case 'f': c = '\f'; break;
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                default: throw dcl::Error("JSON parse error: invalid string escape");
+            }
         }
         result.push_back(c);
     }
@@ -67,80 +82,137 @@ inline std::vector<T> parse_number_array(const std::string& str, std::size_t& po
     while (pos < str.size()) {
         skip_whitespace(str, pos);
         std::size_t start = pos;
-        if (pos < str.size() && (str[pos] == '-' || str[pos] == '+')) {
+        if (pos < str.size() && str[pos] == '-') ++pos;
+        if (pos >= str.size()) throw dcl::Error("JSON parse error: missing number");
+        if (str[pos] == '0') {
             ++pos;
-        }
-        while (pos < str.size() && (std::isdigit(static_cast<unsigned char>(str[pos])) != 0 ||
-                                   str[pos] == '.' || str[pos] == 'e' || str[pos] == 'E' ||
-                                   str[pos] == '-' || str[pos] == '+')) {
-            if ((str[pos] == '-' || str[pos] == '+') && (pos == start || (str[pos - 1] != 'e' && str[pos - 1] != 'E'))) {
-                break;
+            if (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) {
+                throw dcl::Error("JSON parse error: leading zero");
             }
+        } else {
+            if (str[pos] < '1' || str[pos] > '9') {
+                throw dcl::Error("JSON parse error: invalid number");
+            }
+            while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
+        }
+        bool fractional = false;
+        if (pos < str.size() && str[pos] == '.') {
+            fractional = true;
             ++pos;
+            if (pos >= str.size() || !std::isdigit(static_cast<unsigned char>(str[pos]))) {
+                throw dcl::Error("JSON parse error: invalid fraction");
+            }
+            while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
         }
-        if (pos == start) {
-            throw dcl::Error("JSON parse error: expected number at position " + std::to_string(pos));
+        if (pos < str.size() && (str[pos] == 'e' || str[pos] == 'E')) {
+            fractional = true;
+            ++pos;
+            if (pos < str.size() && (str[pos] == '+' || str[pos] == '-')) ++pos;
+            if (pos >= str.size() || !std::isdigit(static_cast<unsigned char>(str[pos]))) {
+                throw dcl::Error("JSON parse error: invalid exponent");
+            }
+            while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
         }
-        std::string num_str = str.substr(start, pos - start);
-        std::istringstream iss(num_str);
+        if constexpr (std::is_integral_v<T>) {
+            if (fractional) throw dcl::Error("JSON parse error: expected integer");
+        }
         T val{};
-        if (!(iss >> val) || !iss.eof()) {
-            throw dcl::Error("JSON parse error: invalid number '" + num_str + "'");
+        const auto parsed = std::from_chars(str.data() + start, str.data() + pos, val);
+        if (parsed.ec != std::errc{} || parsed.ptr != str.data() + pos) {
+            throw dcl::Error("JSON parse error: number out of range");
         }
         if (!std::isfinite(static_cast<double>(val))) {
-            throw dcl::Error("JSON parse error: non-finite number '" + num_str + "'");
+            throw dcl::Error("JSON parse error: non-finite number");
         }
         result.push_back(val);
 
         skip_whitespace(str, pos);
         if (pos < str.size() && str[pos] == ',') {
             ++pos;
+            skip_whitespace(str, pos);
+            if (pos >= str.size() || str[pos] == ']') {
+                throw dcl::Error("JSON parse error: trailing array comma");
+            }
             continue;
         }
         if (pos < str.size() && str[pos] == ']') {
             ++pos;
-            break;
+            return result;
         }
         throw dcl::Error("JSON parse error: expected ',' or ']' at position " + std::to_string(pos));
     }
-    return result;
+    throw dcl::Error("JSON parse error: missing closing ']'");
 }
 
-inline void skip_json_value(const std::string& str, std::size_t& pos) {
+inline void skip_json_value(const std::string& str, std::size_t& pos, int depth = 0) {
+    if (depth > 64) throw dcl::Error("JSON parse error: excessive nesting");
     skip_whitespace(str, pos);
-    if (pos >= str.size()) return;
-    char c = str[pos];
-    if (c == '"') {
+    if (pos >= str.size()) throw dcl::Error("JSON parse error: missing value");
+    if (str[pos] == '"') {
         (void)parse_string(str, pos);
-    } else if (c == '[') {
+        return;
+    }
+    if (str[pos] == '[' || str[pos] == '{') {
+        const bool object = str[pos] == '{';
         ++pos;
-        int depth = 1;
-        while (pos < str.size() && depth > 0) {
-            if (str[pos] == '"') {
+        skip_whitespace(str, pos);
+        const char closing = object ? '}' : ']';
+        if (pos < str.size() && str[pos] == closing) { ++pos; return; }
+        while (true) {
+            if (object) {
                 (void)parse_string(str, pos);
-            } else {
-                if (str[pos] == '[') ++depth;
-                else if (str[pos] == ']') --depth;
-                ++pos;
+                if (!consume_char(str, pos, ':')) {
+                    throw dcl::Error("JSON parse error: expected ':'");
+                }
+            }
+            skip_json_value(str, pos, depth + 1);
+            if (consume_char(str, pos, closing)) return;
+            if (!consume_char(str, pos, ',')) {
+                throw dcl::Error("JSON parse error: expected comma");
+            }
+            skip_whitespace(str, pos);
+            if (pos >= str.size() || str[pos] == closing) {
+                throw dcl::Error("JSON parse error: trailing comma");
             }
         }
-    } else if (c == '{') {
+    }
+    for (const char* literal : {"true", "false", "null"}) {
+        const std::size_t length = std::char_traits<char>::length(literal);
+        if (str.compare(pos, length, literal) == 0) { pos += length; return; }
+    }
+    const std::size_t start = pos;
+    if (str[pos] == '-') ++pos;
+    if (pos >= str.size()) throw dcl::Error("JSON parse error: invalid number");
+    if (str[pos] == '0') {
         ++pos;
-        int depth = 1;
-        while (pos < str.size() && depth > 0) {
-            if (str[pos] == '"') {
-                (void)parse_string(str, pos);
-            } else {
-                if (str[pos] == '{') ++depth;
-                else if (str[pos] == '}') --depth;
-                ++pos;
-            }
+        if (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) {
+            throw dcl::Error("JSON parse error: leading zero");
         }
     } else {
-        while (pos < str.size() && str[pos] != ',' && str[pos] != '}' && str[pos] != ']' &&
-               (std::isspace(static_cast<unsigned char>(str[pos])) == 0)) {
-            ++pos;
+        if (str[pos] < '1' || str[pos] > '9') {
+            throw dcl::Error("JSON parse error: invalid value");
         }
+        while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
+    }
+    if (pos < str.size() && str[pos] == '.') {
+        ++pos;
+        if (pos >= str.size() || !std::isdigit(static_cast<unsigned char>(str[pos]))) {
+            throw dcl::Error("JSON parse error: invalid fraction");
+        }
+        while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
+    }
+    if (pos < str.size() && (str[pos] == 'e' || str[pos] == 'E')) {
+        ++pos;
+        if (pos < str.size() && (str[pos] == '+' || str[pos] == '-')) ++pos;
+        if (pos >= str.size() || !std::isdigit(static_cast<unsigned char>(str[pos]))) {
+            throw dcl::Error("JSON parse error: invalid exponent");
+        }
+        while (pos < str.size() && std::isdigit(static_cast<unsigned char>(str[pos]))) ++pos;
+    }
+    double value = 0.0;
+    const auto parsed = std::from_chars(str.data() + start, str.data() + pos, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != str.data() + pos || !std::isfinite(value)) {
+        throw dcl::Error("JSON parse error: invalid number");
     }
 }
 
@@ -174,6 +246,7 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
     }
 
     bool closed = false;
+    std::unordered_set<std::string> seen_keys;
     while (pos < content.size()) {
         detail::skip_whitespace(content, pos);
         if (pos < content.size() && content[pos] == '}') {
@@ -182,6 +255,9 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
             break;
         }
         std::string key = detail::parse_string(content, pos);
+        if (!seen_keys.insert(key).second) {
+            throw dcl::Error("JSON parse error: duplicate key '" + key + "'");
+        }
         if (!detail::consume_char(content, pos, ':')) {
             throw dcl::Error("JSON parse error: expected ':' after key '" + key + "'");
         }
@@ -205,6 +281,16 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
             metrics.thermal_tdp_watts = detail::parse_number_array<double>(content, pos);
         } else if (key == "current_power_watts") {
             metrics.current_power_watts = detail::parse_number_array<double>(content, pos);
+        } else if (key == "synthetic") {
+            if (content.compare(pos, 4, "true") == 0) {
+                metrics.synthetic = true;
+                pos += 4;
+            } else if (content.compare(pos, 5, "false") == 0) {
+                metrics.synthetic = false;
+                pos += 5;
+            } else {
+                throw dcl::Error("JSON parse error: synthetic must be boolean");
+            }
         } else {
             detail::skip_json_value(content, pos);
         }
@@ -251,7 +337,8 @@ inline void save_topo_metrics(const TopoMetrics& metrics, const std::string& jso
     detail::serialize_array(ofs, "device_numa_node", metrics.device_numa_node);
     detail::serialize_array(ofs, "memory_contention_factor", metrics.memory_contention_factor);
     detail::serialize_array(ofs, "thermal_tdp_watts", metrics.thermal_tdp_watts);
-    detail::serialize_array(ofs, "current_power_watts", metrics.current_power_watts, true);
+    detail::serialize_array(ofs, "current_power_watts", metrics.current_power_watts);
+    ofs << "  \"synthetic\": " << (metrics.synthetic ? "true" : "false") << "\n";
     ofs << "}\n";
 }
 
@@ -323,21 +410,25 @@ inline double estimate_migration_cost_bytes(const TopoMetrics& metrics,
         transfer_s = (static_cast<double>(bytes) / (pcie_bw * 1e9)) +
                      (static_cast<double>(bytes) / (pcie_bw_dst * 1e9));
 
-        if (!metrics.mpi_latency_ns.empty()) {
-            std::size_t num_ranks = static_cast<std::size_t>(std::round(std::sqrt(metrics.mpi_latency_ns.size())));
-            if (num_ranks > 0) {
-                std::size_t mpi_idx = static_cast<std::size_t>(src_rank) * num_ranks + static_cast<std::size_t>(dst_rank);
-                if (mpi_idx < metrics.mpi_latency_ns.size()) {
-                    latency_s += metrics.mpi_latency_ns[mpi_idx] * 1e-9;
-                    double mpi_bw = metrics.mpi_bandwidth_gbps[mpi_idx];
-                    if (mpi_bw > 0.0) {
-                        transfer_s += static_cast<double>(bytes) / (mpi_bw * 1e9);
-                    } else {
-                        transfer_s += static_cast<double>(bytes) / (1.0 * 1e9);
-                    }
-                }
-            }
+        const std::size_t num_ranks =
+            static_cast<std::size_t>(std::sqrt(metrics.mpi_latency_ns.size()));
+        if (num_ranks == 0 || num_ranks * num_ranks != metrics.mpi_latency_ns.size() ||
+            metrics.mpi_bandwidth_gbps.size() != metrics.mpi_latency_ns.size() ||
+            static_cast<std::size_t>(src_rank) >= num_ranks ||
+            static_cast<std::size_t>(dst_rank) >= num_ranks) {
+            throw dcl::Error("MPI migration metrics do not cover the requested ranks");
         }
+        const std::size_t mpi_idx =
+            static_cast<std::size_t>(src_rank) * num_ranks +
+            static_cast<std::size_t>(dst_rank);
+        const double mpi_bw = metrics.mpi_bandwidth_gbps[mpi_idx];
+        if (!std::isfinite(mpi_bw) || mpi_bw <= 0.0 ||
+            !std::isfinite(metrics.mpi_latency_ns[mpi_idx]) ||
+            metrics.mpi_latency_ns[mpi_idx] < 0.0) {
+            throw dcl::Error("Invalid MPI migration metrics");
+        }
+        latency_s += metrics.mpi_latency_ns[mpi_idx] * 1e-9;
+        transfer_s += static_cast<double>(bytes) / (mpi_bw * 1e9);
     } else {
         // Intra-rank migration: NUMA + PCIe
         if (src_node == dst_node) {
