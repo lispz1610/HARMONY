@@ -7,6 +7,8 @@ output_dir="${BENCH_OUTPUT_DIR:-${script_dir}}"
 mkdir -p "${output_dir}"
 
 cxx_flags="-std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 -DCL_TARGET_OPENCL_VERSION=300"
+opencl_headers="${root_dir}/third_party/opencl_headers"
+opencl_library="${OPENCL_LIBRARY:--lOpenCL}"
 bin_dir="${BENCH_BIN_DIR:-${output_dir}}"
 kneighbor_bin="${bin_dir}/kneighbor.out"
 leanmd_bin="${bin_dir}/leanmd.out"
@@ -19,8 +21,10 @@ if [[ "${BENCH_SKIP_BUILD:-0}" == 1 ]]; then
     done
 else
     mkdir -p "${bin_dir}"
-    mpic++ ${cxx_flags} "${root_dir}/benchmarks/kneighbor.cpp" -lOpenCL -o "${kneighbor_bin}"
-    mpic++ ${cxx_flags} "${root_dir}/benchmarks/leanmd.cpp" -lOpenCL -o "${leanmd_bin}"
+    mpic++ ${cxx_flags} -I"${opencl_headers}" "${root_dir}/benchmarks/kneighbor.cpp" \
+        "${opencl_library}" -o "${kneighbor_bin}"
+    mpic++ ${cxx_flags} -I"${opencl_headers}" "${root_dir}/benchmarks/leanmd.cpp" \
+        "${opencl_library}" -o "${leanmd_bin}"
 fi
 
 if [[ "${BENCH_BUILD_ONLY:-0}" == 1 ]]; then

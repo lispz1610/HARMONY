@@ -456,8 +456,10 @@ bash cluster_build.sh
 If the cluster directory is not a Git checkout, transfer the complete source
 tree and run `bash cluster_build.sh` there instead. The script compiles all
 tests, the topology probe, the main program, and both benchmarks into
-`build/cluster/` using C++20 and the OpenCL ICD loader. The compute nodes do
-not need development headers. Submit the short main-program smoke test before
+`build/cluster/` using C++20, the bundled Khronos OpenCL 3.0 headers, and the
+OpenCL library found by `ldconfig`. Set `OPENCL_LIBRARY` to the full library
+path if discovery fails. The compute nodes do not need development headers.
+Submit the short main-program smoke test before
 the longer evaluation:
 
 ```bash
