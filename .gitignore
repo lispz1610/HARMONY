@@ -1,5 +1,4 @@
 # ─── Compiled binaries ────────────────────────────────────────────────────────
-*.out
 *.o
 *.a
 *.so
@@ -27,20 +26,6 @@ gabarito.out
 job_dcl.out
 teste_250.out
 job_mpiocl.out
-
-# ─── Benchmark CSV results (generated at runtime) ─────────────────────────────
-benchmarks/*.csv
-benchmarks/*.log
-benchmarks/comparison_metadata.json
-
-# ─── Topology probe JSON (generated at runtime) ───────────────────────────────
-test_probe.json
-topo_metrics_*.json
-
-# ─── MPI / PBS job logs ───────────────────────────────────────────────────────
-*.pbs.o*
-*.pbs.e*
-Results/
 
 # ─── Editor & OS noise ────────────────────────────────────────────────────────
 .agents/
