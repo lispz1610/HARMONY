@@ -433,14 +433,21 @@ The jobs follow the LIMC cluster guide v5.0. Both reserve one full A100 GPU
 and one MPI rank on each of `compute-1-0[0]` and `compute-1-1[0]`, with four
 CPUs and 8 GB RAM per chunk. Check the current vnode inventory with
 `pbsnodes -a` before submitting; the cluster configuration can change.
-Both jobs load `gcc/13.2.0` and `openmpi5/5.0.5`, build with C++20 and the
-OpenCL ICD loader, and run from `PBS_O_WORKDIR`. The cluster's `prun` launcher
-uses the two allocated MPI slots. The OpenCL probe must find GPUs; neither job
-uses its synthetic mode.
+Both jobs load the `gnu13/13.2.0`, `openmpi5/5.0.5`, and `prun/2.2` modules
+observed on the cluster frontend. They retain the site's base modules, build
+with C++20 and the OpenCL ICD loader, and run from `PBS_O_WORKDIR`. The
+cluster's `prun` launcher uses the two allocated MPI slots. The OpenCL probe
+must find GPUs; neither job uses its synthetic mode.
 
-Copy the complete source tree to the cluster first. An ordinary clone will
-not include local uncommitted changes. From the login node, submit the short
-main-program smoke test before the longer evaluation:
+Update the Git checkout on the cluster login node before submitting jobs:
+
+```bash
+git pull --ff-only origin master
+```
+
+If the cluster directory is not a Git checkout, transfer the complete source
+tree instead. Submit the short main-program smoke test before the longer
+evaluation:
 
 ```bash
 qsub job_harmony_smoke.pbs

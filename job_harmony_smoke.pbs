@@ -14,9 +14,9 @@ if [[ -z "${PBS_O_WORKDIR:-}" || -z "${PBS_NODEFILE:-}" ]]; then
 fi
 cd "$PBS_O_WORKDIR"
 
-module purge
-module load gcc/13.2.0
+module load gnu13/13.2.0
 module load openmpi5/5.0.5
+module load prun/2.2
 
 echo "=== Allocated MPI slots ==="
 cat "$PBS_NODEFILE"
@@ -25,8 +25,13 @@ if [[ $(wc -l < "$PBS_NODEFILE") -ne 2 ]]; then
     exit 1
 fi
 echo "=== Toolchain ==="
+module list 2>&1
+command -v mpic++
+command -v mpirun
 mpic++ --version
 command -v prun
+printf '#include <span>\nint main() { std::span<int> value; return value.size(); }\n' \
+    | mpic++ -std=c++20 -x c++ -fsyntax-only -
 
 echo "=== Build the GPU topology probe and main program ==="
 mkdir -p build
