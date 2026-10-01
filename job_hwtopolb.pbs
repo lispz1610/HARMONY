@@ -26,35 +26,31 @@ if [[ $(wc -l < "$PBS_NODEFILE") -ne 2 ]]; then
 fi
 echo "=== Toolchain ==="
 module list 2>&1
-command -v mpic++
 command -v mpirun
-mpic++ --version
 command -v prun
-printf '#include <span>\nint main() { std::span<int> value; return value.size(); }\n' \
-    | mpic++ -std=c++20 -x c++ -fsyntax-only -
-
-compile() {
-    mpic++ -std=c++20 -Wall -Wextra -O2 -DCL_TARGET_OPENCL_VERSION=300 \
-        "$1" -lOpenCL -o "$2"
-}
-
-echo "=== Build and run the five core test suites ==="
-for name in topo_metrics numa_cost hierarchical algorithms contention_power; do
-    compile "tests/test_${name}.cpp" "tests/test_${name}.out"
+bin_dir="$PBS_O_WORKDIR/build/cluster"
+for binary in test_topo_metrics.out test_numa_cost.out test_hierarchical.out \
+              test_algorithms.out test_contention_power.out \
+              test_probe_runtime_integration.out test_async_halo_opencl.out \
+              topo_probe.out kneighbor.out leanmd.out; do
+    if [[ ! -x "$bin_dir/$binary" ]]; then
+        echo "Missing $bin_dir/$binary; run bash cluster_build.sh on the frontend" >&2
+        exit 1
+    fi
 done
 
-mpirun -n 1 ./tests/test_topo_metrics.out
-mpirun -n 1 ./tests/test_numa_cost.out
-prun ./tests/test_numa_cost.out
-prun ./tests/test_hierarchical.out
-mpirun -n 1 ./tests/test_algorithms.out
-prun ./tests/test_algorithms.out
-mpirun -n 1 ./tests/test_contention_power.out
-prun ./tests/test_contention_power.out
+echo "=== Run the five core test suites ==="
+mpirun -n 1 "$bin_dir/test_topo_metrics.out"
+mpirun -n 1 "$bin_dir/test_numa_cost.out"
+prun "$bin_dir/test_numa_cost.out"
+prun "$bin_dir/test_hierarchical.out"
+mpirun -n 1 "$bin_dir/test_algorithms.out"
+prun "$bin_dir/test_algorithms.out"
+mpirun -n 1 "$bin_dir/test_contention_power.out"
+prun "$bin_dir/test_contention_power.out"
 
 echo "=== Measure GPU and MPI topology ==="
-compile topo_probe.cpp topo_probe.out
-prun ./topo_probe.out --output-json topo_metrics_cluster.json
+prun "$bin_dir/topo_probe.out" --output-json topo_metrics_cluster.json
 python3 - topo_metrics_cluster.json <<'PY'
 import json
 import sys
@@ -68,13 +64,13 @@ if len(metrics["mpi_latency_ns"]) != 4:
 PY
 
 echo "=== Validate the probe/runtime contract and asynchronous halo ==="
-compile tests/test_probe_runtime_integration.cpp tests/test_probe_runtime_integration.out
-compile tests/test_async_halo_opencl.cpp tests/test_async_halo_opencl.out
-prun ./tests/test_probe_runtime_integration.out topo_metrics_cluster.json
-timeout 180s prun ./tests/test_async_halo_opencl.out
+prun "$bin_dir/test_probe_runtime_integration.out" topo_metrics_cluster.json
+timeout 180s prun "$bin_dir/test_async_halo_opencl.out"
 
 echo "=== Compare ERAD and HWTOPOLB on OpenCL GPUs ==="
 export MPI_LAUNCHER=prun
+export BENCH_BIN_DIR="$bin_dir"
+export BENCH_SKIP_BUILD=1
 bash ./benchmarks/compare_algos.sh
 awk -F, '
     NR == 1 { next }

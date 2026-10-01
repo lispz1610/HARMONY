@@ -401,6 +401,12 @@ export MPI_LAUNCHER="mpirun"
 bash benchmarks/compare_algos.sh
 ```
 
+For a cluster build on the frontend, `BENCH_BUILD_ONLY=1` compiles the
+benchmark executables without running them. During a PBS job,
+`BENCH_SKIP_BUILD=1` and `BENCH_BIN_DIR=/path/to/binaries` reuse those
+executables without invoking the compiler. The cluster workflow below sets
+these variables automatically.
+
 ### Injecting Topology Metrics at Runtime
 
 ```cpp
@@ -433,21 +439,26 @@ The jobs follow the LIMC cluster guide v5.0. Both reserve one full A100 GPU
 and one MPI rank on each of `compute-1-0[0]` and `compute-1-1[0]`, with four
 CPUs and 8 GB RAM per chunk. Check the current vnode inventory with
 `pbsnodes -a` before submitting; the cluster configuration can change.
-Both jobs load the `gnu13/13.2.0`, `openmpi5/5.0.5`, and `prun/2.2` modules
-observed on the cluster frontend. They retain the site's base modules, build
-with C++20 and the OpenCL ICD loader, and run from `PBS_O_WORKDIR`. The
-cluster's `prun` launcher uses the two allocated MPI slots. The OpenCL probe
-must find GPUs; neither job uses its synthetic mode.
+The frontend build and both jobs load the `gnu13/13.2.0`,
+`openmpi5/5.0.5`, and `prun/2.2` modules observed on the cluster. They retain
+the site's base modules. The cluster's `prun` launcher uses the two allocated
+MPI slots. The OpenCL probe must find GPUs; neither job uses its synthetic
+mode.
 
-Update the Git checkout on the cluster login node before submitting jobs:
+Update the Git checkout and build on the cluster frontend before submitting
+jobs:
 
 ```bash
 git pull --ff-only origin master
+bash cluster_build.sh
 ```
 
 If the cluster directory is not a Git checkout, transfer the complete source
-tree instead. Submit the short main-program smoke test before the longer
-evaluation:
+tree and run `bash cluster_build.sh` there instead. The script compiles all
+tests, the topology probe, the main program, and both benchmarks into
+`build/cluster/` using C++20 and the OpenCL ICD loader. The compute nodes do
+not need development headers. Submit the short main-program smoke test before
+the longer evaluation:
 
 ```bash
 qsub job_harmony_smoke.pbs
@@ -479,9 +490,9 @@ The merged PBS output is `hwtopolb_eval.out`; the probe writes
 The benchmark drivers currently compare `erad_loads()` and `hwtopolb_loads()`
 without loading `topo_metrics_cluster.json` into their runtime. Treat the
 probe as a separate topology measurement, not as an input to that comparison.
-The job compiles its sources on allocated nodes for reproducibility, so allow
-for build time when setting `walltime`. The PBS jobs cannot be fully validated
-without access to the cluster, its installed modules, and its OpenCL GPUs.
+The jobs fail early if a required frontend-built executable is missing. A
+cluster run is still needed to validate the installed OpenCL driver and GPU
+execution paths.
 
 ---
 

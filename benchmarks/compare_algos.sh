@@ -7,10 +7,25 @@ output_dir="${BENCH_OUTPUT_DIR:-${script_dir}}"
 mkdir -p "${output_dir}"
 
 cxx_flags="-std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O3 -DCL_TARGET_OPENCL_VERSION=300"
-kneighbor_bin="${output_dir}/kneighbor.out"
-leanmd_bin="${output_dir}/leanmd.out"
-mpic++ ${cxx_flags} "${root_dir}/benchmarks/kneighbor.cpp" -lOpenCL -o "${kneighbor_bin}"
-mpic++ ${cxx_flags} "${root_dir}/benchmarks/leanmd.cpp" -lOpenCL -o "${leanmd_bin}"
+bin_dir="${BENCH_BIN_DIR:-${output_dir}}"
+kneighbor_bin="${bin_dir}/kneighbor.out"
+leanmd_bin="${bin_dir}/leanmd.out"
+if [[ "${BENCH_SKIP_BUILD:-0}" == 1 ]]; then
+    for binary in "${kneighbor_bin}" "${leanmd_bin}"; do
+        if [[ ! -x "${binary}" ]]; then
+            printf 'Missing prebuilt benchmark: %s\n' "${binary}" >&2
+            exit 1
+        fi
+    done
+else
+    mkdir -p "${bin_dir}"
+    mpic++ ${cxx_flags} "${root_dir}/benchmarks/kneighbor.cpp" -lOpenCL -o "${kneighbor_bin}"
+    mpic++ ${cxx_flags} "${root_dir}/benchmarks/leanmd.cpp" -lOpenCL -o "${leanmd_bin}"
+fi
+
+if [[ "${BENCH_BUILD_ONLY:-0}" == 1 ]]; then
+    exit 0
+fi
 
 read -r -a launcher <<< "${MPI_LAUNCHER:-}"
 bench_n="${BENCH_N:-1000000}"
