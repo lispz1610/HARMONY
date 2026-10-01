@@ -12,7 +12,14 @@ opencl_library="${OPENCL_LIBRARY:--lOpenCL}"
 bin_dir="${BENCH_BIN_DIR:-${output_dir}}"
 kneighbor_bin="${bin_dir}/kneighbor.out"
 leanmd_bin="${bin_dir}/leanmd.out"
-if [[ "${BENCH_SKIP_BUILD:-0}" == 1 ]]; then
+summarize_only="${BENCH_SUMMARIZE_ONLY:-0}"
+if [[ "$summarize_only" == 1 && "${BENCH_BUILD_ONLY:-0}" == 1 ]]; then
+    printf 'BENCH_SUMMARIZE_ONLY and BENCH_BUILD_ONLY cannot both be set\n' >&2
+    exit 1
+fi
+if [[ "$summarize_only" == 1 ]]; then
+    :
+elif [[ "${BENCH_SKIP_BUILD:-0}" == 1 ]]; then
     for binary in "${kneighbor_bin}" "${leanmd_bin}"; do
         if [[ ! -x "${binary}" ]]; then
             printf 'Missing prebuilt benchmark: %s\n' "${binary}" >&2
@@ -37,20 +44,22 @@ bench_iterations="${BENCH_ITERATIONS:-100}"
 bench_interval="${BENCH_BALANCE_INTERVAL:-10}"
 seeds=(42 123 456)
 
-for seed in "${seeds[@]}"; do
-    for bench in kneighbor leanmd; do
-        if [[ "${bench}" == kneighbor ]]; then binary="${kneighbor_bin}"; else binary="${leanmd_bin}"; fi
-        for algo in erad hwtopolb; do
-            prefix="${output_dir}/${bench}_${algo}_${seed}"
-            "${launcher[@]}" "${binary}" --n "${bench_n}" --iterations "${bench_iterations}" \
-                --balance-interval "${bench_interval}" --balance-algo "${algo}" \
-                --perturbation 0.10 --seed "${seed}" --output-csv "${prefix}.csv" \
-                > "${prefix}.log"
+if [[ "$summarize_only" != 1 ]]; then
+    for seed in "${seeds[@]}"; do
+        for bench in kneighbor leanmd; do
+            if [[ "${bench}" == kneighbor ]]; then binary="${kneighbor_bin}"; else binary="${leanmd_bin}"; fi
+            for algo in erad hwtopolb; do
+                prefix="${output_dir}/${bench}_${algo}_${seed}"
+                "${launcher[@]}" "${binary}" --n "${bench_n}" --iterations "${bench_iterations}" \
+                    --balance-interval "${bench_interval}" --balance-algo "${algo}" \
+                    --perturbation 0.10 --seed "${seed}" --output-csv "${prefix}.csv" \
+                    > "${prefix}.log"
+            done
         done
     done
-done
+fi
 
-python3 - "${output_dir}" "${root_dir}" "${bench_n}" "${bench_iterations}" "${bench_interval}" "${MPI_LAUNCHER:-direct}" "${cxx_flags}" <<'PY'
+python3 - "${output_dir}" "${root_dir}" "${bench_n}" "${bench_iterations}" "${bench_interval}" "${MPI_LAUNCHER:-direct}" "${cxx_flags}" "$summarize_only" <<'PY'
 import csv
 import hashlib
 import json
@@ -61,7 +70,7 @@ import statistics
 import subprocess
 import sys
 
-output_dir, root_dir, n, iterations, interval, launcher, flags = sys.argv[1:]
+output_dir, root_dir, n, iterations, interval, launcher, flags, summarize_only = sys.argv[1:]
 seeds = (42, 123, 456)
 rows = []
 for bench in ('kneighbor', 'leanmd'):
@@ -98,12 +107,23 @@ with open(summary, 'w', newline='') as stream:
                      'stddev_total_wall_s', 'avg_rebalances', 'seeds'])
     writer.writerows(rows)
 
+def optional_command(*command):
+    try:
+        return subprocess.check_output(command, cwd=root_dir, text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+recovering = summarize_only == '1'
+commit = None if recovering else optional_command('git', 'rev-parse', 'HEAD')
+dirty_output = None if recovering else optional_command('git', 'status', '--porcelain')
+compiler_output = None if recovering else optional_command('mpic++', '--version')
 metadata = {
-    'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root_dir, text=True).strip(),
-    'working_tree_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=root_dir, text=True).strip()),
-    'hostname': platform.node(),
-    'platform': platform.platform(),
-    'compiler': subprocess.check_output(['mpic++', '--version'], text=True).splitlines()[0],
+    'commit': commit,
+    'working_tree_dirty': None if dirty_output is None else bool(dirty_output),
+    'hostname': None if recovering else platform.node(),
+    'platform': None if recovering else platform.platform(),
+    'compiler': None if compiler_output is None else compiler_output.splitlines()[0],
     'compiler_flags': flags,
     'mpi_launcher': launcher,
     'global_elements': int(n),
@@ -112,7 +132,17 @@ metadata = {
     'warmup_iterations': 0,
     'seeds': list(seeds),
     'execution_modes': sorted({row[2] for row in rows}),
+    'recovered_from_existing_logs': recovering,
 }
+metadata['binary_sha256'] = {}
+for name in ('kneighbor', 'leanmd'):
+    binary = os.path.join(os.environ.get('BENCH_BIN_DIR', output_dir), name + '.out')
+    if os.path.isfile(binary):
+        digest = hashlib.sha256()
+        with open(binary, 'rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        metadata['binary_sha256'][name] = digest.hexdigest()
 source_digest = hashlib.sha256()
 for relative_path in (
         'dcl/algorithms.hpp', 'dcl/runtime_impl.hpp', 'dcl/topo_metrics_io.hpp',
