@@ -65,7 +65,9 @@ def validate(run_dir):
             not isinstance(pbs.get('slots'), list) or len(pbs['slots']) != 2 or \
             len(set(pbs['slots'])) != 2:
         raise InvalidRun('Missing two-node PBS allocation record')
-    if not run.get('build_manifest_sha256') or not isinstance(run.get('build'), dict):
+    if not isinstance(run.get('build_manifest_sha256'), str) or \
+            not re.fullmatch(r'[0-9a-f]{64}', run['build_manifest_sha256']) or \
+            not isinstance(run.get('build'), dict):
         raise InvalidRun('Missing build provenance')
     params = run.get('input_parameters')
     expected_params = dict(n=1000000, full_iterations=100, rebalance_interval=10,
