@@ -95,6 +95,19 @@ class DiagnosticTraceContract(unittest.TestCase):
             path = Path(f"{prefix}.rank1.csv")
             with path.open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
+            for row in rows:
+                if row["record_type"] == "partition":
+                    if row["part"] == "0":
+                        row["count"] = "3"
+                    else:
+                        row["offset"], row["count"] = "3", "1"
+            with path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            disagreement = subprocess.run(command, text=True, capture_output=True)
+            self.assertNotEqual(disagreement.returncode, 0)
+            self.assertIn("rank progress or condition mismatch", disagreement.stderr)
             rows[1]["offset"] = "5"
             with path.open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields)

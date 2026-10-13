@@ -38,6 +38,7 @@ def read_rank(path, rank, iterations, elements, balance_interval):
     require(len({row["seed"] for row in rows}) == 1 and len({row["algorithm"] for row in rows}) == 1,
             f"{path}: inconsistent condition")
     progress = []
+    maps = []
     previous_new = None
     inventory = {int(row["device_global"]): row for row in rows if row["record_type"] == "inventory"}
     for iteration in range(iterations):
@@ -78,8 +79,10 @@ def read_rank(path, rank, iterations, elements, balance_interval):
                         require(int(part["owner_rank"]) == int(device["owner_rank"]),
                                 f"{path}: inventory owner mismatch")
             require(cursor == elements, f"{path}: partition map does not conserve N")
-            fingerprint = [(row["device_global"], row["owner_rank"], row["offset"], row["count"])
+            fingerprint = [(row["device_global"], row["owner_rank"], row["local_index"],
+                            row["offset"], row["count"])
                            for row in parts]
+            maps.append((iteration, state, fingerprint))
             if state == "old":
                 if previous_new is not None:
                     require(fingerprint == previous_new, f"{path}: unexplained map change")
@@ -103,6 +106,10 @@ def read_rank(path, rank, iterations, elements, balance_interval):
                 if row[field]:
                     value = float(row[field])
                     require(math.isfinite(value) and value >= 0, f"{path}: invalid {field}")
+            if row["record_type"] == "phase":
+                require(bool(row["duration_s"]), f"{path}: missing phase duration")
+            if row["record_type"] == "device_event":
+                require(bool(row["device_event_s"]), f"{path}: missing device event duration")
     final = [row for row in rows if int(row["iteration"]) == iterations and row["record_type"] == "phase"]
     require({row["phase"] for row in final} == FINAL_PHASES,
             f"{path}: incomplete final phases")
@@ -118,7 +125,9 @@ def read_rank(path, rank, iterations, elements, balance_interval):
     summary = {"rank": rank, "trace": str(path), "host_phase_totals_s": host_totals,
                "device_event_total_s": device_event_total,
                "partition_rows": sum(row["record_type"] == "partition" for row in rows)}
-    return (progress, rows[0]["seed"], rows[0]["algorithm"]), summary
+    inventory_rows = [(row["device_global"], row["owner_rank"], row["local_index"],
+                       row["device_identity"]) for row in rows if row["record_type"] == "inventory"]
+    return (progress, rows[0]["seed"], rows[0]["algorithm"], maps), summary, inventory_rows
 
 
 def main():
@@ -134,6 +143,18 @@ def main():
     results = [read_rank(Path(f"{args.prefix}.rank{rank}.csv"), rank, args.iterations,
                          args.elements, args.balance_interval) for rank in range(args.ranks)]
     require(all(result[0] == results[0][0] for result in results), "rank progress or condition mismatch")
+    inventory = [device for result in results for device in result[2]]
+    if inventory:
+        require(len({device[0] for device in inventory}) == len(inventory),
+                "duplicate global device in rank inventories")
+        require(all(int(device[1]) == rank for rank, result in enumerate(results)
+                    for device in result[2]), "rank inventory owner mismatch")
+        expected = {device[0]: (device[1], device[2]) for device in inventory}
+        first_map = results[0][0][3][0][2]
+        require({part[0] for part in first_map} == set(expected),
+                "partition map and device inventory differ")
+        require(all((part[1], part[2]) == expected[part[0]] for part in first_map),
+                "partition owner/local index differs from inventory")
     if args.summary_json:
         summary = {"schema_version": 1, "iterations": args.iterations, "elements": args.elements,
                    "seed": results[0][0][1], "algorithm": results[0][0][2],

@@ -14,7 +14,7 @@ python3 benchmarks/validate_trace.py /path/to/trace \
   --summary-json /path/to/trace-summary.json
 ```
 
-The validator checks schema, sequence, exactly one execution and compatible MPI progress at every iteration, scheduled rebalance phases, old/new partition conservation and continuity, nonnegative finite durations, and final validation phases. Summary JSON version 1 contains `iterations`, `elements`, `seed`, `algorithm`, and a `ranks` array. Each rank entry contains `rank`, source `trace` path, `host_phase_totals_s` by phase, `device_event_total_s`, and `partition_rows`. Treat the per-rank phase totals as local observations; the benchmark's `loop_time_s` is a maximum over ranks, so summing maxima from different ranks is invalid.
+The validator checks schema, sequence, exactly one execution and compatible MPI progress at every iteration, scheduled rebalance phases, old/new partition conservation and continuity across ranks, device inventory consistency, nonnegative finite durations, and final validation phases. Summary JSON version 1 contains `iterations`, `elements`, `seed`, `algorithm`, and a `ranks` array. Each rank entry contains `rank`, source `trace` path, `host_phase_totals_s` by phase, `device_event_total_s`, and `partition_rows`. Treat the per-rank phase totals as local observations; the benchmark's `loop_time_s` is a maximum over ranks, so summing maxima from different ranks is invalid.
 
 ## Pending cluster validation
 
