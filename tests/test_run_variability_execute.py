@@ -29,9 +29,14 @@ identity = 'changed' if os.environ.get('FAKE_MAPPING') and 'hwtopolb' in output.
 ranks = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0, global_index=rank,
               name='fake GPU', platform_name='fake', platform_version='3.0',
               device_version='3.0', driver_version='1', identity_kind='uuid',
-              identity=f'{identity}-{rank}') for rank in (0, 1)]
+              identity=identity if os.environ.get('FAKE_DUPLICATE_UUID') else f'{identity}-{rank}')
+         for rank in (0, 1)]
+if os.environ.get('FAKE_WRONG_GPU_COUNT'):
+    ranks[1]['gpu_count'] = 2
 Path(value('--device-inventory-json')).write_text(json.dumps({'schema_version': 1, 'ranks': ranks}))
 print('validation=PASS loop_time_s=1.0 validation_time_s=0.1')
+if os.environ.get('FAKE_CONFLICTING_VALIDATION'):
+    print('validation=FAIL loop_time_s=2.0')
 '''
 
 
@@ -89,6 +94,31 @@ class ExecuteGates(unittest.TestCase):
                 if flag == 'FAKE_MAPPING':
                     first = [row for row in samples if row['pair_id'] == 'r1_kneighbor_42']
                     self.assertEqual({row['status'] for row in first}, {'rejected'})
+
+    def test_conflicting_validation_summary_rejects_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            env['FAKE_CONFLICTING_VALIDATION'] = '1'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(process.returncode, 0)
+            samples = [json.loads(path.read_text()) for path in (root / 'run').rglob('*.manifest.json')]
+            self.assertTrue(all(row['status'] == 'rejected' for row in samples))
+            self.assertTrue(any('Numerical validation did not pass' in row['rejection_reason']
+                                for row in samples))
+
+    def test_duplicate_uuid_or_wrong_gpu_count_rejects_sample(self):
+        for flag, message in (('FAKE_DUPLICATE_UUID', 'same physical GPU'),
+                              ('FAKE_WRONG_GPU_COUNT', 'exactly one GPU per rank')):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                command, env, _, _ = self.fixture(root)
+                env[flag] = '1'
+                process = subprocess.run(command, env=env, capture_output=True, text=True)
+                self.assertNotEqual(process.returncode, 0)
+                samples = [json.loads(path.read_text()) for path in (root / 'run').rglob('*.manifest.json')]
+                self.assertTrue(all(row['status'] == 'rejected' for row in samples))
+                self.assertTrue(any(message in row['rejection_reason'] for row in samples))
 
     def test_valid_synthetic_pilot_accepts_all_24_samples(self):
         with tempfile.TemporaryDirectory() as temporary:

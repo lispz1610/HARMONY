@@ -146,14 +146,15 @@ def accepted_output(row):
                float(record['step_time_s']) < 0 for record in records):
             raise ValueError('Nonfinite or negative step timing')
         log = Path(row['log']).read_text(encoding='utf-8')
-        if 'validation=PASS' not in log:
+        validation = re.findall(r'\bvalidation=([^\s]+)', log)
+        if validation != ['PASS']:
             raise ValueError('Numerical validation did not pass')
         times = {}
         for name in ('loop_time_s', 'validation_time_s'):
-            match = re.search(rf'\b{name}=([^\s]+)', log)
-            if not match:
-                raise ValueError(f'Missing {name}')
-            times[name] = float(match.group(1))
+            matches = re.findall(rf'\b{name}=([^\s]+)', log)
+            if len(matches) != 1:
+                raise ValueError(f'Missing or ambiguous {name}')
+            times[name] = float(matches[0])
             if not math.isfinite(times[name]) or times[name] < 0:
                 raise ValueError(f'Invalid {name}')
         inventory = json.loads(Path(row['inventory']).read_text(encoding='utf-8'))
@@ -166,12 +167,16 @@ def accepted_output(row):
                     'driver_version', 'identity_kind', 'identity')
         if any(any(item.get(key) is None for key in required) for item in ranks):
             raise ValueError('Incomplete device inventory')
-        if any(item['gpu_count'] != 1 for item in ranks):
+        if any(type(item['gpu_count']) is not int or item['gpu_count'] != 1 for item in ranks):
             raise ValueError('Expected exactly one GPU per rank')
         if any(item['identity_kind'] not in ('uuid', 'pci') or not item['identity']
                for item in ranks):
             raise ValueError('Unverifiable physical GPU identity')
-        physical = {(item['host'], item['identity_kind'], item['identity']) for item in ranks}
+        if len({item['identity_kind'] for item in ranks}) != 1:
+            raise ValueError('GPU identity kinds differ across ranks')
+        physical = {(item['identity_kind'],
+                     item['identity'] if item['identity_kind'] == 'uuid'
+                     else (item['host'], item['identity'])) for item in ranks}
         if len(physical) != 2:
             raise ValueError('The two ranks resolved to the same physical GPU')
         mapping = [{key: item[key] for key in required} for item in sorted(ranks, key=lambda x: x['rank'])]
