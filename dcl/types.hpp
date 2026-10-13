@@ -80,6 +80,12 @@ struct DeviceInfo {
     std::string name;
     DeviceKind kind{DeviceKind::all};
     unsigned int compute_units{0};
+    std::string platform_name;
+    std::string platform_version;
+    std::string device_version;
+    std::string driver_version;
+    std::string identity_kind{"unavailable"};
+    std::string identity;
 };
 
 struct DevicePartition {
