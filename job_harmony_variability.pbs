@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -N harmony_variability
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mpiprocs=1:mem=8gb:ngpus=1:vnode=compute-1-0[0]+1:ncpus=4:mpiprocs=1:mem=8gb:ngpus=1:vnode=compute-1-1[0]
+#PBS -l place=free
+
+set -euo pipefail
+: "${PBS_O_WORKDIR:?PBS_O_WORKDIR is required}"
+cd "$PBS_O_WORKDIR"
+module load gnu13/13.2.0
+module load openmpi5/5.0.5
+module load prun/2.2
+: "${HARMONY_VARIABILITY_RUN_DIR:?Set a fresh HARMONY_VARIABILITY_RUN_DIR before qsub}"
+python3 benchmarks/run_variability.py --execute --mode "${HARMONY_VARIABILITY_MODE:-pilot}" \
+    --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \
+    --bin-dir "$PBS_O_WORKDIR/build/cluster" \
+    --build-manifest "$PBS_O_WORKDIR/build/cluster/build_manifest.json"
