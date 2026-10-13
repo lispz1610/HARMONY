@@ -31,7 +31,7 @@ class PilotAnalysisTests(unittest.TestCase):
                     for algorithm in algorithms:
                         ordinal += 1
                         prefix = self.run / f'{ordinal:03d}_{workload}_{algorithm}_{seed}'
-                        mapping = [dict(rank=rank, host=f'node{rank}', local_index=0,
+                        mapping = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0,
                                         global_index=rank, name='GPU A', platform_name='Vendor',
                                         platform_version='OpenCL 3.0', device_version='OpenCL 3.0',
                                         driver_version='1', identity_kind='uuid', identity=f'gpu-{rank}')
@@ -115,6 +115,30 @@ class PilotAnalysisTests(unittest.TestCase):
         run['mode'] = 'full'
         run_path.write_text(json.dumps(run))
         self.assertNotEqual(self.invoke().returncode, 0)
+
+    def test_invalid_gpu_count_or_duplicate_uuid_is_rejected(self):
+        sample = self.rows[0]
+        inventory_path = Path(sample['inventory'])
+        original = json.loads(inventory_path.read_text())
+        for ranks in [
+            [dict(original['ranks'][0], gpu_count=2), original['ranks'][1]],
+            [original['ranks'][0], dict(original['ranks'][1], identity=original['ranks'][0]['identity'])],
+        ]:
+            with self.subTest(ranks=ranks):
+                inventory_path.write_text(json.dumps(dict(original, ranks=ranks)))
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / 'report.md').exists())
+
+    def test_malformed_sample_timing_is_rejected_without_traceback(self):
+        path = Path(self.rows[0]['manifest'])
+        sample = json.loads(path.read_text())
+        sample['times']['loop_time_s'] = 'invalid'
+        path.write_text(json.dumps(sample))
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('manifest loop_time_s', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
 
 
 if __name__ == '__main__':

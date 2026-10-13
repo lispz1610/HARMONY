@@ -14,7 +14,7 @@ WORKLOADS = ('kneighbor', 'leanmd')
 ALGORITHMS = ('erad', 'hwtopolb')
 SEEDS = (42, 123, 456)
 CSV_FIELDS = ('iteration', 'step_time_s', 'action', 'rebalanced', 'rebalance_gain', 'execution_mode')
-MAPPING_FIELDS = ('rank', 'host', 'local_index', 'global_index', 'name', 'platform_name',
+MAPPING_FIELDS = ('rank', 'host', 'gpu_count', 'local_index', 'global_index', 'name', 'platform_name',
                   'platform_version', 'device_version', 'driver_version', 'identity_kind', 'identity')
 SLOW_THRESHOLD_S = 0.010  # Descriptive threshold for the historical ~20 ms path.
 
@@ -60,17 +60,23 @@ def mapping_from(inventory, context):
     if inventory.get('schema_version') != 1 or not isinstance(inventory.get('ranks'), list):
         raise InvalidPilot(f'{context}: invalid device inventory schema')
     ranks = inventory['ranks']
-    if len(ranks) != 2 or {r.get('rank') for r in ranks} != {0, 1}:
+    if len(ranks) != 2 or any(not isinstance(r, dict) for r in ranks) or \
+            {r.get('rank') for r in ranks} != {0, 1}:
         raise InvalidPilot(f'{context}: expected exactly ranks 0 and 1')
     result = []
     for rank in sorted(ranks, key=lambda item: item['rank']):
         if any(rank.get(field) is None for field in MAPPING_FIELDS):
             raise InvalidPilot(f'{context}: incomplete physical device mapping')
+        if type(rank['gpu_count']) is not int or rank['gpu_count'] != 1:
+            raise InvalidPilot(f'{context}: expected exactly one GPU per rank')
         if rank['identity_kind'] not in ('uuid', 'pci') or not rank['identity']:
             raise InvalidPilot(f'{context}: unverifiable physical device mapping')
         result.append({field: rank[field] for field in MAPPING_FIELDS})
     if len({(item['host'], item['identity_kind'], item['identity']) for item in result}) != 2:
         raise InvalidPilot(f'{context}: ranks resolved to the same physical GPU')
+    uuids = [item['identity'] for item in result if item['identity_kind'] == 'uuid']
+    if len(set(uuids)) != len(uuids):
+        raise InvalidPilot(f'{context}: duplicate physical GPU UUID across hosts')
     return result
 
 
@@ -171,7 +177,8 @@ def analyze(run_dir):
         if total + 1e-9 < max(loop, validation):
             raise InvalidPilot(f'{context}: inconsistent loop/validation/full time')
         times = sample.get('times', {})
-        if not isinstance(times, dict) or any(not math.isclose(times.get(key, -1), value,
+        if not isinstance(times, dict) or any(not math.isclose(
+                finite_nonnegative(times.get(key), f'{context} manifest {key}'), value,
                 rel_tol=1e-6, abs_tol=1e-9) for key, value in
                 (('loop_time_s', loop), ('validation_time_s', validation))):
             raise InvalidPilot(f'{context}: sample manifest timing differs from log')
