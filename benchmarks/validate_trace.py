@@ -79,8 +79,7 @@ def read_rank(path, rank, iterations, elements, balance_interval):
                         require(int(part["owner_rank"]) == int(device["owner_rank"]),
                                 f"{path}: inventory owner mismatch")
             require(cursor == elements, f"{path}: partition map does not conserve N")
-            fingerprint = [(row["device_global"], row["owner_rank"], row["local_index"],
-                            row["offset"], row["count"])
+            fingerprint = [(row["device_global"], row["owner_rank"], row["offset"], row["count"])
                            for row in parts]
             maps.append((iteration, state, fingerprint))
             if state == "old":
@@ -127,6 +126,12 @@ def read_rank(path, rank, iterations, elements, balance_interval):
                "partition_rows": sum(row["record_type"] == "partition" for row in rows)}
     inventory_rows = [(row["device_global"], row["owner_rank"], row["local_index"],
                        row["device_identity"]) for row in rows if row["record_type"] == "inventory"]
+    initial_local = {row["device_global"]: row for row in rows
+                     if row["record_type"] == "partition" and row["iteration"] == "0"
+                     and row["phase"] == "old" and row["owner_rank"] == str(rank)}
+    require(all(device[0] in initial_local and
+                initial_local[device[0]]["local_index"] == device[2]
+                for device in inventory_rows), f"{path}: local inventory mismatch")
     return (progress, rows[0]["seed"], rows[0]["algorithm"], maps), summary, inventory_rows
 
 
@@ -149,12 +154,12 @@ def main():
                 "duplicate global device in rank inventories")
         require(all(int(device[1]) == rank for rank, result in enumerate(results)
                     for device in result[2]), "rank inventory owner mismatch")
-        expected = {device[0]: (device[1], device[2]) for device in inventory}
+        expected = {device[0]: device[1] for device in inventory}
         first_map = results[0][0][3][0][2]
         require({part[0] for part in first_map} == set(expected),
                 "partition map and device inventory differ")
-        require(all((part[1], part[2]) == expected[part[0]] for part in first_map),
-                "partition owner/local index differs from inventory")
+        require(all(part[1] == expected[part[0]] for part in first_map),
+                "partition owner differs from inventory")
     if args.summary_json:
         summary = {"schema_version": 1, "iterations": args.iterations, "elements": args.elements,
                    "seed": results[0][0][1], "algorithm": results[0][0][2],
