@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     std::string output_csv = "leanmd.csv";
     int cutoff = 4;
     unsigned int seed = 0;
+    bool quiet_runtime_metrics = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -67,10 +68,13 @@ int main(int argc, char** argv) {
             cutoff = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--seed" && i + 1 < argc) {
             seed = static_cast<unsigned int>(std::stoul(argv[++i]));
+        } else if (arg == "--quiet-runtime-metrics") {
+            quiet_runtime_metrics = true;
         }
     }
 
     dcl::Runtime runtime = dcl::Runtime::create(argc, argv);
+    runtime.set_verbose_metrics(!quiet_runtime_metrics);
     const int rank = runtime.rank();
     if (n == 0 || n > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         iterations <= 0) {

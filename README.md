@@ -394,6 +394,24 @@ mpic++ -std=c++20 -Wall -Wextra -O2 \
   -o leanmd.out
 ```
 
+Both benchmark drivers accept `--quiet-runtime-metrics` for timed samples.
+It suppresses detailed per-iteration runtime metric output and the optional
+`DCL_METRICS_FILE` CSV, while leaving device event collection, MPI reductions,
+and balancing inputs active. The default remains verbose for existing callers.
+Compare the modes only under the same allocation and workload; the diagnostic
+overhead is separate from any algorithm speedup claim.
+
+The public runtime control is `set_verbose_metrics(bool)`. The focused
+simulation test can be built and run with:
+
+```bash
+mpic++ -std=c++20 -Wall -Wextra -O2 \
+  tests/test_runtime_metrics.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
+  -o tests/test_runtime_metrics.out
+mpirun -n 1 ./tests/test_runtime_metrics.out
+mpirun -n 2 ./tests/test_runtime_metrics.out
+```
+
 Or use the automation script (sets `MPI_LAUNCHER` if needed):
 
 ```bash

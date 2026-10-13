@@ -551,6 +551,7 @@ public:
     int rank() const noexcept { return rank_; }
     int size() const noexcept { return size_; }
     MPI_Comm communicator() const noexcept { return comm_; }
+    void set_verbose_metrics(bool enabled) noexcept { verbose_metrics_ = enabled; }
 
     FieldHandle create_field(const FieldSpec& spec) {
         const int global_devices =
@@ -3119,7 +3120,7 @@ void print_balance_interval_metrics(
     accumulated_balance_seconds_ += T_balance_total;
     accumulated_rebalance_apply_seconds_ += T_rebalance_apply;
 
-    append_balance_metrics_csv(
+    if (verbose_metrics_) append_balance_metrics_csv(
         policy_name,
         action,
         reason,
@@ -3133,7 +3134,7 @@ void print_balance_interval_metrics(
         T_rebalance_apply
     );
 
-    if (rank_ == 0) {
+    if (verbose_metrics_ && rank_ == 0) {
         std::cout << "[DCL][balance-metrics] iteration=" << iteration_counter_ << "\n";
         std::cout << "  policy=" << policy_name << "\n";
         std::cout << "  action=" << action << "\n";
@@ -3153,16 +3154,13 @@ void print_balance_interval_metrics(
         }
     }
 
-    print_named_loads("OLD loads", old_loads);
-
-    if (!proposed_loads.empty()) {
-        print_named_loads("PROPOSED loads", proposed_loads);
-    }
-
-    print_named_loads("CURRENT loads", current_loads_after);
-
-    if (rank_ == 0) {
-        std::cout << std::flush;
+    if (verbose_metrics_) {
+        print_named_loads("OLD loads", old_loads);
+        if (!proposed_loads.empty()) {
+            print_named_loads("PROPOSED loads", proposed_loads);
+        }
+        print_named_loads("CURRENT loads", current_loads_after);
+        if (rank_ == 0) std::cout << std::flush;
     }
 
     if (reset_after_print) {
@@ -4969,6 +4967,7 @@ private:
     std::vector<FieldHandle> last_input_fields_;
     std::vector<FieldHandle> last_output_fields_;
     std::size_t iteration_counter_{0};
+    bool verbose_metrics_{true};
 
     std::vector<ProfileSegment> profiling_data_;
     bool profiling_loaded_{false};
