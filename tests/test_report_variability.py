@@ -45,7 +45,9 @@ class ReportCommandTests(unittest.TestCase):
                              build_manifest='/build/manifest.json', build_manifest_sha256='abc',
                              build=dict(source_revision='deadbeef',
                                         binaries={**{name: dict(sha256=name + '-sha') for name in WORKLOADS},
-                                                  'test_async_halo_opencl': dict(sha256='a' * 64)}),
+                                                  'test_async_halo_opencl': dict(
+                                                      path='/bin/test_async_halo_opencl.out',
+                                                      sha256='a' * 64)}),
                              input_parameters=dict(n=1000000, full_iterations=100,
                                                    rebalance_interval=10, perturbation=0.10,
                                                    kneighbor_k=5, leanmd_cutoff=4),
@@ -167,6 +169,20 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn('digest differs', report)
         self.assertIn('inconclusive', report.lower())
         self.assertNotIn('Useful gain supported', report)
+
+    def test_verified_halo_allows_bounded_performance_signal_but_not_causal_claim(self):
+        halo = self.run / 'halo_reference.log'
+        halo.write_text('PASS: asynchronous OpenCL halo matches two-step CPU reference\n')
+        self.run_data['halo_reference'] = dict(command=['/bin/prun',
+            '/bin/test_async_halo_opencl.out'], log=str(halo),
+            binary_sha256='a' * 64, status='passed', exit_code=0)
+        (self.run / 'run_manifest.json').write_text(json.dumps(self.run_data))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        self.assertIn('Paired performance supports a useful gain', report)
+        self.assertIn('Report status:** provisional', report)
+        self.assertIn('No causal attribution', report)
 
     def test_rejected_manifest_and_nonfinite_loop_are_refused(self):
         row = self.rows[4]

@@ -207,16 +207,22 @@ def halo_reference(run, root):
             evidence.get('exit_code') != 0 or evidence.get('rejection_reason') is not None:
         return False, 'halo reference was not accepted'
     command = evidence.get('command')
-    if not isinstance(command, list) or not command or \
-            not str(command[0]).endswith('prun') or not any(
-                str(arg).endswith('test_async_halo_opencl.out') for arg in command):
+    if not isinstance(command, list) or len(command) != 2 or \
+            not str(command[0]).endswith('prun') or \
+            not str(command[1]).endswith('test_async_halo_opencl.out'):
         return False, 'halo command or two-rank launcher is missing'
     digest = evidence.get('binary_sha256')
     if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
         return False, 'halo binary digest is missing'
-    expected_digest = ((run.get('build') or {}).get('binaries') or {}).get('test_async_halo_opencl', {}).get('sha256')
+    binaries = run.get('build', {}).get('binaries')
+    halo_binary = binaries.get('test_async_halo_opencl') if isinstance(binaries, dict) else None
+    if not isinstance(halo_binary, dict):
+        return False, 'halo binary is missing from the build manifest'
+    expected_digest = halo_binary.get('sha256')
     if digest != expected_digest:
         return False, 'halo binary digest differs from the build manifest'
+    if command[1] != halo_binary.get('path'):
+        return False, 'halo binary path differs from the build manifest'
     launcher = run['environment']['pbs'].get('launcher')
     if command[0] != launcher:
         return False, 'halo launcher differs from the PBS run launcher'
@@ -248,7 +254,9 @@ def render(run, rows, pairs, halo_ok, halo_detail):
             reversal |= median <= 1
             all_gain &= median >= THRESHOLD and stable
             groups.append((workload, seed, median, min(ratios), max(ratios), q1, q3, stable))
-    verdict = ('Useful gain supported for these workloads, seeds, and allocation only.'
+    verdict = ('Paired performance supports a useful gain for these workloads, seeds, '
+               'and allocation only; variance diagnosis remains provisional pending '
+               'rank-local traces.'
                if all_gain and halo_ok else
                'No useful gain across every seed; no general speedup claim.'
                if reversal and halo_ok else
@@ -256,6 +264,8 @@ def render(run, rows, pairs, halo_ok, halo_detail):
                if not halo_ok or near_or_unstable else
                'No useful gain across every seed; no general speedup claim.')
     lines = ['# Controlled two-GPU variance report', '',
+             '**Report status:** provisional until rank-local diagnostic traces are '
+             'validated and phase attribution is reconciled.', '',
              '## Correctness and provenance', '',
              f"PBS job: `{run['environment']['pbs']['job_id']}`; nodes: "
              f"`{', '.join(run['environment']['pbs']['slots'])}`. ",
