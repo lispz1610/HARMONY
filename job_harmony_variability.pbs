@@ -8,6 +8,20 @@
 set -euo pipefail
 : "${PBS_O_WORKDIR:?PBS_O_WORKDIR is required}"
 cd "$PBS_O_WORKDIR"
+on_exit() {
+    status=$?
+    trap - EXIT
+    if [[ -n "${HARMONY_VARIABILITY_RUN_DIR:-}" ]]; then
+        status_path="${HARMONY_VARIABILITY_RUN_DIR}.pbs.status"
+        if ! ( set -C; printf 'pbs_job_id=%s\nscript_exit_code=%s\n' \
+                   "${PBS_JOBID:-unknown}" "$status" > "$status_path" ); then
+            echo "Could not preserve PBS script status at $status_path" >&2
+            exit 1
+        fi
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
 module load gnu13/13.2.0
 module load openmpi5/5.0.5
 module load prun/2.2

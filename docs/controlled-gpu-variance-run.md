@@ -2,7 +2,8 @@
 
 Build on the cluster frontend with `bash cluster_build.sh`. This writes
 `build/cluster/build_manifest.json` with source revision, source digest, compiler,
-flags, exact benchmark commands, OpenCL library, and both binary SHA-256 values.
+flags, exact benchmark commands, OpenCL library, and SHA-256 values for both
+benchmarks and the two-rank asynchronous OpenCL halo test.
 The source digest covers C++ headers and sources in `dcl/` and `benchmarks/`,
 plus OpenCL kernels. The binary hashes are the execution gate.
 
@@ -32,13 +33,39 @@ test ! -e "$HARMONY_PBS_OUTPUT_PATH"
 qsub -o "$HARMONY_PBS_OUTPUT_PATH" -j oe -V job_harmony_variability.pbs
 ```
 
-After the pilot and numerical/halo checks pass, repeat with `MODE=full` and a
-fresh `Results/full-...` directory. PBS stdout/stderr is written to the unique `HARMONY_PBS_OUTPUT_PATH`
-sibling path and recorded in the run manifest. After completion, copy it into
-the run directory and save the scheduler exit status, for example
-`qstat -xf JOBID > "$HARMONY_VARIABILITY_RUN_DIR/pbs.status.txt"`.
-If `qstat` no longer retains the job, record the exit status from the
-site accounting command; never infer success from the presence of CSV files.
+Inspect the pilot run manifest and all 24 sample manifests, CSVs, logs, and
+device inventories. Every sample must be accepted with finite timing,
+`validation=PASS`, two physical GPUs, and complete GPU iterations. Run the
+two-rank diagnostic trace separately and compare it with an uninstrumented
+condition before interpreting phase timings. Do not include pilot or traced
+runs in the full-matrix statistics.
+
+After the pilot, diagnostic, and numerical checks pass, repeat with
+`HARMONY_VARIABILITY_MODE=full` and a fresh `Results/full-...` directory. The
+full executor first runs the prebuilt two-rank asynchronous OpenCL halo test
+on the same PBS allocation. It requires exit code 0 and the CPU-reference
+`PASS` marker; `SKIP`, mismatch, timeout, or missing binary rejects the run
+before any warm-up or timed sample. Preserve `halo_reference.log` and the
+`halo_reference` result in `run_manifest.json`.
+
+PBS stdout/stderr is written to the unique `HARMONY_PBS_OUTPUT_PATH` sibling
+path and recorded in the run manifest. The PBS script writes its own exit code
+and job ID to `${HARMONY_VARIABILITY_RUN_DIR}.pbs.status`. Once the scheduler
+has finished writing output, copy both sibling artifacts into the run directory
+without replacing any existing file:
+
+```sh
+cp -n "$HARMONY_PBS_OUTPUT_PATH" "$HARMONY_VARIABILITY_RUN_DIR/pbs.out"
+cp -n "${HARMONY_VARIABILITY_RUN_DIR}.pbs.status" "$HARMONY_VARIABILITY_RUN_DIR/pbs.status"
+qstat -xf JOBID > "$HARMONY_VARIABILITY_RUN_DIR/pbs.scheduler-status.txt"
+```
+
+If `qstat` no longer retains the job, record the exit status from the site
+accounting command in `pbs.scheduler-status.txt`. The script status is not a
+substitute for the scheduler's final status. Do not infer success from CSV
+presence. Retain all raw sample logs, CSVs, inventories, per-sample manifests,
+the run manifest, PBS artifacts, and build manifest together in the ignored
+dated results archive. Keep the historical archive untouched.
 The executor does not resume or overwrite a run directory. It verifies both
 binary digests before every invocation. Missing PBS job/nodefile, wrong two-node
 slot shape, missing `prun`, or changed binaries refuse execution.
