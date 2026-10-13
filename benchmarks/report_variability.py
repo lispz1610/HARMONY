@@ -158,8 +158,10 @@ def validate(run_dir):
         total = log_number(log, 'total_time_s', label)
         loop = finite(times['loop_time_s'], f'{label} loop', positive=True)
         validation = times['validation_time_s']
-        if total + 1e-9 < loop + validation or loop + 1e-9 < step_sum:
-            raise InvalidRun(f'{label}: inconsistent loop, validation, total, or step time')
+        # Each metric may be a different MPI maximum. Their sums need not fit
+        # another maximum when the slow rank changes between phases/steps.
+        if total + 1e-9 < max(loop, validation):
+            raise InvalidRun(f'{label}: total wall time is below a measured phase')
         rows.append(dict(item, loop=loop, validation=validation, total=total,
                          step_sum=step_sum, mapping=mapping, paths=paths,
                          started_at=sample.get('started_at'),
@@ -222,7 +224,7 @@ def halo_reference(run, root):
         log = artifact(root, evidence.get('log'), 'halo log').read_text(encoding='utf-8')
     except (InvalidRun, OSError, UnicodeError) as error:
         return False, str(error)
-    if log.count('PASS: asynchronous OpenCL halo matches two-step CPU reference') != 1 or \
+    if log.splitlines().count('PASS: asynchronous OpenCL halo matches two-step CPU reference') != 1 or \
             re.search(r'\bSKIP\b|\bFAIL\b', log):
         return False, 'halo log lacks an unambiguous reference PASS'
     return True, 'verified from the full-run halo log and exit status'
@@ -292,7 +294,7 @@ def render(run, rows, pairs, halo_ok, halo_detail):
               'and stable repeats; pooling seeds is not allowed.', '',
               '| Pair | Run order | ERAD ordinal/loop (s) | HWTOPOLB ordinal/loop (s) | '
               'Paired ratio | ERAD/HWTOPOLB full wall (s) | Validation (s) | '
-              'Loop minus recorded steps (s) | UTC start ERAD/HWTOPOLB | Raw CSV/log |',
+              'Loop minus sum of step maxima (s) | UTC start ERAD/HWTOPOLB | Raw CSV/log |',
               '| --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |']
     for p in pairs:
         a, b = p['erad'], p['hwtopolb']
@@ -310,9 +312,11 @@ def render(run, rows, pairs, halo_ok, halo_detail):
               'The legacy full-wall metric includes final validation and is secondary; '
               'it is not comparable with historical full-wall numbers as a loop-time baseline. '
               'Per-step CSV times omit benchmark MPI reductions. The table shows '
-              '`loop minus recorded steps` for every sample; this unresolved host '
-              'interval includes MPI reductions and measurement boundaries and is not '
-              'proven kernel or migration cost. Device OpenCL '
+              '`loop minus sum of step maxima` for every sample as a descriptive '
+              'accounting gap. Loop, validation, full-wall, and individual steps may '
+              'each be maxima from different ranks, so this gap is not a rank-local '
+              'residual; it can even be negative. It cannot be assigned to MPI, kernel, '
+              'migration, or another host phase. Device OpenCL '
               'events may overlap host phases and must be shown on a separate timeline. '
               'Rank-local diagnostic traces and a same-condition unprofiled comparison are '
               'required to reconcile execute, rebalance, benchmark MPI, validation, and '

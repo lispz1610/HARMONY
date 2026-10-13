@@ -180,6 +180,19 @@ class ReportCommandTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.output.exists())
 
+    def test_global_step_maxima_need_not_sum_to_max_rank_loop(self):
+        row = self.rows[4]
+        csv_path = Path(row['csv'])
+        csv_path.write_text(csv_path.read_text().replace('0.005', '0.020'))
+        log_path = Path(row['log'])
+        log_path.write_text(log_path.read_text().replace('total_time_s=1.2',
+                                                       'total_time_s=1.0'))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        self.assertIn('-1.000000', report)
+        self.assertIn('may each be maxima from different ranks', report)
+
 
 if __name__ == '__main__':
     unittest.main()
