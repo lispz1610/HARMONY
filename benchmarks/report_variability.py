@@ -3,12 +3,15 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
 import re
 import statistics
+import subprocess
 import sys
+import tempfile
 
 from run_variability import ALGORITHMS, SEEDS, WORKLOADS, accepted_output, schedule
 
@@ -51,6 +54,14 @@ def log_number(text, name, label):
     if len(matches) != 1:
         raise InvalidRun(f'{label}: expected one {name}, found {len(matches)}')
     return finite(matches[0], f'{label} {name}')
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def validate(run_dir):
@@ -238,6 +249,186 @@ def halo_reference(run, root):
     return True, 'verified from the full-run halo log and exit status'
 
 
+def diagnostic_evidence(manifest_path, run, rows):
+    manifest_path = manifest_path.resolve()
+    evidence = json_file(manifest_path)
+    if not isinstance(evidence, dict) or evidence.get('schema_version') != 1 or \
+            evidence.get('status') != 'captured' or \
+            evidence.get('exit_code') != 0:
+        raise InvalidRun('Diagnostic invocation did not complete successfully')
+    pbs = evidence.get('pbs')
+    if pbs != run['environment']['pbs']:
+        raise InvalidRun('Diagnostic PBS allocation differs from the full matrix')
+    if evidence.get('build_manifest_sha256') != run['build_manifest_sha256']:
+        raise InvalidRun('Diagnostic build manifest differs from the full matrix')
+    workload, seed, algorithm = (evidence.get(key) for key in ('workload', 'seed', 'algorithm'))
+    if workload not in WORKLOADS or seed not in SEEDS or algorithm not in ALGORITHMS:
+        raise InvalidRun('Diagnostic condition is not in the controlled matrix')
+    binaries = run['build'].get('binaries')
+    binary = binaries.get(workload) if isinstance(binaries, dict) else None
+    if not isinstance(binary, dict) or evidence.get('binary_sha256') != binary.get('sha256'):
+        raise InvalidRun('Diagnostic executable digest differs from full matrix build')
+    matched = Path(str(evidence.get('matched_sample_manifest'))).resolve()
+    candidates = [row for row in rows if row['phase'] == 'full' and
+                  row['paths']['manifest'] == matched]
+    if len(candidates) != 1:
+        raise InvalidRun('Diagnostic matched sample is absent from unprofiled matrix')
+    sample = candidates[0]
+    if (sample['workload'], sample['seed'], sample['algorithm']) != (workload, seed, algorithm):
+        raise InvalidRun('Diagnostic and matched sample conditions differ')
+    root = manifest_path.parent
+    artifacts = evidence.get('artifacts')
+    digests = evidence.get('artifact_sha256')
+    names = ('csv', 'log', 'inventory', 'rank0', 'rank1')
+    if not isinstance(artifacts, dict) or not isinstance(digests, dict):
+        raise InvalidRun('Diagnostic artifacts and hashes are missing')
+    paths = {key: artifact(root, artifacts.get(key), f'diagnostic {key}') for key in names}
+    if len(set(paths.values())) != len(names) or \
+            any(path in {p for row in rows for p in row['paths'].values()}
+                for path in paths.values()):
+        raise InvalidRun('Diagnostic artifacts collide with each other or unprofiled samples')
+    for name, path in paths.items():
+        if digests.get(name) != sha256(path):
+            raise InvalidRun(f'Diagnostic {name} SHA-256 mismatch')
+    prefix = Path(str(evidence.get('trace_prefix'))).resolve()
+    if paths['rank0'] != Path(f'{prefix}.rank0.csv') or \
+            paths['rank1'] != Path(f'{prefix}.rank1.csv'):
+        raise InvalidRun('Diagnostic trace prefix does not identify both rank files')
+    command = evidence.get('command')
+    expected = [pbs['launcher'], *sample['argv']]
+    for flag, path in (('--output-csv', paths['csv']),
+                       ('--device-inventory-json', paths['inventory'])):
+        expected[expected.index(flag) + 1] = str(path)
+    expected += ['--diagnostics-prefix', str(prefix)]
+    if command != expected:
+        raise InvalidRun('Diagnostic command differs from the matched sample or trace paths')
+    try:
+        times, mapping = accepted_output(dict(csv=str(paths['csv']),
+                                              log=str(paths['log']),
+                                              inventory=str(paths['inventory']),
+                                              iterations=100))
+    except (ValueError, IndexError) as error:
+        raise InvalidRun(f'Diagnostic sample is not valid: {error}') from error
+    if mapping != sample['mapping']:
+        raise InvalidRun('Diagnostic physical GPU mapping differs from matched sample')
+    log = paths['log'].read_text(encoding='utf-8')
+    if re.findall(r'\bmode=([^\s]+)', log) != ['gpu_opencl'] or \
+            re.findall(r'\bvalidation=([^\s]+)', log) != ['PASS']:
+        raise InvalidRun('Diagnostic GPU mode or numerical validation failed')
+    total = log_number(log, 'total_time_s', 'diagnostic')
+    if total + 1e-9 < max(times.values()):
+        raise InvalidRun('Diagnostic full wall is below a measured phase')
+    validator = Path(__file__).with_name('validate_trace.py')
+    if not validator.is_file():
+        raise InvalidRun('Rank trace validator is unavailable')
+    with tempfile.TemporaryDirectory() as temporary:
+        summary_path = Path(temporary) / 'summary.json'
+        result = subprocess.run([sys.executable, str(validator), str(prefix),
+                                 '--ranks', '2', '--iterations', '100',
+                                 '--elements', '1000000', '--balance-interval', '10',
+                                 '--summary-json', str(summary_path)],
+                                capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise InvalidRun(f'Invalid rank traces: {result.stderr.strip()}')
+        summary = json_file(summary_path)
+    if summary.get('schema_version') != 1 or summary.get('iterations') != 100 or \
+            summary.get('elements') != 1000000 or summary.get('seed') != str(seed) or \
+            summary.get('algorithm') != algorithm:
+        raise InvalidRun('Rank trace summary differs from diagnostic condition')
+    rank_data = summary.get('ranks')
+    if not isinstance(rank_data, list) or len(rank_data) != 2 or \
+            [item.get('rank') for item in rank_data] != [0, 1]:
+        raise InvalidRun('Rank trace summary does not contain both ranks')
+    phase_names = ('runtime_execute', 'rebalance_plan', 'rebalance_apply',
+                   'mpi_step_max', 'mpi_device_times')
+    reconciled = []
+    for rank, item in enumerate(rank_data):
+        if Path(item.get('trace', '')).resolve() != paths[f'rank{rank}']:
+            raise InvalidRun(f'Rank {rank} trace path differs from diagnostic manifest')
+        totals = item.get('host_phase_totals_s')
+        if not isinstance(totals, dict) or any(name not in totals for name in
+              ('loop_total', *phase_names, 'gather', 'reference', 'mpi_validation')) or \
+                'cpu_simulation' in totals:
+            raise InvalidRun(f'Rank {rank} host phases are incomplete or CPU-only')
+        values = {key: finite(value, f'rank {rank} {key}') for key, value in totals.items()}
+        loop = finite(values['loop_total'], f'rank {rank} loop_total', positive=True)
+        host = sum(values[name] for name in phase_names)
+        device = finite(item.get('device_event_total_s'), f'rank {rank} device events')
+        with paths[f'rank{rank}'].open(newline='', encoding='utf-8') as stream:
+            raw = list(csv.DictReader(stream))
+        inventory = [row for row in raw if row['record_type'] == 'inventory']
+        if len(inventory) != 1 or inventory[0]['device_global'] != str(mapping[rank]['global_index']) or \
+                inventory[0]['device_identity'] != \
+                f"{mapping[rank]['identity_kind']}:{mapping[rank]['identity']}":
+            raise InvalidRun(f'Rank {rank} trace GPU identity differs from inventory')
+        reconciled.append(dict(rank=rank, loop=loop, phases=values, host=host,
+                               unaccounted=loop-host, device=device,
+                               trace=paths[f'rank{rank}'], raw=raw,
+                               partition_rows=item.get('partition_rows')))
+    if not math.isclose(max(item['loop'] for item in reconciled),
+                        times['loop_time_s'], rel_tol=1e-4, abs_tol=1e-5):
+        raise InvalidRun('Diagnostic global loop differs from rank-local loop totals')
+    controlling_rank = max(reconciled, key=lambda item: item['loop'])['rank']
+    return dict(manifest=manifest_path, evidence=evidence, matched=sample,
+                times=times, mapping=mapping, ranks=reconciled, paths=paths,
+                controlling_rank=controlling_rank)
+
+
+def render_diagnostic(diag):
+    lines = ['', '## Rank-local diagnostic accounting', '',
+             f"PBS job `{diag['evidence']['pbs']['job_id']}`; traced condition "
+             f"`{diag['evidence']['workload']}` / `{diag['evidence']['algorithm']}` / "
+             f"seed `{diag['evidence']['seed']}`. Diagnostic manifest: "
+             f"`{diag['manifest']}`. The matched unprofiled sample is invocation "
+             f"{diag['matched']['ordinal']} (`{diag['matched']['paths']['manifest']}`).", '',
+             f"Traced loop `{diag['times']['loop_time_s']:.6f}` s; matched unprofiled "
+             f"loop `{diag['matched']['loop']:.6f}` s; one-condition trace overhead "
+             f"ratio `{diag['times']['loop_time_s']/diag['matched']['loop']:.4f}`. "
+             'These diagnostic times do not enter the 30 headline pairs. '
+             f"Rank {diag['controlling_rank']} determines the diagnostic global loop maximum.", '',
+             '| Rank | Loop total (s) | Execute | Rebalance plan/apply | MPI step/device reductions | '
+             'Measured host phases | Unaccounted host (s; % loop) | OpenCL device events (s) | '
+             'Post-loop gather/reference/MPI validation (s) | Trace |',
+             '| ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- |']
+    for item in diag['ranks']:
+        p = item['phases']
+        lines.append(f"| {item['rank']} | {item['loop']:.6f} | "
+                     f"{p['runtime_execute']:.6f} | "
+                     f"{p['rebalance_plan']:.6f} / {p['rebalance_apply']:.6f} | "
+                     f"{p['mpi_step_max']:.6f} / {p['mpi_device_times']:.6f} | "
+                     f"{item['host']:.6f} | {item['unaccounted']:.6f}; "
+                     f"{100 * item['unaccounted'] / item['loop']:.1f}% | "
+                     f"{item['device']:.6f} | "
+                     f"{p['gather']:.6f} / {p['reference']:.6f} / "
+                     f"{p['mpi_validation']:.6f} | `{item['trace']}` |")
+    lines += ['', 'Unaccounted host time is `loop_total` minus nonoverlapping host phases '
+              'on the **same rank**. A positive remainder is a missing measurement; a '
+              'negative remainder indicates overlap or inconsistent boundaries. OpenCL '
+              'event time is a separate, potentially overlapping device timeline and is '
+              'not added to host phases. Post-loop validation is outside `loop_total`. '
+              'Boundary shifts are element-count estimates; transfer bytes are unknown '
+              'unless the trace contains a measured byte count.', '']
+    for item in diag['ranks']:
+        first = [row for row in item['raw'] if row['iteration'] == '0' and
+                 row['record_type'] in ('phase', 'partition', 'device_event')]
+        lines += [f"### Rank {item['rank']}, iteration 0 (before rebalance)", '',
+                  '| Trace seq | Type/phase | Partition | Device/owner | Offset/count | Host duration (s) | '
+                  'Device event (s) |',
+                  '| ---: | --- | ---: | --- | --- | ---: | ---: |']
+        for row in first:
+            lines.append(f"| {row['seq']} | {row['record_type']}/{row['phase']} | "
+                         f"{row['part'] or '-'} | {row['device_global'] or '-'} / "
+                         f"{row['owner_rank'] or '-'} | {row['offset'] or '-'} / "
+                         f"{row['count'] or '-'} | {row['duration_s'] or '-'} | "
+                         f"{row['device_event_s'] or '-'} |")
+        lines.append('')
+    lines += ['The trace establishes timing and partition records for this diagnostic '
+              'invocation only. A seed-dependent causal explanation requires matching '
+              'fast/control traces and, when the seed-123 reversal persists, the separate '
+              'ERAD/HWTOPOLB/ERAD sequence. No causal attribution is made here.', '']
+    return '\n'.join(lines)
+
+
 def render(run, rows, pairs, halo_ok, halo_detail):
     groups = []
     near_or_unstable = False
@@ -374,6 +565,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--diagnostic-manifest', type=Path)
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f'output already exists: {args.output}')
@@ -381,6 +573,9 @@ def main():
         run, rows, pairs = validate(args.run_dir)
         halo_ok, halo_detail = halo_reference(run, args.run_dir.resolve())
         report = render(run, rows, pairs, halo_ok, halo_detail)
+        if args.diagnostic_manifest:
+            diag = diagnostic_evidence(args.diagnostic_manifest, run, rows)
+            report += render_diagnostic(diag)
         with args.output.open('x', encoding='utf-8') as stream:
             stream.write(report)
     except (InvalidRun, OSError, ValueError, TypeError, KeyError, IndexError) as error:

@@ -30,3 +30,9 @@ python3 benchmarks/run_variability.py --execute --mode "${HARMONY_VARIABILITY_MO
     --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \
     --bin-dir "$PBS_O_WORKDIR/build/cluster" \
     --build-manifest "$PBS_O_WORKDIR/build/cluster/build_manifest.json"
+if [[ "${HARMONY_VARIABILITY_MODE:-pilot}" == full && -n "${HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL:-}" ]]; then
+    python3 benchmarks/capture_diagnostic.py --execute \
+        --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \
+        --sample-ordinal "$HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL" \
+        --output-dir "$HARMONY_VARIABILITY_RUN_DIR/diagnostic-${HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL}"
+fi

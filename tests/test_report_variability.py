@@ -1,6 +1,7 @@
 """Command-level checks for the final GPU comparison report."""
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'benchmarks' / 'report_variability.py'
+CAPTURE = Path(__file__).resolve().parents[1] / 'benchmarks' / 'capture_diagnostic.py'
 WORKLOADS = ('kneighbor', 'leanmd')
 SEEDS = (42, 123, 456)
 ALGORITHMS = ('erad', 'hwtopolb')
@@ -94,6 +96,76 @@ class ReportCommandTests(unittest.TestCase):
     def invoke(self, *extra):
         return subprocess.run([sys.executable, str(SCRIPT), '--run-dir', str(self.run),
                                '--output', str(self.output), *extra], capture_output=True, text=True)
+
+    def diagnostic_fixture(self):
+        directory = self.run / 'diagnostic'
+        directory.mkdir()
+        prefix = directory / 'trace'
+        fields = ['schema_version', 'rank', 'seq', 'iteration', 'seed', 'algorithm',
+                  'record_type', 'phase', 'part', 'device_global', 'owner_rank', 'local_index',
+                  'offset', 'count', 'duration_s', 'device_event_s',
+                  'boundary_shift_elements_estimate', 'transfer_bytes_measured',
+                  'device_name', 'device_kind', 'device_identity']
+        for rank in (0, 1):
+            rows = []
+            def add(iteration, kind, phase, **values):
+                row = dict.fromkeys(fields, '')
+                row.update(schema_version='1', rank=str(rank), seq=str(len(rows)),
+                           iteration=str(iteration), seed='42', algorithm='erad',
+                           record_type=kind, phase=phase)
+                row.update({key: str(value) for key, value in values.items()})
+                rows.append(row)
+            add(-1, 'inventory', 'discovered', device_global=rank, owner_rank=rank,
+                local_index=0, device_name='GPU A', device_kind='gpu',
+                device_identity=f'uuid:gpu-{rank}')
+            for iteration in range(100):
+                for state in ('old', 'new'):
+                    for part in (0, 1):
+                        add(iteration, 'partition', state, part=part, device_global=part,
+                            owner_rank=part, local_index=0, offset=part * 500000,
+                            count=500000)
+                if iteration and iteration % 10 == 0:
+                    add(iteration, 'phase', 'rebalance_plan', duration_s=0.01)
+                    add(iteration, 'phase', 'rebalance_apply', duration_s=0.01)
+                add(iteration, 'phase', 'runtime_execute', duration_s=0.004)
+                add(iteration, 'device_event', 'kernel', part=rank, device_global=rank,
+                    owner_rank=rank, local_index=0, offset=rank * 500000, count=500000,
+                    device_event_s=0.003)
+                add(iteration, 'phase', 'mpi_step_max', duration_s=0.001)
+                add(iteration, 'phase', 'mpi_device_times', duration_s=0.001)
+            add(100, 'phase', 'loop_total', duration_s=1.0 if rank == 0 else 0.9)
+            for phase in ('gather', 'reference', 'mpi_validation'):
+                add(100, 'phase', phase, duration_s=0.01)
+            with Path(f'{prefix}.rank{rank}.csv').open('w', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        sample = self.rows[4]
+        diag_csv = directory / 'diagnostic.csv'
+        diag_log = directory / 'diagnostic.log'
+        diag_inventory = directory / 'diagnostic.inventory.json'
+        diag_csv.write_text(Path(sample['csv']).read_text())
+        diag_log.write_text('mode=gpu_opencl loop_time_s=1.0 validation_time_s=0.1 '
+                            'total_time_s=1.2 validation=PASS\n')
+        diag_inventory.write_text(json.dumps(dict(schema_version=1, ranks=self.mapping)))
+        command = ['/bin/prun', *sample['argv']]
+        for flag, path in (('--output-csv', diag_csv),
+                           ('--device-inventory-json', diag_inventory)):
+            command[command.index(flag) + 1] = str(path)
+        command += ['--diagnostics-prefix', str(prefix)]
+        paths = dict(csv=str(diag_csv), log=str(diag_log), inventory=str(diag_inventory),
+                     rank0=f'{prefix}.rank0.csv', rank1=f'{prefix}.rank1.csv')
+        digest = {key: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                  for key, path in paths.items()}
+        manifest = directory / 'diagnostic.manifest.json'
+        manifest.write_text(json.dumps(dict(schema_version=1, status='captured', exit_code=0,
+            pbs=dict(job_id='123.cluster', slots=['node0', 'node1'], launcher='/bin/prun'),
+            build_manifest_sha256='c' * 64, binary_sha256='kneighbor-sha',
+            workload='kneighbor', seed=42, algorithm='erad',
+            matched_sample_manifest=sample['manifest'], command=command,
+            trace_prefix=str(prefix), artifacts=paths, artifact_sha256=digest,
+            started_at='2026-10-13T00:00:01Z', completed_at='2026-10-13T00:00:02Z')))
+        return manifest
 
     def test_complete_matrix_reports_all_adjacent_pairs_without_claiming_cluster_correctness(self):
         result = self.invoke()
@@ -183,6 +255,95 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn('Paired performance supports a useful gain', report)
         self.assertIn('Report status:** provisional', report)
         self.assertIn('No causal attribution', report)
+
+    def test_diagnostic_manifest_adds_rank_local_accounting_without_changing_pairs(self):
+        manifest = self.diagnostic_fixture()
+        result = self.invoke('--diagnostic-manifest', str(manifest))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        self.assertIn('30 adjacent pairs', report)
+        self.assertIn('Rank-local diagnostic accounting', report)
+        self.assertIn('0.220000', report)
+        self.assertIn('0.220000; 22.0%', report)
+        self.assertIn('0.300000', report)
+        self.assertIn('Rank 0 determines the diagnostic global loop maximum', report)
+        self.assertIn('rank0.csv', report)
+        self.assertIn('iteration 0', report)
+        self.assertIn('No causal attribution', report)
+
+    def test_diagnostic_capture_preview_requires_same_pbs_allocation_without_running(self):
+        import os
+        launcher = self.root / 'prun'
+        launcher.write_text('#!/bin/sh\nexit 0\n')
+        launcher.chmod(0o755)
+        binary = self.root / 'kneighbor.out'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
+        binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+        self.rows[4]['argv'][0] = str(binary)
+        sample_path = Path(self.rows[4]['manifest'])
+        sample = json.loads(sample_path.read_text())
+        sample['argv'][0] = str(binary)
+        sample_path.write_text(json.dumps(sample))
+        self.run_data['invocations'][4]['argv'][0] = str(binary)
+        self.run_data['build']['binaries']['kneighbor'] = dict(path=str(binary), sha256=binary_hash)
+        self.run_data['environment']['pbs']['launcher'] = str(launcher)
+        (self.run / 'run_manifest.json').write_text(json.dumps(self.run_data))
+        nodefile = self.root / 'nodefile'
+        nodefile.write_text('node0\nnode1\n')
+        env = dict(os.environ, PBS_JOBID='123.cluster', PBS_NODEFILE=str(nodefile))
+        command = [sys.executable, str(CAPTURE), '--dry-run', '--run-dir', str(self.run),
+                   '--sample-ordinal', '5', '--output-dir', str(self.root / 'diagnostic')]
+        result = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preview = json.loads(result.stdout)
+        self.assertIn('--diagnostics-prefix', preview['command'])
+        self.assertEqual(preview['pbs']['job_id'], '123.cluster')
+        self.assertFalse((self.root / 'diagnostic').exists())
+        env['PBS_JOBID'] = 'other.cluster'
+        refused = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse((self.root / 'diagnostic').exists())
+
+    def test_diagnostic_hash_or_condition_mismatch_fails_before_report(self):
+        manifest_path = self.diagnostic_fixture()
+        original = json.loads(manifest_path.read_text())
+        for altered in [dict(original, seed=123),
+                        dict(original, artifact_sha256=dict(original['artifact_sha256'],
+                            rank0='0' * 64)),
+                        dict(original, pbs=dict(original['pbs'], job_id='different.cluster'))]:
+            with self.subTest(change=altered):
+                manifest_path.write_text(json.dumps(altered))
+                result = self.invoke('--diagnostic-manifest', str(manifest_path))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
+
+    def test_diagnostic_trace_validator_rejects_missing_rank_without_report(self):
+        manifest_path = self.diagnostic_fixture()
+        manifest = json.loads(manifest_path.read_text())
+        rank1 = Path(manifest['artifacts']['rank1'])
+        rank1.unlink()
+        result = self.invoke('--diagnostic-manifest', str(manifest_path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_diagnostic_trace_validator_rejects_corrupt_sequence_with_matching_hash(self):
+        manifest_path = self.diagnostic_fixture()
+        manifest = json.loads(manifest_path.read_text())
+        rank0 = Path(manifest['artifacts']['rank0'])
+        with rank0.open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        rows[2]['seq'] = rows[1]['seq']
+        with rank0.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        manifest['artifact_sha256']['rank0'] = hashlib.sha256(rank0.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        result = self.invoke('--diagnostic-manifest', str(manifest_path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Invalid rank traces', result.stderr)
+        self.assertFalse(self.output.exists())
 
     def test_rejected_manifest_and_nonfinite_loop_are_refused(self):
         row = self.rows[4]
