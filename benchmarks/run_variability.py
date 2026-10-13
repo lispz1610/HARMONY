@@ -218,7 +218,7 @@ def execute(args, rows):
                 check['rejection_reason'] = 'Asynchronous halo reference timed out'
         if check['status'] != 'rejected':
             output = halo_log.read_text(encoding='utf-8')
-            if check['exit_code'] == 0 and output.count(
+            if check['exit_code'] == 0 and output.splitlines().count(
                     'PASS: asynchronous OpenCL halo matches two-step CPU reference') == 1 \
                     and 'SKIP:' not in output:
                 check['status'] = 'passed'

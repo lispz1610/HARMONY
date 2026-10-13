@@ -19,6 +19,9 @@ if sys.argv[1].endswith('test_async_halo_opencl.out'):
     if os.environ.get('FAKE_HALO_FAIL'):
         print('SKIP: asynchronous halo test needs two OpenCL GPU partitions')
         sys.exit(77)
+    if os.environ.get('FAKE_HALO_FALSE_PASS'):
+        print('NOT PASS: asynchronous OpenCL halo matches two-step CPU reference')
+        sys.exit(0)
     print('PASS: asynchronous OpenCL halo matches two-step CPU reference')
     sys.exit(0)
 def value(name):
@@ -155,6 +158,18 @@ class ExecuteGates(unittest.TestCase):
             self.assertEqual(run['status'], 'rejected')
             self.assertEqual(run['halo_reference']['status'], 'rejected')
             self.assertIn('SKIP:', (root / 'run' / 'halo_reference.log').read_text())
+            self.assertEqual(list((root / 'run').rglob('*.manifest.json')), [])
+
+    def test_full_run_rejects_non_exact_halo_pass_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'full'
+            env['FAKE_HALO_FALSE_PASS'] = '1'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(process.returncode, 0)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['halo_reference']['status'], 'rejected')
             self.assertEqual(list((root / 'run').rglob('*.manifest.json')), [])
 
     def test_full_run_accepts_matrix_only_after_halo_reference_passes(self):
