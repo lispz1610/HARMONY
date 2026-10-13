@@ -1474,7 +1474,7 @@ public:
     }
 
     void print_partition_loads(const std::vector<float>& loads) const {
-        if (rank_ != 0) return;
+        if (!verbose_metrics_ || rank_ != 0) return;
 
         const std::vector<float> individual = detail::cumulative_to_individual(loads);
 

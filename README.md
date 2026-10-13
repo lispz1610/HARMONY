@@ -412,6 +412,10 @@ mpirun -n 1 ./tests/test_runtime_metrics.out
 mpirun -n 2 ./tests/test_runtime_metrics.out
 ```
 
+For a local simulated overhead probe, pass `--measure`; its results must not
+be interpreted as GPU performance. See the runtime metric mode diagnostic in
+`docs/` for the measured local condition and limits.
+
 Or use the automation script (sets `MPI_LAUNCHER` if needed):
 
 ```bash
