@@ -351,7 +351,7 @@ def diagnostic_evidence(manifest_path, run, rows):
                 'cpu_simulation' in totals:
             raise InvalidRun(f'Rank {rank} host phases are incomplete or CPU-only')
         values = {key: finite(value, f'rank {rank} {key}') for key, value in totals.items()}
-        loop = values['loop_total']
+        loop = finite(values['loop_total'], f'rank {rank} loop_total', positive=True)
         host = sum(values[name] for name in phase_names)
         device = finite(item.get('device_event_total_s'), f'rank {rank} device events')
         with paths[f'rank{rank}'].open(newline='', encoding='utf-8') as stream:
@@ -368,8 +368,10 @@ def diagnostic_evidence(manifest_path, run, rows):
     if not math.isclose(max(item['loop'] for item in reconciled),
                         times['loop_time_s'], rel_tol=1e-4, abs_tol=1e-5):
         raise InvalidRun('Diagnostic global loop differs from rank-local loop totals')
+    controlling_rank = max(reconciled, key=lambda item: item['loop'])['rank']
     return dict(manifest=manifest_path, evidence=evidence, matched=sample,
-                times=times, mapping=mapping, ranks=reconciled, paths=paths)
+                times=times, mapping=mapping, ranks=reconciled, paths=paths,
+                controlling_rank=controlling_rank)
 
 
 def render_diagnostic(diag):
@@ -382,9 +384,10 @@ def render_diagnostic(diag):
              f"Traced loop `{diag['times']['loop_time_s']:.6f}` s; matched unprofiled "
              f"loop `{diag['matched']['loop']:.6f}` s; one-condition trace overhead "
              f"ratio `{diag['times']['loop_time_s']/diag['matched']['loop']:.4f}`. "
-             'These diagnostic times do not enter the 30 headline pairs.', '',
+             'These diagnostic times do not enter the 30 headline pairs. '
+             f"Rank {diag['controlling_rank']} determines the diagnostic global loop maximum.", '',
              '| Rank | Loop total (s) | Execute | Rebalance plan/apply | MPI step/device reductions | '
-             'Measured host phases | Unaccounted host (s) | OpenCL device events (s) | '
+             'Measured host phases | Unaccounted host (s; % loop) | OpenCL device events (s) | '
              'Post-loop gather/reference/MPI validation (s) | Trace |',
              '| ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- |']
     for item in diag['ranks']:
@@ -393,7 +396,8 @@ def render_diagnostic(diag):
                      f"{p['runtime_execute']:.6f} | "
                      f"{p['rebalance_plan']:.6f} / {p['rebalance_apply']:.6f} | "
                      f"{p['mpi_step_max']:.6f} / {p['mpi_device_times']:.6f} | "
-                     f"{item['host']:.6f} | {item['unaccounted']:.6f} | "
+                     f"{item['host']:.6f} | {item['unaccounted']:.6f}; "
+                     f"{100 * item['unaccounted'] / item['loop']:.1f}% | "
                      f"{item['device']:.6f} | "
                      f"{p['gather']:.6f} / {p['reference']:.6f} / "
                      f"{p['mpi_validation']:.6f} | `{item['trace']}` |")
