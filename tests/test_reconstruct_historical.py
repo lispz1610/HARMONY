@@ -108,6 +108,17 @@ class ReconstructionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.out.exists())
 
+    def test_orphan_records_are_rejected(self):
+        base = self.log.read_text()
+        for text in ["  device_times_s:\n" + base,
+                     base + "    part[0]=0.00001\n"]:
+            with self.subTest(text=text[:30]):
+                self.write_log(text)
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unjoinable", result.stderr)
+                self.assertFalse(self.out.exists())
+
     def test_wrong_global_count_is_rejected(self):
         result = subprocess.run([sys.executable, str(COMMAND), "--run-dir", str(self.run),
                                  "--output-dir", str(self.out), "--workloads", "kneighbor",

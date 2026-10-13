@@ -77,12 +77,18 @@ def records_for_log(path, iterations, global_count):
             section = "boundary"
             continue
         if line == "  device_times_s:":
+            if current is None:
+                raise InvalidRun(f"{path}:{line_no}: unjoinable device event section")
             section = "events"
             continue
         if line == "  OLD loads:":
+            if current is None:
+                raise InvalidRun(f"{path}:{line_no}: unjoinable old partition section")
             section = "old"
             continue
         if line == "  CURRENT loads:":
+            if current is None:
+                raise InvalidRun(f"{path}:{line_no}: unjoinable current partition section")
             section = "current"
             continue
         if line.startswith("    part[") and section == "events":
@@ -98,6 +104,8 @@ def records_for_log(path, iterations, global_count):
             target = boundaries[-1]["parts"] if section == "boundary" else current[section]
             target.append(parse_partition(line, f"{path}:{line_no}"))
             continue
+        if re.match(r"^\s+part\[", line):
+            raise InvalidRun(f"{path}:{line_no}: unjoinable partition or device event record")
         if line.strip().startswith("total=") or line.strip().startswith("total_share="):
             section = None
         elif line.startswith("[") and not metric:
