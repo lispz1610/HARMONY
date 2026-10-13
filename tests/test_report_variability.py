@@ -209,6 +209,36 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn('-1.000000', report)
         self.assertIn('may each be maxima from different ranks', report)
 
+    def test_early_late_drift_blocks_gain_even_when_iqr_is_small(self):
+        ratios = (1.2, 1.2, 1.25, 1.321, 1.321)
+        for row in self.rows:
+            if row['phase'] != 'full' or row['workload'] != 'kneighbor' or \
+                    row['seed'] != 42 or row['algorithm'] != 'hwtopolb':
+                continue
+            loop = 1 / ratios[row['repetition'] - 1]
+            log_path = Path(row['log'])
+            log_path.write_text(log_path.read_text().replace('loop_time_s=0.8',
+                                                        f'loop_time_s={loop}'))
+            manifest_path = Path(row['manifest'])
+            sample = json.loads(manifest_path.read_text())
+            sample['times']['loop_time_s'] = loop
+            manifest_path.write_text(json.dumps(sample))
+        halo = self.run / 'halo_reference.log'
+        halo.write_text('PASS: asynchronous OpenCL halo matches two-step CPU reference\n')
+        self.run_data['halo_reference'] = dict(command=['/bin/prun',
+            '/bin/test_async_halo_opencl.out'], log=str(halo),
+            binary_sha256='a' * 64, status='passed', exit_code=0)
+        (self.run / 'run_manifest.json').write_text(json.dumps(self.run_data))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        group = next(line for line in report.splitlines()
+                     if line.startswith('| kneighbor | 42 |'))
+        self.assertIn('| 1.2000 | 1.3210 |', group)
+        self.assertTrue(group.endswith('| no |'))
+        self.assertIn('inconclusive', report.lower())
+        self.assertIn('UTC end ERAD/HWTOPOLB', report)
+
 
 if __name__ == '__main__':
     unittest.main()

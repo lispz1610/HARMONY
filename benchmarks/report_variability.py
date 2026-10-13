@@ -250,12 +250,19 @@ def render(run, rows, pairs, halo_ok, halo_detail):
             median = statistics.median(ratios)
             q1, q3 = quartiles(ratios)
             spread = q3 - q1
-            stable = spread / median <= 0.10 and q1 >= THRESHOLD
+            early = statistics.median(p['ratio'] for p in group[:2])
+            late = statistics.median(p['ratio'] for p in group[-2:])
+            drift = abs(late - early) / early > 0.10
+            stable = spread / median <= 0.10 and q1 >= THRESHOLD and not drift
             near = abs(median - THRESHOLD) <= spread
             near_or_unstable |= near or not stable
             reversal |= median <= 1
             all_gain &= median >= THRESHOLD and stable
-            groups.append((workload, seed, median, min(ratios), max(ratios), q1, q3, stable))
+            erad_loops = [p['erad']['loop'] for p in group]
+            hwtopolb_loops = [p['hwtopolb']['loop'] for p in group]
+            groups.append((workload, seed, median, min(ratios), max(ratios), q1, q3,
+                           early, late, min(erad_loops), max(erad_loops),
+                           min(hwtopolb_loops), max(hwtopolb_loops), stable))
     verdict = ('Paired performance supports a useful gain for these workloads, seeds, '
                'and allocation only; variance diagnosis remains provisional pending '
                'rank-local traces.'
@@ -295,19 +302,28 @@ def render(run, rows, pairs, halo_ok, halo_detail):
               f'Validated {len(pairs)} adjacent pairs from five rotated repetitions. '
               'The primary metric is the complete 100-iteration loop through its MPI reductions; '
               'final gather/reference validation is excluded. All headline pairs are unprofiled.', '',
-              '| Workload | Seed | Median ERAD/HWTOPOLB | Min | Max | Q1 | Q3 | Stable |',
-              '| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
-    for workload, seed, median, minimum, maximum, q1, q3, stable in groups:
+              '| Workload | Seed | Median ERAD/HWTOPOLB | Min | Max | Q1 | Q3 | '
+              'Early pair median | Late pair median | ERAD loop range (s) | '
+              'HWTOPOLB loop range (s) | Stable |',
+              '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | '
+              '--- | --- | --- |']
+    for workload, seed, median, minimum, maximum, q1, q3, early, late, \
+            erad_min, erad_max, hwt_min, hwt_max, stable in groups:
         lines.append(f'| {workload} | {seed} | {median:.4f} | {minimum:.4f} | '
-                     f'{maximum:.4f} | {q1:.4f} | {q3:.4f} | {"yes" if stable else "no"} |')
+                     f'{maximum:.4f} | {q1:.4f} | {q3:.4f} | {early:.4f} | '
+                     f'{late:.4f} | {erad_min:.6f}–{erad_max:.6f} | '
+                     f'{hwt_min:.6f}–{hwt_max:.6f} | {"yes" if stable else "no"} |')
     lines += ['', 'Q1 and Q3 are Tukey hinges (the medians of the lower and upper two '
               'values among five sorted ratios). Stability requires (Q3-Q1)/median <= 0.10 '
-              'and Q1 >= 1/0.9. A useful gain requires each seed median >= 1/0.9 '
+              'and Q1 >= 1/0.9, with early-versus-late paired-ratio median drift '
+              '<= 10% (first two versus last two pairs in run order). '
+              'A useful gain requires each seed median >= 1/0.9 '
               'and stable repeats; pooling seeds is not allowed.', '',
               '| Pair | Run order | ERAD ordinal/loop (s) | HWTOPOLB ordinal/loop (s) | '
               'Paired ratio | ERAD/HWTOPOLB full wall (s) | Validation (s) | '
-              'Loop minus sum of step maxima (s) | UTC start ERAD/HWTOPOLB | Raw CSV/log |',
-              '| --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |']
+              'Loop minus sum of step maxima (s) | UTC start ERAD/HWTOPOLB | '
+              'UTC end ERAD/HWTOPOLB | Raw CSV/log |',
+              '| --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |']
     for p in pairs:
         a, b = p['erad'], p['hwtopolb']
         lines.append(f"| {p['id']} | {p['order']} | {a['ordinal']} / {a['loop']:.6f} | "
@@ -318,6 +334,8 @@ def render(run, rows, pairs, halo_ok, halo_detail):
                      f"{b['loop'] - b['step_sum']:.6f} | "
                      f"{a['started_at'] or 'unavailable'} / "
                      f"{b['started_at'] or 'unavailable'} | "
+                     f"{a['completed_at'] or 'unavailable'} / "
+                     f"{b['completed_at'] or 'unavailable'} | "
                      f"`{a['csv']}`; `{a['log']}`; `{b['csv']}`; `{b['log']}` |")
     lines += ['', f'**Verdict:** {verdict}', '',
               '## Timing interpretation and cause', '',
