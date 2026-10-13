@@ -401,6 +401,41 @@ and balancing inputs active. The default remains verbose for existing callers.
 Compare the modes only under the same allocation and workload; the diagnostic
 overhead is separate from any algorithm speedup claim.
 
+For admitted two-rank GPU timing, pass `--require-two-rank-gpu` and
+`--device-inventory-json PATH` to either benchmark. The command exits before
+creating the step CSV unless there are exactly two ranks, exactly one OpenCL
+GPU per rank, and distinct verifiable physical identities. The inventory is
+one JSON file with `schema_version: 1` and rank-ordered `ranks` records. Each
+record includes the MPI host and rank, GPU count, local and global device
+indices, GPU and OpenCL platform names, platform and device versions, driver
+version, and an `identity_kind` / `identity` pair. Identity is either a device
+UUID or a PCI address qualified by the host. A missing identity is recorded as
+`unavailable` and rejected in strict mode. Save and compare this inventory for
+both conditions in each adjacent pair; a model name or runtime index alone
+does not identify a physical GPU.
+
+The summary retains `total_time_s` for historical consumers and adds
+`loop_time_s`, `validation_time_s`, and `validation=PASS`. The primary
+`loop_time_s` starts before iteration zero and ends immediately after the last
+iteration's benchmark MPI reductions. Final gather and scalar reference check
+run afterward; their rank-local intervals are reduced separately to produce
+`validation_time_s`. The full `total_time_s` retains its existing broader
+scope. A failed numerical check aborts without a PASS summary. K-neighbor uses
+an absolute tolerance of `1e-5`; LeanMD uses `1e-4 + 1e-4 * abs(reference)`.
+Both reject nonfinite results and references.
+
+Run the focused command-interface test after building both binaries:
+
+```bash
+python3 tests/test_benchmark_sample_contract.py ./kneighbor.out ./leanmd.out
+```
+
+This local test covers CPU simulation output and collective sample rejection.
+It does not validate an OpenCL kernel or a physical GPU mapping. The latter
+requires a PBS two-rank job on the cluster, with one GPU exposed to each rank;
+inspect the JSON inventory and require `validation=PASS` in both logs before
+admitting either timing sample.
+
 The public runtime control is `set_verbose_metrics(bool)`. The focused
 simulation test can be built and run with:
 
