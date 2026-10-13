@@ -49,6 +49,9 @@ def main():
                 library, '-o', str(binary)]
         data['commands'][workload] = argv
         data['binaries'][workload] = dict(path=str(binary), sha256=sha256(binary))
+    halo = bin_dir / 'test_async_halo_opencl.out'
+    data['binaries']['test_async_halo_opencl'] = dict(
+        path=str(halo), sha256=sha256(halo))
     destination = bin_dir / 'build_manifest.json'
     temporary = destination.with_name(destination.name + '.tmp')
     with open(temporary, 'w', encoding='utf-8') as stream:

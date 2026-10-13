@@ -84,7 +84,7 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations):
 def build_verified(bin_dir, manifest_path):
     with open(manifest_path, encoding='utf-8') as stream:
         manifest = json.load(stream)
-    for workload in WORKLOADS:
+    for workload in (*WORKLOADS, 'test_async_halo_opencl'):
         binary = bin_dir / f'{workload}.out'
         recorded = manifest['binaries'][workload]
         if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -200,6 +200,38 @@ def execute(args, rows):
                                      kneighbor_k=5, leanmd_cutoff=4),
                invocations=rows)
     write_json(args.run_dir / 'run_manifest.json', run)
+    if args.mode == 'full':
+        halo = bin_dir / 'test_async_halo_opencl.out'
+        halo_log = args.run_dir / 'halo_reference.log'
+        check = dict(command=[pbs['launcher'], str(halo)], log=str(halo_log),
+                     binary_sha256=build['binaries']['test_async_halo_opencl']['sha256'],
+                     status='running', exit_code=None)
+        run['halo_reference'] = check
+        write_json(args.run_dir / 'run_manifest.json', run)
+        with open(halo_log, 'x', encoding='utf-8') as log:
+            try:
+                result = subprocess.run(check['command'], stdout=log,
+                                        stderr=subprocess.STDOUT, timeout=180, check=False)
+                check['exit_code'] = result.returncode
+            except subprocess.TimeoutExpired:
+                check['status'] = 'rejected'
+                check['rejection_reason'] = 'Asynchronous halo reference timed out'
+        if check['status'] != 'rejected':
+            output = halo_log.read_text(encoding='utf-8')
+            if check['exit_code'] == 0 and output.count(
+                    'PASS: asynchronous OpenCL halo matches two-step CPU reference') == 1 \
+                    and 'SKIP:' not in output:
+                check['status'] = 'passed'
+            else:
+                check['status'] = 'rejected'
+                check['rejection_reason'] = 'Two-rank asynchronous OpenCL halo reference did not pass'
+        if check['status'] != 'passed':
+            run['status'] = 'rejected'
+            run['rejected_samples'] = 0
+            run['completed_at'] = datetime.now(timezone.utc).isoformat()
+            write_json(args.run_dir / 'run_manifest.json', run)
+            return 1
+        write_json(args.run_dir / 'run_manifest.json', run)
     baseline = None
     pairs = {}
     failures = 0

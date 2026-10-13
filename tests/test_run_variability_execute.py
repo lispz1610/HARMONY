@@ -15,6 +15,12 @@ from pathlib import Path
 if '--version' in sys.argv:
     print('fake-prun 1.0')
     sys.exit(0)
+if sys.argv[1].endswith('test_async_halo_opencl.out'):
+    if os.environ.get('FAKE_HALO_FAIL'):
+        print('SKIP: asynchronous halo test needs two OpenCL GPU partitions')
+        sys.exit(77)
+    print('PASS: asynchronous OpenCL halo matches two-step CPU reference')
+    sys.exit(0)
 def value(name):
     return sys.argv[sys.argv.index(name) + 1]
 output = Path(value('--output-csv'))
@@ -48,10 +54,13 @@ class ExecuteGates(unittest.TestCase):
             binary = binaries / (workload + '.out')
             binary.write_text('#!/bin/sh\nexit 0\n')
             binary.chmod(0o755)
+        halo = binaries / 'test_async_halo_opencl.out'
+        halo.write_text('#!/bin/sh\nexit 0\n')
+        halo.chmod(0o755)
         manifest = binaries / 'build_manifest.json'
         manifest.write_text(json.dumps({'binaries': {
             workload: {'sha256': hashlib.sha256((binaries / (workload + '.out')).read_bytes()).hexdigest()}
-            for workload in ('kneighbor', 'leanmd')}}))
+            for workload in ('kneighbor', 'leanmd', 'test_async_halo_opencl')}}))
         launcher = root / 'prun'
         launcher.write_text(FAKE_PRUN)
         launcher.chmod(0o755)
@@ -133,6 +142,33 @@ class ExecuteGates(unittest.TestCase):
             second = subprocess.run(command, env=env, capture_output=True, text=True)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn('File exists', second.stderr)
+
+    def test_full_run_stops_before_samples_when_halo_reference_skips(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'full'
+            env['FAKE_HALO_FAIL'] = '1'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(process.returncode, 0)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['status'], 'rejected')
+            self.assertEqual(run['halo_reference']['status'], 'rejected')
+            self.assertIn('SKIP:', (root / 'run' / 'halo_reference.log').read_text())
+            self.assertEqual(list((root / 'run').rglob('*.manifest.json')), [])
+
+    def test_full_run_accepts_matrix_only_after_halo_reference_passes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'full'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['halo_reference']['status'], 'passed')
+            self.assertEqual(run['halo_reference']['exit_code'], 0)
+            self.assertEqual(run['status'], 'completed')
+            self.assertEqual(len(list((root / 'run').rglob('*.manifest.json'))), 64)
 
 
 if __name__ == '__main__':
