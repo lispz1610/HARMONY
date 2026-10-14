@@ -46,6 +46,7 @@ class ReportCommandTests(unittest.TestCase):
                                  f'r{repetition}_{workload}_{seed}')
         self.run_data = dict(schema_version=1, mode='full', status='completed',
                              rejected_samples=0, invocations=self.rows,
+                             baseline_mapping=self.mapping,
                              build_manifest='/build/manifest.json', build_manifest_sha256='c' * 64,
                              build=dict(source_revision='deadbeef',
                                         binaries={**{name: dict(sha256=name + '-sha') for name in WORKLOADS},
@@ -91,7 +92,8 @@ class ReportCommandTests(unittest.TestCase):
                                     'validation=PASS\n')
         Path(row['inventory']).write_text(json.dumps(dict(schema_version=1, ranks=self.mapping)))
         Path(row['manifest']).write_text(json.dumps(dict(row, status='accepted',
-            rejection_reason=None, build_manifest_sha256='c' * 64, mapping=self.mapping,
+            rejection_reason=None, exit_code=0,
+            build_manifest_sha256='c' * 64, mapping=self.mapping,
             times=dict(loop_time_s=loop, validation_time_s=0.1),
             started_at='2026-10-13T00:00:00Z', completed_at='2026-10-13T00:00:01Z')))
 
@@ -200,6 +202,21 @@ class ReportCommandTests(unittest.TestCase):
         inventory = json.loads(original_inventory)
         inventory['ranks'][0]['identity'] = 'different'
         inventory_path.write_text(json.dumps(inventory))
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_nonzero_exit_or_changed_run_baseline_is_rejected(self):
+        sample_path = Path(self.rows[4]['manifest'])
+        sample = json.loads(sample_path.read_text())
+        sample['exit_code'] = 17
+        sample_path.write_text(json.dumps(sample))
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.assertFalse(self.output.exists())
+        sample['exit_code'] = 0
+        sample_path.write_text(json.dumps(sample))
+        run = dict(self.run_data, baseline_mapping=[dict(self.mapping[0], identity='other'),
+                                                    self.mapping[1]])
+        (self.run / 'run_manifest.json').write_text(json.dumps(run))
         self.assertNotEqual(self.invoke().returncode, 0)
         self.assertFalse(self.output.exists())
 

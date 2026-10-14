@@ -56,7 +56,7 @@ class PilotAnalysisTests(unittest.TestCase):
                                                     'total_time_s=0.17 validation=PASS\n')
                         Path(row['inventory']).write_text(json.dumps(dict(schema_version=1, ranks=mapping)))
                         Path(row['manifest']).write_text(json.dumps(dict(row, status='accepted',
-                            rejection_reason=None, build_manifest_sha256='abc',
+                            rejection_reason=None, exit_code=0, build_manifest_sha256='abc',
                             times=dict(loop_time_s=0.16, validation_time_s=0.01),
                             mapping=mapping)))
         (self.run / 'run_manifest.json').write_text(json.dumps(dict(schema_version=1, mode='pilot',
@@ -140,6 +140,16 @@ class PilotAnalysisTests(unittest.TestCase):
         result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Run baseline mapping differs', result.stderr)
+        self.assertFalse((self.root / 'report.md').exists())
+
+    def test_accepted_sample_requires_successful_launcher_exit(self):
+        path = Path(self.rows[0]['manifest'])
+        sample = json.loads(path.read_text())
+        sample['exit_code'] = 7
+        path.write_text(json.dumps(sample))
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('launcher exit', result.stderr)
         self.assertFalse((self.root / 'report.md').exists())
 
     def test_malformed_sample_timing_is_rejected_without_traceback(self):

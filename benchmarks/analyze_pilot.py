@@ -132,8 +132,9 @@ def analyze(run_dir):
             raise InvalidPilot(f'{context}: duplicate artifact path')
         used_paths.update(paths.values())
         sample = required_json(paths['manifest'])
-        if sample.get('status') != 'accepted' or sample.get('rejection_reason') is not None:
-            raise InvalidPilot(f'{context}: sample was not accepted')
+        if sample.get('status') != 'accepted' or sample.get('rejection_reason') is not None or \
+                sample.get('exit_code') != 0:
+            raise InvalidPilot(f'{context}: sample was not accepted or launcher exit was nonzero')
         if any(sample.get(key) != row[key] for key in ('phase', 'ordinal', 'repetition',
                'workload', 'seed', 'algorithm', 'pair_id', 'iterations', 'csv', 'log',
                'inventory', 'manifest')):

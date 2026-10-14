@@ -37,7 +37,9 @@ with output.open('w', newline='') as stream:
     writer.writerow(['iteration', 'step_time_s', 'action', 'rebalanced',
                      'rebalance_gain', 'execution_mode'])
     for step in range(count):
-        writer.writerow([step, '0.1', 'compute', 0, 0, mode])
+        rebalance = step > 0 and step % 10 == 0
+        writer.writerow([step, '0.1', 'rebalance' if rebalance else 'compute',
+                         int(rebalance), 0, mode])
 identity = 'changed' if os.environ.get('FAKE_MAPPING') and 'hwtopolb' in output.name else 'gpu'
 ranks = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0, global_index=rank,
               name='fake GPU', platform_name='fake', platform_version='3.0',
@@ -68,7 +70,8 @@ class ExecuteGates(unittest.TestCase):
         halo.chmod(0o755)
         manifest = binaries / 'build_manifest.json'
         manifest.write_text(json.dumps({'binaries': {
-            workload: {'sha256': hashlib.sha256((binaries / (workload + '.out')).read_bytes()).hexdigest()}
+            workload: {'path': str(binaries / (workload + '.out')),
+                       'sha256': hashlib.sha256((binaries / (workload + '.out')).read_bytes()).hexdigest()}
             for workload in ('kneighbor', 'leanmd', 'test_async_halo_opencl')}}))
         launcher = root / 'prun'
         launcher.write_text(FAKE_PRUN)
@@ -242,6 +245,13 @@ class ExecuteGates(unittest.TestCase):
             self.assertEqual(run['halo_reference']['exit_code'], 0)
             self.assertEqual(run['status'], 'completed')
             self.assertEqual(len(list((root / 'run').rglob('*.manifest.json'))), 64)
+            report = subprocess.run(
+                [sys.executable, str(SCRIPT.with_name('report_variability.py')),
+                 '--run-dir', str(root / 'run'), '--output', str(root / 'full-report.md')],
+                capture_output=True, text=True)
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertIn('Validated 30 adjacent pairs',
+                          (root / 'full-report.md').read_text())
 
 
 if __name__ == '__main__':

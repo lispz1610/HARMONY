@@ -121,6 +121,7 @@ def validate(run_dir):
         used.update(paths.values())
         sample = json_file(paths['manifest'])
         if sample.get('status') != 'accepted' or sample.get('rejection_reason') is not None or \
+                sample.get('exit_code') != 0 or \
                 sample.get('build_manifest_sha256') != run['build_manifest_sha256'] or \
                 any(sample.get(key) != item[key] for key in
                     ('phase', 'ordinal', 'repetition', 'workload', 'seed', 'algorithm',
@@ -134,6 +135,8 @@ def validate(run_dir):
             raise InvalidRun(f'{label}: physical GPU mapping differs from inventory')
         if baseline is None:
             baseline = mapping
+            if run.get('baseline_mapping') != mapping:
+                raise InvalidRun('Run baseline mapping differs from device inventory')
         elif mapping != baseline:
             raise InvalidRun(f'{label}: physical GPU mapping changed')
         for key, value in times.items():
@@ -299,6 +302,7 @@ def aba_evidence(run_dir, full_run):
                  for key in ('csv', 'log', 'inventory', 'manifest')}
         sample = json_file(paths['manifest'])
         if sample.get('status') != 'accepted' or sample.get('rejection_reason') is not None or \
+                sample.get('exit_code') != 0 or \
                 sample.get('build_manifest_sha256') != run['build_manifest_sha256'] or \
                 any(sample.get(key) != row[key] for key in reference if key in row):
             raise InvalidRun(f'{label}: rejected or inconsistent sample manifest')
@@ -310,6 +314,8 @@ def aba_evidence(run_dir, full_run):
             raise InvalidRun(f'{label}: manifest differs from raw GPU evidence')
         if baseline is None:
             baseline = mapping
+            if run.get('baseline_mapping') != mapping:
+                raise InvalidRun('A/B/A baseline mapping differs from device inventory')
         elif mapping != baseline:
             raise InvalidRun(f'{label}: physical rank-to-GPU mapping changed')
         total = log_number(paths['log'].read_text(encoding='utf-8'), 'total_time_s', label)
