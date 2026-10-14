@@ -34,9 +34,10 @@ count = int(value('--iterations'))
 mode = 'cpu_simulation' if os.environ.get('FAKE_CPU') else 'gpu_opencl'
 with output.open('w', newline='') as stream:
     writer = csv.writer(stream)
-    writer.writerow(['iteration', 'step_time_s', 'execution_mode'])
+    writer.writerow(['iteration', 'step_time_s', 'action', 'rebalanced',
+                     'rebalance_gain', 'execution_mode'])
     for step in range(count):
-        writer.writerow([step, '0.1', mode])
+        writer.writerow([step, '0.1', 'compute', 0, 0, mode])
 identity = 'changed' if os.environ.get('FAKE_MAPPING') and 'hwtopolb' in output.name else 'gpu'
 ranks = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0, global_index=rank,
               name='fake GPU', platform_name='fake', platform_version='3.0',
@@ -47,7 +48,8 @@ if os.environ.get('FAKE_WRONG_GPU_COUNT'):
     ranks[1]['gpu_count'] = 2
 Path(value('--device-inventory-json')).write_text(json.dumps({'schema_version': 1, 'ranks': ranks}))
 summary_mode = 'cpu_simulation' if os.environ.get('FAKE_SUMMARY_CPU') else mode
-print(f'mode={summary_mode} validation=PASS loop_time_s=1.0 validation_time_s=0.1')
+print(f'mode={summary_mode} validation=PASS loop_time_s=1.0 '
+      'validation_time_s=0.1 total_time_s=1.1')
 if os.environ.get('FAKE_CONFLICTING_VALIDATION'):
     print('validation=FAIL loop_time_s=2.0')
 '''
@@ -160,6 +162,12 @@ class ExecuteGates(unittest.TestCase):
             samples = [json.loads(path.read_text()) for path in (root / 'run').rglob('*.manifest.json')]
             self.assertTrue(all(row['exit_code'] == 0 for row in samples))
             self.assertEqual(len(list((root / 'run').rglob('*.manifest.json'))), 24)
+            analysis = subprocess.run(
+                [sys.executable, str(SCRIPT.with_name('analyze_pilot.py')),
+                 '--run-dir', str(root / 'run'), '--output', str(root / 'pilot-report.md')],
+                capture_output=True, text=True)
+            self.assertEqual(analysis.returncode, 0, analysis.stderr)
+            self.assertIn('24 accepted', (root / 'pilot-report.md').read_text())
             second = subprocess.run(command, env=env, capture_output=True, text=True)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn('File exists', second.stderr)

@@ -71,7 +71,10 @@ def mapping_from(inventory, context):
             raise InvalidPilot(f'{context}: expected exactly one GPU per rank')
         if rank['identity_kind'] not in ('uuid', 'pci') or not rank['identity']:
             raise InvalidPilot(f'{context}: unverifiable physical device mapping')
-        result.append({field: rank[field] for field in MAPPING_FIELDS})
+        result.append({**{field: rank[field] for field in MAPPING_FIELDS},
+                       'cpu_affinity': rank.get('cpu_affinity',
+                                                {'value': None,
+                                                 'unavailable_reason': 'not recorded'})})
     if len({(item['host'], item['identity_kind'], item['identity']) for item in result}) != 2:
         raise InvalidPilot(f'{context}: ranks resolved to the same physical GPU')
     uuids = [item['identity'] for item in result if item['identity_kind'] == 'uuid']
@@ -142,6 +145,8 @@ def analyze(run_dir):
             raise InvalidPilot(f'{context}: accepted mapping differs from device inventory')
         if baseline is None:
             baseline = mapping
+            if run.get('baseline_mapping') != mapping:
+                raise InvalidPilot('Run baseline mapping differs from device inventory')
         elif mapping != baseline:
             raise InvalidPilot(f'{context}: physical GPU mapping changed during pilot')
         try:

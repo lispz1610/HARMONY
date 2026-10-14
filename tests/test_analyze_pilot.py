@@ -34,7 +34,8 @@ class PilotAnalysisTests(unittest.TestCase):
                         mapping = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0,
                                         global_index=rank, name='GPU A', platform_name='Vendor',
                                         platform_version='OpenCL 3.0', device_version='OpenCL 3.0',
-                                        driver_version='1', identity_kind='uuid', identity=f'gpu-{rank}')
+                                        driver_version='1', identity_kind='uuid', identity=f'gpu-{rank}',
+                                        cpu_affinity=dict(value=str(rank), unavailable_reason=None))
                                    for rank in (0, 1)]
                         row = dict(phase='pilot', ordinal=ordinal, repetition=repetition,
                                    workload=workload, seed=seed, algorithm=algorithm,
@@ -61,7 +62,8 @@ class PilotAnalysisTests(unittest.TestCase):
         (self.run / 'run_manifest.json').write_text(json.dumps(dict(schema_version=1, mode='pilot',
             status='completed', invocations=self.rows,
             environment=dict(pbs=dict(job_id='123.cluster', slots=['node0', 'node1'])),
-            build_manifest='/tmp/build_manifest.json', build_manifest_sha256='abc')))
+            build_manifest='/tmp/build_manifest.json', build_manifest_sha256='abc',
+            baseline_mapping=mapping)))
 
     def invoke(self):
         return subprocess.run([sys.executable, str(COMMAND), '--run-dir', str(self.run),
@@ -129,6 +131,16 @@ class PilotAnalysisTests(unittest.TestCase):
                 result = self.invoke()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((self.root / 'report.md').exists())
+
+    def test_run_baseline_mapping_must_match_rank_affinity(self):
+        path = self.run / 'run_manifest.json'
+        run = json.loads(path.read_text())
+        run['baseline_mapping'][0]['cpu_affinity']['value'] = 'other-cpu'
+        path.write_text(json.dumps(run))
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Run baseline mapping differs', result.stderr)
+        self.assertFalse((self.root / 'report.md').exists())
 
     def test_malformed_sample_timing_is_rejected_without_traceback(self):
         path = Path(self.rows[0]['manifest'])

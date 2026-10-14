@@ -13,12 +13,15 @@ python3 benchmarks/run_variability.py --dry-run --mode pilot \
 Choose a **new** run directory for each submission. The preview prints every invocation and expected artifact without launching MPI or creating the directory. Then submit the two-rank PBS wrapper:
 
 ```sh
-HARMONY_VARIABILITY_MODE=pilot \
-HARMONY_VARIABILITY_RUN_DIR="$PWD/Results/pilot-YYYYMMDD-unique" \
-  qsub -V job_harmony_variability.pbs
+export HARMONY_VARIABILITY_MODE=pilot
+export HARMONY_VARIABILITY_RUN_DIR="$PWD/Results/pilot-YYYYMMDD-unique"
+export HARMONY_PBS_OUTPUT_PATH="${HARMONY_VARIABILITY_RUN_DIR}.pbs.out"
+test ! -e "$HARMONY_VARIABILITY_RUN_DIR"
+test ! -e "$HARMONY_PBS_OUTPUT_PATH"
+qsub -o "$HARMONY_PBS_OUTPUT_PATH" -j oe -V job_harmony_variability.pbs
 ```
 
-Keep the PBS output with the run directory. Inspect the job exit status and `run_manifest.json`; every sample must be `accepted`, the run must be `completed`, both ranks must have verified physical GPU identities and stable mapping, and the numerical reference checks must pass. The runner preserves per-sample CSV, log, inventory, and manifest artifacts. If any sample fails, retain the failed directory and submit a fresh unique directory after fixing the cause. Do not replace partial artifacts.
+Keep the PBS output and scheduler exit status with the run directory as described in `docs/controlled-gpu-variance-run.md`. Inspect the job exit status and `run_manifest.json`; every sample must be `accepted`, the run must be `completed`, both ranks must have verified physical GPU identities and stable mapping, and the numerical reference checks must pass. The analyzer also checks that the run baseline mapping matches the sample inventories, including each rank's CPU affinity or its explicit unavailability reason. The runner preserves per-sample CSV, log, inventory, and manifest artifacts. If any sample fails, retain the failed directory and submit a fresh unique directory after fixing the cause. Do not replace partial artifacts.
 
 After a completed pilot, generate its evidence report from the preserved raw files:
 
