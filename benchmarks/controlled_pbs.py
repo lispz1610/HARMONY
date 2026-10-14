@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from run_variability import build_verified, digest
 
@@ -272,7 +273,7 @@ def submit(workflow, workflow_root, mode):
                             'resubmit this experiment ID without reconciling the job')
     stage.update(status='submitted', job_id=job_id)
     save(workflow_root / 'workflow.json', workflow)
-    print(f'{mode}: submitted PBS job {job_id}; rerun this command after it finishes')
+    print(f'{mode}: submitted PBS job {job_id}', flush=True)
 
 
 def collect(workflow, workflow_root, mode, adopted_job_id=None, saved_record=None):
@@ -296,25 +297,43 @@ def collect(workflow, workflow_root, mode, adopted_job_id=None, saved_record=Non
     if stage['status'] == 'failed':
         raise WorkflowError(f'{mode}: preserved failed run; use a new experiment ID after repair')
     job_id = stage['job_id']
-    state, exit_status, record = scheduler_record(job_id, saved_record)
+    terminal_record = workflow_root / f'{mode}.pbs.scheduler-status.txt'
+    state, exit_status, record = scheduler_record(
+        job_id, terminal_record if terminal_record.is_file() else saved_record)
     if state.upper() not in ('F', 'C'):
-        print(f'{mode}: PBS job {job_id} is {state}; rerun after it finishes')
+        if stage.get('last_observed_state') != state:
+            stage['last_observed_state'] = state
+            save(workflow_root / 'workflow.json', workflow)
+            print(f'{mode}: PBS job {job_id} is {state}; waiting', flush=True)
         return False
     if exit_status is None:
         raise WorkflowError(f'{mode}: terminal PBS record has no Exit_status')
+    if not terminal_record.exists():
+        with terminal_record.open('x', encoding='utf-8') as stream:
+            stream.write(record)
+    if not stage.get('terminal_observed_at'):
+        stage['terminal_observed_at'] = now()
+        save(workflow_root / 'workflow.json', workflow)
     run_dir, output, status = stage_paths(workflow_root, mode)
-    if not run_dir.is_dir():
-        raise WorkflowError(f'{mode}: PBS job finished without a run directory: {run_dir}')
+    def wait_for_artifacts(missing):
+        observed = datetime.fromisoformat(stage['terminal_observed_at'])
+        if (datetime.now(timezone.utc) - observed).total_seconds() >= 120:
+            raise WorkflowError(f'{mode}: terminal PBS job still lacks artifacts after 120 seconds: '
+                                f'{missing}')
+        if not stage.get('waiting_for_artifacts'):
+            stage['waiting_for_artifacts'] = True
+            save(workflow_root / 'workflow.json', workflow)
+            print(f'{mode}: PBS job finished; waiting for output staging: {missing}', flush=True)
+        return False
+
+    missing = [str(path) for path in (run_dir, output, status) if not path.exists()]
+    if missing:
+        return wait_for_artifacts(missing)
     copy_once(output, run_dir / 'pbs.out')
     copy_once(status, run_dir / 'pbs.status')
     copy_once(workflow_root / 'build_manifest.json', run_dir / 'build_manifest.json')
     scheduler_path = run_dir / 'pbs.scheduler-status.txt'
-    if scheduler_path.exists():
-        if scheduler_path.read_text(encoding='utf-8') != record:
-            raise WorkflowError(f'Preserved scheduler record changed: {scheduler_path}')
-    else:
-        with scheduler_path.open('x', encoding='utf-8') as stream:
-            stream.write(record)
+    copy_once(terminal_record, scheduler_path)
     script_exit = script_status(status, job_id)
     stage.update(scheduler_exit_status=exit_status, script_exit_status=script_exit,
                  completed_at=now())
@@ -324,7 +343,7 @@ def collect(workflow, workflow_root, mode, adopted_job_id=None, saved_record=Non
         raise WorkflowError(f'{mode}: PBS or script exited nonzero; raw artifacts were preserved')
     manifest_path = run_dir / 'run_manifest.json'
     if not manifest_path.is_file():
-        raise WorkflowError(f'{mode}: run manifest is missing')
+        return wait_for_artifacts(str(manifest_path))
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     expected_mode = 'aba' if mode.startswith('aba-') else mode
     if manifest.get('mode') != expected_mode or manifest.get('status') != 'completed' or \
@@ -365,7 +384,7 @@ def report(workflow, workflow_root, aba_modes):
     print(f'Validated report: {output}')
 
 
-def advance(args):
+def advance_once(args):
     if os.environ.get('PBS_JOBID'):
         raise WorkflowError('Run this coordinator on the frontend, outside a PBS allocation')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.experiment_id):
@@ -384,7 +403,7 @@ def advance(args):
             mode = f'aba-{workload}'
             plans[mode] = preview(mode, workflow_root / mode, workload)
         print(json.dumps(dict(experiment_id=args.experiment_id, plans=plans), indent=2))
-        return
+        return True
     workflow_root.mkdir(parents=True, exist_ok=True)
     with (workflow_root / '.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -411,16 +430,19 @@ def advance(args):
             if mode not in workflow['aba_modes']:
                 workflow['aba_modes'].append(mode)
         save(state_path, workflow)
-        adoption = args.adopt_job_id
+        pending = [mode for mode, stage in workflow['stages'].items()
+                   if stage['status'] == 'submission_pending']
+        if args.adopt_job_id and len(pending) != 1:
+            raise WorkflowError('--adopt-job-id requires exactly one uncertain submission')
         for mode in ('pilot', 'smoke', 'full', *workflow['aba_modes']):
             if mode not in workflow['stages']:
-                if adoption:
+                if args.adopt_job_id:
                     raise WorkflowError('--adopt-job-id requires an existing uncertain submission')
                 submit(workflow, workflow_root, mode)
-                return
-            if not collect(workflow, workflow_root, mode, adoption, records.get(mode)):
-                return
-            adoption = None
+                return False
+            adopted = args.adopt_job_id if pending and mode == pending[0] else None
+            if not collect(workflow, workflow_root, mode, adopted, records.get(mode)):
+                return False
             if mode == 'pilot':
                 run_dir = workflow_root / 'pilot'
                 output = run_dir / 'pilot-analysis.md'
@@ -433,6 +455,7 @@ def advance(args):
         if workflow['aba_modes']:
             report(workflow, workflow_root, workflow['aba_modes'])
         print(f'Workflow complete. Preserve {workflow_root} and provide its raw artifacts for review.')
+        return True
 
 
 def main():
@@ -441,6 +464,10 @@ def main():
     parser.add_argument('--results-root', type=Path, default=ROOT / 'Results')
     parser.add_argument('--diagnostic-ordinal', type=int, default=8)
     parser.add_argument('--sample-timeout-seconds', type=int, default=1800)
+    parser.add_argument('--poll-interval-seconds', type=int, default=30,
+                        help='Seconds between scheduler checks while waiting (default: 30)')
+    parser.add_argument('--once', action='store_true',
+                        help='Submit or check one stage and exit without waiting')
     parser.add_argument('--aba-workload', choices=('kneighbor', 'leanmd'),
                         action='append', default=[])
     parser.add_argument('--adopt-job-id')
@@ -452,8 +479,16 @@ def main():
         parser.error('Diagnostic ordinal must be 0 (disabled) or 5-64')
     if not 1 <= args.sample_timeout_seconds <= 86400:
         parser.error('Sample timeout must be from 1 to 86400 seconds')
+    if not 1 <= args.poll_interval_seconds <= 3600:
+        parser.error('Poll interval must be from 1 to 3600 seconds')
     try:
-        advance(args)
+        while True:
+            if advance_once(args) or args.once:
+                break
+            args.adopt_job_id = None
+            time.sleep(args.poll_interval_seconds)
+    except KeyboardInterrupt:
+        parser.exit(130, 'Interrupted; rerun the same command and experiment ID to resume.\n')
     except (WorkflowError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         parser.exit(1, f'error: {error}\n')
 
