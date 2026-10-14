@@ -455,15 +455,16 @@ For the controlled two-GPU variance experiment, use the resumable frontend
 coordinator instead of submitting each PBS stage by hand:
 
 ```bash
-python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a --preview
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
-Repeat the second command with the same ID after each PBS job. It builds and
-pins the binaries, validates the pilot and rank-local diagnostic smoke, then
-submits and reports the full matrix without duplicating jobs or overwriting
-raw evidence. See `docs/controlled-gpu-variance-run.md` for failure recovery
-and conditional seed-123 A/B/A runs. Real GPU/PBS results remain necessary.
+The command stays on the frontend, checks PBS every 30 seconds, and submits
+each next stage after validating the previous one. It builds and pins the
+binaries, validates the pilot and rank-local diagnostic smoke, then runs and
+reports the full matrix without duplicating jobs or overwriting raw evidence.
+If the session is interrupted, rerun the same command and ID to resume. See
+`docs/controlled-gpu-variance-run.md` for failure recovery and optional
+seed-123 A/B/A runs. Real GPU/PBS results remain necessary.
 
 Or use the automation script (sets `MPI_LAUNCHER` if needed):
 

@@ -1,21 +1,24 @@
 # Controlled GPU variance run
 
-Run the coordinator on the cluster frontend from the published integration
-branch. Choose one stable experiment ID and reuse it for every invocation:
+From the published integration branch on the cluster frontend, choose one
+stable experiment ID and run:
 
 ```sh
-git fetch origin
-git switch --track origin/codex/implement-gpu-variance-spec
-python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a --preview
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
-The preview prints the pilot, diagnostic smoke, and full schedules without
-building, submitting, or writing files. The second command builds with
-`cluster_build.sh` if needed, verifies the C++20/OpenCL binaries and their
-source revision, then submits the pilot. **Run the same second command again**
-after each PBS job finishes. A call made while a job is queued or running only
-reports its state. Each completed call advances one gate:
+The command builds with `cluster_build.sh` if needed, verifies the C++20/OpenCL
+binaries and their source revision, and submits the pilot. It remains active
+on the frontend, checks PBS every 30 seconds, and advances automatically after
+each completed stage passes its evidence gate. Keep the frontend session alive
+until it prints `Workflow complete`. If the session disconnects, rerun the
+same command and experiment ID; queued and running PBS jobs are reused.
+Set `--poll-interval-seconds N` to change the check interval (1–3600 seconds).
+Use `--preview` separately if you want a read-only schedule first.
+
+The stages are ordered because a scheduler dependency alone checks job exit,
+while this workflow must also validate the pilot and diagnostic evidence
+before submitting the full matrix:
 
 | Stage | PBS work | Evidence required before the next stage |
 | --- | --- | --- |
@@ -32,7 +35,8 @@ enter the 30 paired performance comparisons.
 
 When the final report shows a persistent seed-123 reversal, request an
 isolated A/B/A run for each affected workload. Add the option to the same
-experiment ID and rerun until its PBS job is complete:
+experiment ID; that single invocation waits for its PBS job and updates the
+report:
 
 ```sh
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a \
@@ -73,6 +77,7 @@ workflow option, or modified preserved artifact stops this experiment ID.
 Keep its raw evidence and use a **new** ID after repairing the cause. The
 sample timeout defaults to 1,800 seconds; `--sample-timeout-seconds N` may be
 set at the first invocation and must remain the same thereafter.
+Use `--once` only when a scheduler check without waiting is desired.
 
 The build manifest records the compiler, exact flags, source revision and
 digest, OpenCL library, and binary SHA-256 hashes. Each sample requires exactly

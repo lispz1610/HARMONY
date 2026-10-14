@@ -5,9 +5,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 
@@ -64,12 +67,16 @@ print(f'{122 + count}.fake')
         qstat = scripts / 'qstat'
         qstat.write_text('''#!/usr/bin/env python3
 import os, sys
+from pathlib import Path
 if os.environ.get('FAKE_QSTAT_MISSING'):
     sys.exit(153)
+state = os.environ.get('FAKE_JOB_STATE', 'R')
+if os.environ.get('FAKE_AUTO_DIR'):
+    state = 'F' if (Path(os.environ['FAKE_AUTO_DIR']) / (sys.argv[-1] + '.done')).exists() else 'Q'
 print(f'Job Id: {sys.argv[-1]}')
 print(f'    Job_Name = {os.environ.get("FAKE_JOB_NAME", "unknown")}')
-print(f'    job_state = {os.environ.get("FAKE_JOB_STATE", "R")}')
-if os.environ.get('FAKE_JOB_STATE') == 'F':
+print(f'    job_state = {state}')
+if state == 'F':
     print(f'    Exit_status = {os.environ.get("FAKE_JOB_EXIT", "0")}')
 ''')
         qstat.chmod(0o755)
@@ -80,7 +87,7 @@ if os.environ.get('FAKE_JOB_STATE') == 'F':
         self.workflow_root = self.root / 'Results' / 'controlled-sample'
 
     def invoke(self, *extra, env=None):
-        return subprocess.run([*self.command, *extra], cwd=self.root,
+        return subprocess.run([*self.command, '--once', *extra], cwd=self.root,
                               env=env or self.env, capture_output=True, text=True)
 
     def workflow(self):
@@ -118,6 +125,76 @@ if os.environ.get('FAKE_JOB_STATE') == 'F':
             diag = run_dir / 'diagnostic-8'
             diag.mkdir()
             (diag / 'diagnostic.manifest.json').write_text('{}')
+
+    def test_one_command_waits_for_pbs_and_completes_all_stages(self):
+        done = self.root / 'finished'
+        done.mkdir()
+        errors = []
+
+        def finish_in_order():
+            try:
+                for mode, job_id in [('pilot', '123.fake'), ('smoke', '124.fake'),
+                                     ('full', '125.fake')]:
+                    deadline = time.monotonic() + 12
+                    while time.monotonic() < deadline:
+                        state = self.workflow() if (self.workflow_root / 'workflow.json').is_file() else {}
+                        stage = state.get('stages', {}).get(mode)
+                        if stage and stage['status'] == 'submitted':
+                            self.finish_job(mode, job_id)
+                            (done / f'{job_id}.done').touch()
+                            break
+                        time.sleep(0.02)
+                    else:
+                        raise AssertionError(f'{mode} was never submitted')
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=finish_in_order)
+        worker.start()
+        try:
+            result = subprocess.run([*self.command, '--poll-interval-seconds', '1'],
+                                    cwd=self.root, env=dict(self.env, FAKE_AUTO_DIR=str(done)),
+                                    capture_output=True, text=True, timeout=15)
+        finally:
+            worker.join(timeout=15)
+        self.assertEqual(errors, [])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Workflow complete', result.stdout)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '3')
+        self.assertEqual({mode: stage['status'] for mode, stage in
+                          self.workflow()['stages'].items()},
+                         {'pilot': 'complete', 'smoke': 'complete', 'full': 'complete'})
+        self.assertTrue((self.workflow_root / 'full-report.md').is_file())
+        repeated = subprocess.run([*self.command, '--poll-interval-seconds', '1'],
+                                  cwd=self.root, env=dict(self.env, FAKE_AUTO_DIR=str(done)),
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '3')
+
+    def test_interrupted_wait_resumes_without_resubmitting(self):
+        process = subprocess.Popen([*self.command, '--poll-interval-seconds', '1'],
+                                   cwd=self.root, env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                state = self.workflow() if (self.workflow_root / 'workflow.json').is_file() else {}
+                if state.get('stages', {}).get('pilot', {}).get('status') == 'submitted':
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail('Pilot was not submitted')
+            process.send_signal(signal.SIGINT)
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 130)
+            self.assertIn('rerun the same command', stderr)
+            resumed = self.invoke()
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual((self.root / 'qsub-count').read_text(), '1')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
 
     def test_rerun_never_duplicates_jobs_and_advances_after_verified_completion(self):
         first = self.invoke()
@@ -166,6 +243,19 @@ if os.environ.get('FAKE_JOB_STATE') == 'F':
         self.assertEqual(self.workflow()['stages']['pilot']['job_id'], '123.fake')
         self.assertEqual((self.root / 'qsub-count').read_text(), '1')
 
+    def test_later_stage_uncertain_submission_can_be_adopted(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        self.finish_job('pilot', '123.fake')
+        uncertain = self.invoke(env=dict(self.env, FAKE_JOB_STATE='F', FAKE_QSUB_BAD='1'))
+        self.assertNotEqual(uncertain.returncode, 0)
+        self.assertEqual(self.workflow()['stages']['smoke']['status'], 'submission_pending')
+        name = self.workflow()['stages']['smoke']['job_name']
+        adopted = self.invoke('--adopt-job-id', '124.fake',
+                              env=dict(self.env, FAKE_JOB_NAME=name))
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        self.assertEqual(self.workflow()['stages']['smoke']['job_id'], '124.fake')
+        self.assertEqual((self.root / 'qsub-count').read_text(), '2')
+
     def test_preview_is_read_only_and_needs_no_scheduler(self):
         env = dict(self.env, PATH=os.environ['PATH'])
         result = self.invoke('--preview', env=env)
@@ -184,6 +274,18 @@ if os.environ.get('FAKE_JOB_STATE') == 'F':
         resumed = self.invoke('--scheduler-record', f'pilot={saved}', env=env)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual((self.root / 'qsub-count').read_text(), '2')
+
+    def test_terminal_job_waits_for_staged_output_even_if_qstat_expires(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        terminal = self.invoke(env=dict(self.env, FAKE_JOB_STATE='F'))
+        self.assertEqual(terminal.returncode, 0, terminal.stderr)
+        self.assertIn('waiting for output staging', terminal.stdout)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '1')
+        self.finish_job('pilot', '123.fake')
+        resumed = self.invoke(env=dict(self.env, FAKE_QSTAT_MISSING='1'))
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '2')
+        self.assertTrue((self.workflow_root / 'pilot' / 'pbs.scheduler-status.txt').is_file())
 
     def test_failed_pbs_exit_preserves_artifacts_without_submitting_next_stage(self):
         self.assertEqual(self.invoke().returncode, 0)

@@ -2,16 +2,14 @@
 
 The pilot is a diagnostic experiment for issue #8. It uses two rotated passes of eight iterations, so no scheduled rebalance at iteration 10 occurs. Its 24 invocations form 12 adjacent ERAD/HWTOPOLB pairs. Pilot samples must stay out of the full 100-iteration performance comparison.
 
-On the cluster frontend, preview and submit through the resumable coordinator
+On the cluster frontend, run the resumable coordinator
 described in `docs/controlled-gpu-variance-run.md`:
 
 ```sh
-python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a --preview
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
-The preview does not create files or launch MPI. The second command builds if
-needed and submits the pilot. Repeat it after the PBS job finishes; it
+The command builds if needed, submits the pilot, waits for PBS, and then
 preserves the scheduler record, PBS output and exit status, raw samples, and
 pilot report before advancing to the diagnostic smoke. The pilot run is at
 `Results/controlled-EXPERIMENT_ID/pilot/`. Every sample must be `accepted`,
