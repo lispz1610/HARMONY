@@ -46,7 +46,8 @@ ranks = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0, global_
 if os.environ.get('FAKE_WRONG_GPU_COUNT'):
     ranks[1]['gpu_count'] = 2
 Path(value('--device-inventory-json')).write_text(json.dumps({'schema_version': 1, 'ranks': ranks}))
-print('validation=PASS loop_time_s=1.0 validation_time_s=0.1')
+summary_mode = 'cpu_simulation' if os.environ.get('FAKE_SUMMARY_CPU') else mode
+print(f'mode={summary_mode} validation=PASS loop_time_s=1.0 validation_time_s=0.1')
 if os.environ.get('FAKE_CONFLICTING_VALIDATION'):
     print('validation=FAIL loop_time_s=2.0')
 '''
@@ -122,6 +123,17 @@ class ExecuteGates(unittest.TestCase):
             self.assertTrue(any('Numerical validation did not pass' in row['rejection_reason']
                                 for row in samples))
 
+    def test_cpu_summary_conflicting_with_gpu_csv_rejects_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            env['FAKE_SUMMARY_CPU'] = '1'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(process.returncode, 0)
+            samples = [json.loads(path.read_text()) for path in (root / 'run').rglob('*.manifest.json')]
+            self.assertTrue(all(row['status'] == 'rejected' for row in samples))
+            self.assertTrue(any('GPU execution mode' in row['rejection_reason'] for row in samples))
+
     def test_duplicate_uuid_or_wrong_gpu_count_rejects_sample(self):
         for flag, message in (('FAKE_DUPLICATE_UUID', 'same physical GPU'),
                               ('FAKE_WRONG_GPU_COUNT', 'exactly one GPU per rank')):
@@ -144,6 +156,9 @@ class ExecuteGates(unittest.TestCase):
             run = json.loads((root / 'run' / 'run_manifest.json').read_text())
             self.assertEqual(run['status'], 'completed')
             self.assertEqual(run['rejected_samples'], 0)
+            self.assertEqual([row['rank'] for row in run['baseline_mapping']], [0, 1])
+            samples = [json.loads(path.read_text()) for path in (root / 'run').rglob('*.manifest.json')]
+            self.assertTrue(all(row['exit_code'] == 0 for row in samples))
             self.assertEqual(len(list((root / 'run').rglob('*.manifest.json'))), 24)
             second = subprocess.run(command, env=env, capture_output=True, text=True)
             self.assertNotEqual(second.returncode, 0)

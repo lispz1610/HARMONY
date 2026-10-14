@@ -172,6 +172,8 @@ def accepted_output(row):
                float(record['step_time_s']) < 0 for record in records):
             raise ValueError('Nonfinite or negative step timing')
         log = Path(row['log']).read_text(encoding='utf-8')
+        if re.findall(r'\bmode=([^\s]+)', log) != ['gpu_opencl']:
+            raise ValueError('GPU execution mode is missing or inconsistent')
         validation = re.findall(r'\bvalidation=([^\s]+)', log)
         if validation != ['PASS']:
             raise ValueError('Numerical validation did not pass')
@@ -227,7 +229,7 @@ def execute(args, rows):
                                      pilot_iterations=args.pilot_iterations,
                                      rebalance_interval=10, perturbation=0.10,
                                      kneighbor_k=5, leanmd_cutoff=4),
-               invocations=rows)
+               invocations=rows, baseline_mapping=None)
     write_json(args.run_dir / 'run_manifest.json', run)
     if args.mode in ('full', 'aba'):
         halo = bin_dir / 'test_async_halo_opencl.out'
@@ -267,7 +269,7 @@ def execute(args, rows):
     for row in rows:
         sample = dict(row, status='planned', rejection_reason=None,
                       build_manifest_sha256=run['build_manifest_sha256'],
-                      started_at=None, completed_at=None)
+                      started_at=None, completed_at=None, exit_code=None)
         path = Path(row['manifest'])
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, sample)
@@ -285,6 +287,7 @@ def execute(args, rows):
             with open(row['log'], 'x', encoding='utf-8') as log:
                 exit_code = run_bounded([pbs['launcher'], *row['argv']], log,
                                         args.sample_timeout_seconds)
+            sample['exit_code'] = exit_code
             if exit_code != 0:
                 raise ValueError(f'Benchmark exited {exit_code}')
             times, mapping = accepted_output(row)
@@ -299,6 +302,8 @@ def execute(args, rows):
                 pairs[row['pair_id']] = dict(mapping=mapping, sample=sample)
             if baseline is None:
                 baseline = mapping
+                run['baseline_mapping'] = mapping
+                write_json(args.run_dir / 'run_manifest.json', run)
             elif mapping != baseline:
                 raise ValueError('Device mapping differs from run baseline')
             sample.update(status='accepted', times=times, mapping=mapping)

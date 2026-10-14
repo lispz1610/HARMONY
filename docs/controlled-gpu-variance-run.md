@@ -78,9 +78,12 @@ The executor depends on benchmark support for `--require-two-rank-gpu`,
 Every sample has a separate CSV, log, device inventory JSON, and status manifest.
 The run manifest records the PBS allocation, build provenance hash, exact
 commands, input parameters, module list, MPI version, CPU model, and available
-GPU clock/power/contention observations. An unavailable optional observation
+GPU clock/power/contention observations. It also records the first accepted
+rank-to-device mapping as the run baseline. Each sample manifest records its
+launcher exit code, or `null` if it timed out or did not start. An unavailable optional observation
 is represented by `value: null` with an `unavailable_reason`. A sample is
-accepted only with complete GPU CSV iterations, `validation=PASS`, finite
+accepted only with complete GPU CSV iterations, a `gpu_opencl` summary,
+`validation=PASS`, finite
 `loop_time_s` and `validation_time_s`, and two stable, distinct physical GPU
 identities. A rejected sample and its raw artifacts remain in place. A paired
 sample is also rejected when its partner fails or the rank/device mapping
