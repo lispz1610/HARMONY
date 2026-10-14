@@ -50,4 +50,10 @@ echo "=== Build benchmarks ==="
 BENCH_BIN_DIR="$bin_dir" BENCH_BUILD_ONLY=1 OPENCL_LIBRARY="$opencl_library" \
     bash "$root_dir/benchmarks/compare_algos.sh"
 
+# Provenance is captured on the frontend, where git and the compiler exist.
+python3 "$root_dir/benchmarks/write_build_manifest.py" "$root_dir" "$bin_dir" \
+    mpic++ "$opencl_library" -std=c++20 -Wall -Wextra -Wpedantic \
+    -Wno-unused-parameter -O3 -DCL_TARGET_OPENCL_VERSION=300 \
+    "-I$root_dir/third_party/opencl_headers"
+
 echo "Frontend build complete: $bin_dir"

@@ -34,6 +34,7 @@
 #include <iostream>
 #include <chrono>
 #include <climits>
+#include <iomanip>
 
 namespace dcl {
 
@@ -54,6 +55,24 @@ static inline void check_cl(cl_int code, const char* what) {
     std::ostringstream oss;
     oss << "OpenCL failure at " << what << " code=" << code;
     throw Error(oss.str());
+}
+
+static inline std::string device_string(cl_device_id device, cl_device_info field) {
+    std::size_t size = 0;
+    check_cl(clGetDeviceInfo(device, field, 0, nullptr, &size), "clGetDeviceInfo(string size)");
+    std::string value(size, '\0');
+    check_cl(clGetDeviceInfo(device, field, size, value.data(), nullptr), "clGetDeviceInfo(string)");
+    if (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
+}
+
+static inline std::string platform_string(cl_platform_id platform, cl_platform_info field) {
+    std::size_t size = 0;
+    check_cl(clGetPlatformInfo(platform, field, 0, nullptr, &size), "clGetPlatformInfo(string size)");
+    std::string value(size, '\0');
+    check_cl(clGetPlatformInfo(platform, field, size, value.data(), nullptr), "clGetPlatformInfo(string)");
+    if (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
 }
 
 static inline std::string slurp_file(const std::string& path) {
@@ -498,6 +517,36 @@ public:
                     info.name = owned_device.name;
                     info.kind = owned_device.kind;
                     info.compute_units = owned_device.compute_units;
+                    info.platform_name = detail::platform_string(platform_ids[p], CL_PLATFORM_NAME);
+                    info.platform_version = detail::platform_string(platform_ids[p], CL_PLATFORM_VERSION);
+                    info.device_version = detail::device_string(owned_device.device, CL_DEVICE_VERSION);
+                    info.driver_version = detail::device_string(owned_device.device, CL_DRIVER_VERSION);
+                    const std::string extensions = detail::device_string(owned_device.device, CL_DEVICE_EXTENSIONS);
+                    const auto has_extension = [&extensions](const std::string& name) {
+                        return (" " + extensions + " ").find(" " + name + " ") != std::string::npos;
+                    };
+                    if (has_extension("cl_khr_device_uuid")) {
+                        unsigned char uuid[CL_UUID_SIZE_KHR]{};
+                        detail::check_cl(clGetDeviceInfo(owned_device.device, CL_DEVICE_UUID_KHR, sizeof(uuid), uuid, nullptr),
+                                         "clGetDeviceInfo(CL_DEVICE_UUID_KHR)");
+                        std::ostringstream token;
+                        for (unsigned char byte : uuid) {
+                            token << std::hex << std::setfill('0') << std::setw(2)
+                                  << static_cast<unsigned>(byte);
+                        }
+                        info.identity_kind = "uuid";
+                        info.identity = token.str();
+                    } else if (has_extension("cl_khr_pci_bus_info")) {
+                        cl_device_pci_bus_info_khr pci{};
+                        detail::check_cl(clGetDeviceInfo(owned_device.device, CL_DEVICE_PCI_BUS_INFO_KHR, sizeof(pci), &pci, nullptr),
+                                         "clGetDeviceInfo(CL_DEVICE_PCI_BUS_INFO_KHR)");
+                        std::ostringstream token;
+                        token << std::hex << std::setfill('0') << std::setw(4) << pci.pci_domain << ':'
+                              << std::setw(2) << pci.pci_bus << ':' << std::setw(2) << pci.pci_device
+                              << '.' << pci.pci_function;
+                        info.identity_kind = "pci";
+                        info.identity = token.str();
+                    }
                     devices_.push_back(info);
                 }
 
@@ -551,6 +600,7 @@ public:
     int rank() const noexcept { return rank_; }
     int size() const noexcept { return size_; }
     MPI_Comm communicator() const noexcept { return comm_; }
+    void set_verbose_metrics(bool enabled) noexcept { verbose_metrics_ = enabled; }
 
     FieldHandle create_field(const FieldSpec& spec) {
         const int global_devices =
@@ -1473,7 +1523,7 @@ public:
     }
 
     void print_partition_loads(const std::vector<float>& loads) const {
-        if (rank_ != 0) return;
+        if (!verbose_metrics_ || rank_ != 0) return;
 
         const std::vector<float> individual = detail::cumulative_to_individual(loads);
 
@@ -3119,7 +3169,7 @@ void print_balance_interval_metrics(
     accumulated_balance_seconds_ += T_balance_total;
     accumulated_rebalance_apply_seconds_ += T_rebalance_apply;
 
-    append_balance_metrics_csv(
+    if (verbose_metrics_) append_balance_metrics_csv(
         policy_name,
         action,
         reason,
@@ -3133,7 +3183,7 @@ void print_balance_interval_metrics(
         T_rebalance_apply
     );
 
-    if (rank_ == 0) {
+    if (verbose_metrics_ && rank_ == 0) {
         std::cout << "[DCL][balance-metrics] iteration=" << iteration_counter_ << "\n";
         std::cout << "  policy=" << policy_name << "\n";
         std::cout << "  action=" << action << "\n";
@@ -3153,16 +3203,13 @@ void print_balance_interval_metrics(
         }
     }
 
-    print_named_loads("OLD loads", old_loads);
-
-    if (!proposed_loads.empty()) {
-        print_named_loads("PROPOSED loads", proposed_loads);
-    }
-
-    print_named_loads("CURRENT loads", current_loads_after);
-
-    if (rank_ == 0) {
-        std::cout << std::flush;
+    if (verbose_metrics_) {
+        print_named_loads("OLD loads", old_loads);
+        if (!proposed_loads.empty()) {
+            print_named_loads("PROPOSED loads", proposed_loads);
+        }
+        print_named_loads("CURRENT loads", current_loads_after);
+        if (rank_ == 0) std::cout << std::flush;
     }
 
     if (reset_after_print) {
@@ -4969,6 +5016,7 @@ private:
     std::vector<FieldHandle> last_input_fields_;
     std::vector<FieldHandle> last_output_fields_;
     std::size_t iteration_counter_{0};
+    bool verbose_metrics_{true};
 
     std::vector<ProfileSegment> profiling_data_;
     bool profiling_loaded_{false};
