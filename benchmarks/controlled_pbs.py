@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Advance one immutable, resumable PBS comparison through its stages."""
+"""Queue one immutable, resumable PBS comparison with dependent stages."""
 
 import argparse
 from datetime import datetime, timezone
@@ -226,7 +226,7 @@ def produce_once(workflow, key, output, command):
     workflow['reports'][key] = digest(output)
 
 
-def submit(workflow, workflow_root, mode):
+def submit(workflow, workflow_root, mode, dependency=None):
     if shutil.which('qsub') is None:
         raise WorkflowError('qsub is unavailable; run this script on the cluster frontend')
     run_dir, output, status = stage_paths(workflow_root, mode)
@@ -245,7 +245,8 @@ def submit(workflow, workflow_root, mode):
     job_name = 'hgv' + code + hashlib.sha256(
         workflow['experiment_id'].encode()).hexdigest()[:8]
     stage = dict(status='submission_pending', job_id=None, job_name=job_name,
-                 run_dir=str(run_dir), output=str(output), submitted_at=now())
+                 run_dir=str(run_dir), output=str(output), dependency=dependency,
+                 submitted_at=now())
     workflow['stages'][mode] = stage
     save(workflow_root / 'workflow.json', workflow)
     env = dict(os.environ, HARMONY_VARIABILITY_RUN_DIR=str(run_dir),
@@ -256,8 +257,10 @@ def submit(workflow, workflow_root, mode):
         env['HARMONY_ABA_WORKLOAD'] = workload
     if mode == 'full' and workflow['diagnostic_ordinal']:
         env['HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL'] = str(workflow['diagnostic_ordinal'])
-    command = ['qsub', '-N', job_name, '-o', str(output), '-j', 'oe', '-V',
-               str(ROOT / 'job_harmony_variability.pbs')]
+    command = ['qsub', '-N', job_name, '-o', str(output), '-j', 'oe', '-V']
+    if dependency:
+        command += ['-W', f'depend=afterok:{dependency}']
+    command += [str(ROOT / 'job_harmony_variability.pbs')]
     try:
         result = run_checked(command, cwd=ROOT, env=env, capture_output=True, timeout=60)
     except WorkflowError:
@@ -384,8 +387,8 @@ def report(workflow, workflow_root, aba_modes):
     print(f'Validated report: {output}')
 
 
-def advance_once(args):
-    if os.environ.get('PBS_JOBID'):
+def advance_once(args, finalizing=False, selected_aba_modes=None):
+    if os.environ.get('PBS_JOBID') and not finalizing:
         raise WorkflowError('Run this coordinator on the frontend, outside a PBS allocation')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.experiment_id):
         raise WorkflowError('Experiment ID must be 1-64 ASCII letters, digits, _ or -')
@@ -422,7 +425,7 @@ def advance_once(args):
                             build_manifest_sha256=None, stages={}, reports={},
                             aba_modes=[])
             save(state_path, workflow)
-        if shutil.which('qsub') is None:
+        if not finalizing and shutil.which('qsub') is None:
             raise WorkflowError('qsub is unavailable; run this script on the cluster frontend')
         ensure_build(workflow, workflow_root)
         for workload in args.aba_workload:
@@ -434,8 +437,11 @@ def advance_once(args):
                    if stage['status'] == 'submission_pending']
         if args.adopt_job_id and len(pending) != 1:
             raise WorkflowError('--adopt-job-id requires exactly one uncertain submission')
-        for mode in ('pilot', 'smoke', 'full', *workflow['aba_modes']):
+        modes = ('pilot', 'smoke', 'full', *(selected_aba_modes if finalizing else workflow['aba_modes']))
+        for mode in modes:
             if mode not in workflow['stages']:
+                if finalizing:
+                    raise WorkflowError(f'{mode}: expected queued PBS job is missing')
                 if args.adopt_job_id:
                     raise WorkflowError('--adopt-job-id requires an existing uncertain submission')
                 submit(workflow, workflow_root, mode)
@@ -452,10 +458,125 @@ def advance_once(args):
                 save(state_path, workflow)
             if mode == 'full':
                 report(workflow, workflow_root, [])
-        if workflow['aba_modes']:
-            report(workflow, workflow_root, workflow['aba_modes'])
+        aba_modes = selected_aba_modes if finalizing else workflow['aba_modes']
+        if aba_modes:
+            report(workflow, workflow_root, aba_modes)
+        if finalizing:
+            key = 'baseline' if not aba_modes else '-'.join(aba_modes)
+            entry = workflow.get('finalizers', {}).get(key)
+            if entry:
+                entry.update(status='complete', completed_at=now())
+                save(state_path, workflow)
         print(f'Workflow complete. Preserve {workflow_root} and provide its raw artifacts for review.')
         return True
+
+
+def adopt_queued(entry, job_id):
+    state, _, record = scheduler_record(job_id)
+    name = re.search(r'^\s*Job_Name\s*=\s*(\S+)', record,
+                     re.MULTILINE | re.IGNORECASE)
+    if not name or name.group(1) != entry['job_name']:
+        raise WorkflowError('Adopted PBS job name does not match this experiment')
+    entry.update(status='submitted', job_id=job_id)
+    print(f'Adopted PBS job {job_id} (scheduler state {state})', flush=True)
+
+
+def queue_finalizer(workflow, workflow_root, key, dependency):
+    output = workflow_root / f'finalize-{key}.pbs.out'
+    if output.exists():
+        raise WorkflowError(f'Fresh finalizer output already exists: {output}')
+    job_name = 'hgvz' + hashlib.sha256(
+        (workflow['experiment_id'] + key).encode()).hexdigest()[:8]
+    entry = dict(status='submission_pending', job_id=None, job_name=job_name,
+                 dependency=dependency, output=str(output), submitted_at=now())
+    workflow['finalizers'][key] = entry
+    save(workflow_root / 'workflow.json', workflow)
+    env = dict(os.environ, HARMONY_VARIABILITY_EXPERIMENT_ID=workflow['experiment_id'],
+               HARMONY_VARIABILITY_RESULTS_ROOT=str(workflow_root.parent),
+               HARMONY_FINALIZE_ABA_MODES=','.join(workflow['aba_modes']))
+    command = ['qsub', '-N', job_name, '-o', str(output), '-j', 'oe', '-V']
+    if dependency:
+        command += ['-W', f'depend=afterok:{dependency}']
+    command += [str(ROOT / 'job_harmony_variability_finalize.pbs')]
+    try:
+        result = run_checked(command, cwd=ROOT, env=env, capture_output=True, timeout=60)
+    except WorkflowError:
+        raise WorkflowError('Finalizer qsub outcome is uncertain; inspect qstat and '
+                            'resume with --adopt-job-id if accepted') from None
+    entry['qsub_stdout'] = result.stdout.strip()
+    entry['qsub_stderr'] = result.stderr.strip()
+    job_id = result.stdout.strip().split()[0] if result.stdout.strip() else ''
+    if result.returncode != 0 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', job_id):
+        save(workflow_root / 'workflow.json', workflow)
+        raise WorkflowError('Finalizer qsub outcome is uncertain; inspect the scheduler')
+    entry.update(status='submitted', job_id=job_id)
+    save(workflow_root / 'workflow.json', workflow)
+    print(f'finalize-{key}: queued PBS job {job_id}', flush=True)
+
+
+def queue_all(args):
+    if os.environ.get('PBS_JOBID'):
+        raise WorkflowError('Queue jobs on the frontend, outside a PBS allocation')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.experiment_id):
+        raise WorkflowError('Experiment ID must be 1-64 ASCII letters, digits, _ or -')
+    if shutil.which('qsub') is None:
+        raise WorkflowError('qsub is unavailable; run this script on the cluster frontend')
+    workflow_root = args.results_root.resolve() / f'controlled-{args.experiment_id}'
+    workflow_root.mkdir(parents=True, exist_ok=True)
+    with (workflow_root / '.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state_path = workflow_root / 'workflow.json'
+        if state_path.is_file():
+            workflow = json.loads(state_path.read_text(encoding='utf-8'))
+            if workflow.get('schema_version') != 1 or \
+                    workflow.get('experiment_id') != args.experiment_id or \
+                    workflow.get('diagnostic_ordinal') != args.diagnostic_ordinal or \
+                    workflow.get('sample_timeout_seconds') != args.sample_timeout_seconds:
+                raise WorkflowError('Existing workflow parameters differ; reuse the original options')
+        else:
+            workflow = dict(schema_version=1, experiment_id=args.experiment_id,
+                            diagnostic_ordinal=args.diagnostic_ordinal,
+                            sample_timeout_seconds=args.sample_timeout_seconds,
+                            build_manifest_sha256=None, stages={}, reports={},
+                            aba_modes=[], finalizers={})
+            save(state_path, workflow)
+        workflow.setdefault('finalizers', {})
+        ensure_build(workflow, workflow_root)
+        for workload in args.aba_workload:
+            mode = f'aba-{workload}'
+            if mode not in workflow['aba_modes']:
+                workflow['aba_modes'].append(mode)
+        save(state_path, workflow)
+        key = 'baseline' if not workflow['aba_modes'] else '-'.join(workflow['aba_modes'])
+        modes = ('pilot', 'smoke', 'full', *workflow['aba_modes'])
+        pending = [entry for entry in (
+            *(workflow['stages'][mode] for mode in modes if mode in workflow['stages']),
+            *(entry for entry in workflow['finalizers'].values()))
+            if entry['status'] == 'submission_pending']
+        if args.adopt_job_id and len(pending) != 1:
+            raise WorkflowError('--adopt-job-id requires exactly one uncertain submission')
+        if pending:
+            if not args.adopt_job_id or len(pending) != 1:
+                raise WorkflowError('A qsub outcome is uncertain; reconcile it with --adopt-job-id')
+            adopt_queued(pending[0], args.adopt_job_id)
+            save(state_path, workflow)
+        previous = None
+        for mode in modes:
+            stage = workflow['stages'].get(mode)
+            if stage is None:
+                submit(workflow, workflow_root, mode, previous)
+                stage = workflow['stages'][mode]
+            elif stage['status'] == 'submission_pending':
+                raise WorkflowError(f'{mode}: qsub outcome is uncertain; use --adopt-job-id')
+            if not stage.get('job_id'):
+                raise WorkflowError(f'{mode}: no verified PBS job ID')
+            previous = None if stage['status'] == 'complete' else stage['job_id']
+        finalizer = workflow['finalizers'].get(key)
+        if finalizer is None:
+            queue_finalizer(workflow, workflow_root, key, previous)
+        elif finalizer['status'] == 'submission_pending':
+            raise WorkflowError('Finalizer qsub outcome is uncertain; use --adopt-job-id')
+        print(f'All PBS jobs queued. Results: {workflow_root}', flush=True)
 
 
 def main():
@@ -468,6 +589,9 @@ def main():
                         help='Seconds between scheduler checks while waiting (default: 30)')
     parser.add_argument('--once', action='store_true',
                         help='Submit or check one stage and exit without waiting')
+    parser.add_argument('--watch', action='store_true',
+                        help='Wait on the frontend and advance stages there')
+    parser.add_argument('--finalize', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--aba-workload', choices=('kneighbor', 'leanmd'),
                         action='append', default=[])
     parser.add_argument('--adopt-job-id')
@@ -482,11 +606,30 @@ def main():
     if not 1 <= args.poll_interval_seconds <= 3600:
         parser.error('Poll interval must be from 1 to 3600 seconds')
     try:
-        while True:
-            if advance_once(args) or args.once:
-                break
-            args.adopt_job_id = None
-            time.sleep(args.poll_interval_seconds)
+        if args.preview:
+            advance_once(args)
+        elif args.finalize:
+            workflow_root = args.results_root.resolve() / f'controlled-{args.experiment_id}'
+            workflow = json.loads((workflow_root / 'workflow.json').read_text(encoding='utf-8'))
+            args.diagnostic_ordinal = workflow['diagnostic_ordinal']
+            args.sample_timeout_seconds = workflow['sample_timeout_seconds']
+            selected = [mode for mode in os.environ.get('HARMONY_FINALIZE_ABA_MODES', '').split(',')
+                        if mode]
+            if any(mode not in workflow['aba_modes'] for mode in selected):
+                raise WorkflowError('Finalizer A/B/A modes differ from the queued workflow')
+            deadline = time.monotonic() + 600
+            while not advance_once(args, finalizing=True, selected_aba_modes=selected):
+                if time.monotonic() >= deadline:
+                    raise WorkflowError('Finalizer waited 600 seconds for PBS output staging')
+                time.sleep(5)
+        elif args.watch or args.once:
+            while True:
+                if advance_once(args) or args.once:
+                    break
+                args.adopt_job_id = None
+                time.sleep(args.poll_interval_seconds)
+        else:
+            queue_all(args)
     except KeyboardInterrupt:
         parser.exit(130, 'Interrupted; rerun the same command and experiment ID to resume.\n')
     except (WorkflowError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:

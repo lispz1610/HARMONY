@@ -38,6 +38,11 @@ if [[ -n "${HARMONY_SAMPLE_TIMEOUT_SECONDS:-}" ]]; then
     runner_args+=(--sample-timeout-seconds "$HARMONY_SAMPLE_TIMEOUT_SECONDS")
 fi
 python3 benchmarks/run_variability.py "${runner_args[@]}"
+if [[ "$mode" == pilot ]]; then
+    python3 benchmarks/analyze_pilot.py \
+        --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \
+        --output "$HARMONY_VARIABILITY_RUN_DIR/pilot-analysis.md"
+fi
 if [[ "${HARMONY_VARIABILITY_MODE:-pilot}" == full && -n "${HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL:-}" ]]; then
     python3 benchmarks/capture_diagnostic.py --execute \
         --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \

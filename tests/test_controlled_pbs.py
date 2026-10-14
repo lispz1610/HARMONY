@@ -30,10 +30,12 @@ class ControlledPbsTests(unittest.TestCase):
                 '#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n'
                 "Path(sys.argv[sys.argv.index('--output') + 1]).write_text('validated\\n')\n")
         (self.root / 'cluster_build.sh').write_text('#!/bin/bash\nexit 99\n')
-        (self.root / 'job_harmony_variability.pbs').write_text('#!/bin/bash\n')
+        for name in ('job_harmony_variability.pbs', 'job_harmony_variability_finalize.pbs'):
+            shutil.copy2(REPO / name, self.root / name)
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
         subprocess.run(['git', 'add', 'benchmarks', 'cluster_build.sh',
-                        'job_harmony_variability.pbs'], cwd=self.root, check=True)
+                        'job_harmony_variability.pbs',
+                        'job_harmony_variability_finalize.pbs'], cwd=self.root, check=True)
         subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
                         'commit', '-qm', 'fixture'], cwd=self.root, check=True)
         revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root,
@@ -53,12 +55,16 @@ class ControlledPbsTests(unittest.TestCase):
         scripts.mkdir()
         qsub = scripts / 'qsub'
         qsub.write_text('''#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 from pathlib import Path
 counter = Path(os.environ['FAKE_QSUB_COUNT'])
 count = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(count))
-if os.environ.get('FAKE_QSUB_BAD'):
+if os.environ.get('FAKE_QSUB_LOG'):
+    with Path(os.environ['FAKE_QSUB_LOG']).open('a') as log:
+        log.write(json.dumps(dict(argv=sys.argv[1:], mode=os.environ.get('HARMONY_VARIABILITY_MODE'),
+                                  finalize=os.environ.get('HARMONY_FINALIZE_ABA_MODES'))) + '\\n')
+if os.environ.get('FAKE_QSUB_BAD') or os.environ.get('FAKE_QSUB_BAD_AT') == str(count):
     print('submission response unavailable')
     sys.exit(1)
 print(f'{122 + count}.fake')
@@ -81,7 +87,8 @@ if state == 'F':
 ''')
         qstat.chmod(0o755)
         self.env = dict(os.environ, PATH=str(scripts) + os.pathsep + os.environ['PATH'],
-                        FAKE_QSUB_COUNT=str(self.root / 'qsub-count'))
+                        FAKE_QSUB_COUNT=str(self.root / 'qsub-count'),
+                        FAKE_QSUB_LOG=str(self.root / 'qsub-log.jsonl'))
         self.command = [sys.executable, str(self.root / 'benchmarks' / 'controlled_pbs.py'),
                         '--experiment-id', 'sample', '--results-root', str(self.root / 'Results')]
         self.workflow_root = self.root / 'Results' / 'controlled-sample'
@@ -92,6 +99,119 @@ if state == 'F':
 
     def workflow(self):
         return json.loads((self.workflow_root / 'workflow.json').read_text())
+
+    def requests(self):
+        return [json.loads(line) for line in (self.root / 'qsub-log.jsonl').read_text().splitlines()]
+
+    def test_default_command_queues_every_stage_and_finalizer_once(self):
+        first = subprocess.run(self.command, cwd=self.root, env=self.env,
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('All PBS jobs queued', first.stdout)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '4')
+        requests = self.requests()
+        self.assertEqual([item['mode'] for item in requests],
+                         ['pilot', 'smoke', 'full', None])
+        self.assertEqual([item['finalize'] for item in requests],
+                         [None, None, None, ''])
+        for index, prior in [(1, '123.fake'), (2, '124.fake'), (3, '125.fake')]:
+            self.assertIn(f'depend=afterok:{prior}', requests[index]['argv'])
+        self.assertFalse(any(arg.startswith('depend=') for arg in requests[0]['argv']))
+        self.assertEqual([self.workflow()['stages'][mode]['job_id']
+                          for mode in ('pilot', 'smoke', 'full')],
+                         ['123.fake', '124.fake', '125.fake'])
+        self.assertEqual(self.workflow()['finalizers']['baseline']['job_id'], '126.fake')
+        second = subprocess.run(self.command, cwd=self.root, env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '4')
+
+    def test_queue_resumes_after_ambiguous_second_submission(self):
+        bad = dict(self.env, FAKE_QSUB_BAD_AT='2')
+        first = subprocess.run(self.command, cwd=self.root, env=bad,
+                               capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(self.workflow()['stages']['smoke']['status'], 'submission_pending')
+        repeated = subprocess.run(self.command, cwd=self.root, env=self.env,
+                                  capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '2')
+        name = self.workflow()['stages']['smoke']['job_name']
+        adopted = subprocess.run([*self.command, '--adopt-job-id', '124.fake'],
+                                 cwd=self.root, env=dict(self.env, FAKE_JOB_NAME=name),
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '4')
+        self.assertIn('depend=afterok:124.fake', self.requests()[2]['argv'])
+
+    def test_optional_aba_jobs_are_queued_in_the_same_dependency_chain(self):
+        command = [*self.command, '--aba-workload', 'kneighbor',
+                   '--aba-workload', 'leanmd']
+        result = subprocess.run(command, cwd=self.root, env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '6')
+        requests = self.requests()
+        self.assertEqual([item['mode'] for item in requests],
+                         ['pilot', 'smoke', 'full', 'aba', 'aba', None])
+        self.assertEqual(requests[-1]['finalize'], 'aba-kneighbor,aba-leanmd')
+        self.assertIn('depend=afterok:125.fake', requests[3]['argv'])
+        self.assertIn('depend=afterok:126.fake', requests[4]['argv'])
+        self.assertIn('depend=afterok:127.fake', requests[5]['argv'])
+
+    def test_later_aba_followup_queues_after_completed_baseline(self):
+        queued = subprocess.run(self.command, cwd=self.root, env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(queued.returncode, 0, queued.stderr)
+        for mode, job_id in [('pilot', '123.fake'), ('smoke', '124.fake'),
+                             ('full', '125.fake')]:
+            self.finish_job(mode, job_id)
+        finalized = subprocess.run([*self.command, '--finalize'], cwd=self.root,
+                                   env=dict(self.env, PBS_JOBID='126.fake', FAKE_JOB_STATE='F'),
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(finalized.returncode, 0, finalized.stderr)
+        followup = subprocess.run([*self.command, '--aba-workload', 'kneighbor'],
+                                  cwd=self.root, env=self.env,
+                                  capture_output=True, text=True, timeout=10)
+        self.assertEqual(followup.returncode, 0, followup.stderr)
+        self.assertEqual((self.root / 'qsub-count').read_text(), '6')
+        self.assertEqual(self.requests()[4]['mode'], 'aba')
+        self.assertFalse(any(arg.startswith('depend=') for arg in self.requests()[4]['argv']))
+        self.assertIn('depend=afterok:127.fake', self.requests()[5]['argv'])
+
+    def test_finalizer_collects_queued_jobs_inside_pbs_allocation(self):
+        queued = subprocess.run(self.command, cwd=self.root, env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(queued.returncode, 0, queued.stderr)
+        for mode, job_id in [('pilot', '123.fake'), ('smoke', '124.fake'),
+                             ('full', '125.fake')]:
+            self.finish_job(mode, job_id)
+        finalizer = subprocess.run([*self.command, '--finalize'], cwd=self.root,
+                                   env=dict(self.env, PBS_JOBID='126.fake', FAKE_JOB_STATE='F'),
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(finalizer.returncode, 0, finalizer.stderr)
+        self.assertTrue((self.workflow_root / 'full-report.md').is_file())
+        self.assertEqual({mode: stage['status'] for mode, stage in self.workflow()['stages'].items()},
+                         {'pilot': 'complete', 'smoke': 'complete', 'full': 'complete'})
+
+    def test_pilot_job_fails_when_its_analysis_fails(self):
+        scripts = self.root / 'fake-bin'
+        (scripts / 'module').write_text('#!/bin/sh\nexit 0\n')
+        (scripts / 'module').chmod(0o755)
+        (scripts / 'python3').write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            '  benchmarks/run_variability.py) exit 0 ;;\n'
+            '  benchmarks/analyze_pilot.py) exit 42 ;;\n'
+            'esac\nexit 99\n')
+        (scripts / 'python3').chmod(0o755)
+        env = dict(self.env, PBS_O_WORKDIR=str(self.root), PBS_JOBID='123.fake',
+                   HARMONY_VARIABILITY_MODE='pilot',
+                   HARMONY_VARIABILITY_RUN_DIR=str(self.root / 'pilot'))
+        result = subprocess.run(['bash', str(self.root / 'job_harmony_variability.pbs')],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertIn('script_exit_code=42',
+                      (self.root / 'pilot.pbs.status').read_text())
 
     def finish_job(self, mode, job_id):
         run_dir = self.workflow_root / mode
@@ -104,6 +224,8 @@ if state == 'F':
             rejected_samples=0,
             build_manifest_sha256=self.workflow()['build_manifest_sha256'],
             environment=dict(pbs=dict(job_id=job_id)))))
+        if mode == 'pilot':
+            (run_dir / 'pilot-analysis.md').write_text('validated\n')
         if mode == 'smoke':
             paths = [run_dir / 'smoke_trace_summary.json',
                      run_dir / 'smoke.rank0.csv', run_dir / 'smoke.rank1.csv']
@@ -152,7 +274,7 @@ if state == 'F':
         worker = threading.Thread(target=finish_in_order)
         worker.start()
         try:
-            result = subprocess.run([*self.command, '--poll-interval-seconds', '1'],
+            result = subprocess.run([*self.command, '--watch', '--poll-interval-seconds', '1'],
                                     cwd=self.root, env=dict(self.env, FAKE_AUTO_DIR=str(done)),
                                     capture_output=True, text=True, timeout=15)
         finally:
@@ -165,14 +287,14 @@ if state == 'F':
                           self.workflow()['stages'].items()},
                          {'pilot': 'complete', 'smoke': 'complete', 'full': 'complete'})
         self.assertTrue((self.workflow_root / 'full-report.md').is_file())
-        repeated = subprocess.run([*self.command, '--poll-interval-seconds', '1'],
+        repeated = subprocess.run([*self.command, '--watch', '--poll-interval-seconds', '1'],
                                   cwd=self.root, env=dict(self.env, FAKE_AUTO_DIR=str(done)),
                                   capture_output=True, text=True, timeout=5)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual((self.root / 'qsub-count').read_text(), '3')
 
     def test_interrupted_wait_resumes_without_resubmitting(self):
-        process = subprocess.Popen([*self.command, '--poll-interval-seconds', '1'],
+        process = subprocess.Popen([*self.command, '--watch', '--poll-interval-seconds', '1'],
                                    cwd=self.root, env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:

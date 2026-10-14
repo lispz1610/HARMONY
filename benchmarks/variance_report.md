@@ -14,8 +14,9 @@ The evaluated HWTOPOLB variant uses throughput and seeded perturbation. It does 
 
 ## Controlled report command
 
-The resumable command in `docs/controlled-gpu-variance-run.md` submits the
-pilot, diagnostic smoke, and full matrix in order. It writes
+The resumable command in `docs/controlled-gpu-variance-run.md` queues the
+pilot, diagnostic smoke, full matrix, and finalizer with PBS dependencies. The
+finalizer writes
 `Results/controlled-EXPERIMENT_ID/full-report.md` after validating the PBS
 records and the full run. Repeating the command does not replace that report.
 For an independent read-only revalidation from the preserved full-run directory:
