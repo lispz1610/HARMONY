@@ -66,6 +66,17 @@ class RunnerCLITests(unittest.TestCase):
             self.assertEqual([row['workload'] for row in samples], ['kneighbor'] * 3)
             self.assertTrue(all('/aba/' in row['csv'] for row in samples))
 
+    def test_smoke_preview_pairs_one_unprofiled_and_one_traced_gpu_condition(self):
+        samples = self.preview('smoke')['invocations']
+        self.assertEqual(len(samples), 2)
+        self.assertEqual([(row['workload'], row['seed'], row['algorithm'], row['n'])
+                          for row in samples], [('kneighbor', 123, 'hwtopolb', 100000)] * 2)
+        self.assertEqual([row['iterations'] for row in samples], [100, 100])
+        self.assertIsNone(samples[0]['diagnostics_prefix'])
+        self.assertNotIn('--diagnostics-prefix', samples[0]['argv'])
+        self.assertIn('--diagnostics-prefix', samples[1]['argv'])
+        self.assertEqual(len({row['csv'] for row in samples}), 2)
+
 
 if __name__ == '__main__':
     unittest.main()

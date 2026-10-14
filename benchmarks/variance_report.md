@@ -14,21 +14,32 @@ The evaluated HWTOPOLB variant uses throughput and seeded perturbation. It does 
 
 ## Controlled report command
 
-After completing the pilot, two-rank diagnostic trace, unprofiled full matrix, and halo reference under PBS, generate a report from the preserved full-run directory:
+The resumable command in `docs/controlled-gpu-variance-run.md` submits the
+pilot, diagnostic smoke, and full matrix in order. It writes
+`Results/controlled-EXPERIMENT_ID/full-report.md` after validating the PBS
+records and the full run. Repeating the command does not replace that report.
+For an independent read-only revalidation from the preserved full-run directory:
 
 ```sh
 python3 benchmarks/report_variability.py \
-  --run-dir "$PWD/Results/full-YYYYMMDD-unique" \
-  --output "$PWD/Results/full-YYYYMMDD-unique-report.md" \
-  --diagnostic-manifest "$PWD/Results/full-YYYYMMDD-unique/diagnostic-7/diagnostic.manifest.json" \
-  --aba-run-dir "$PWD/Results/aba-kneighbor-YYYYMMDD-unique"
+  --run-dir "$PWD/Results/controlled-EXPERIMENT_ID/full" \
+  --output "$PWD/Results/controlled-EXPERIMENT_ID/independent-report.md" \
+  --diagnostic-manifest "$PWD/Results/controlled-EXPERIMENT_ID/full/diagnostic-8/diagnostic.manifest.json"
 ```
 
 The command reads the `run_manifest.json`, four warm-ups, 60 full samples, and the full-run `halo_reference` record. It validates each sample's successful launcher exit, CSV, log, inventory, build digest, strict GPU mapping against the run baseline, reference result, order, and unique paths before reporting the 30 adjacent pairs. It calculates each ERAD/HWTOPOLB loop-time ratio within its pair and reports median, min/max, and Tukey-hinge quartiles for each workload and seed. The raw paired table keeps the primary complete-loop time, secondary full-wall time, post-loop validation time, and descriptive `loop minus sum of step maxima` gap separate. MPI maxima may come from different ranks, so that gap is not an additive phase residual and may be negative. The command refuses to overwrite an existing output file. The pilot and traced diagnostic runs never enter the headline matrix.
 
 A useful gain requires every workload/seed median paired ratio to reach `1/0.9`, with stable repetitions. The predeclared stability check requires `(Q3-Q1)/median <= 0.10`, `Q1 >= 1/0.9`, and no more than 10% early-versus-late paired-ratio median drift (first two versus last two pairs in run order). The report also shows the raw loop-time range for each algorithm. A near-threshold or unstable group calls for more rotated samples or an inconclusive conclusion. A seed-level reversal blocks a general gain claim. If seed 123 remains anomalous, run a separate same-allocation ERAD/HWTOPOLB/ERAD diagnostic sequence; preserve its exact order and raw artifacts outside the paired estimate.
 
-The diagnostic manifest is optional. To capture one automatically on the **same PBS allocation** as a full run, set `HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL` to an accepted full-matrix invocation ordinal (5–64) before submitting `job_harmony_variability.pbs`; the wrapper runs `capture_diagnostic.py` after the unprofiled matrix and writes a new `diagnostic-ORDINAL/` directory. Preview a planned capture inside that allocation with `python3 benchmarks/capture_diagnostic.py --dry-run --run-dir RUN --sample-ordinal ORDINAL --output-dir NEW_DIR`. The capture records the exact command, PBS job, build and binary hashes, raw artifact hashes, trace paths, and matched unprofiled sample. It marks the manifest `captured` after exit zero and all five files exist; this is not an accepted diagnosis. The report independently validates the raw GPU outputs and traces. The capture never replaces a headline sample.
+The coordinator defaults to diagnostic ordinal 8 and passes that selection to
+the PBS wrapper. The wrapper runs `capture_diagnostic.py` after the unprofiled
+matrix on the **same allocation** and writes a new `diagnostic-ORDINAL/`
+directory. The capture records the exact command, PBS job, build and binary
+hashes, raw artifact hashes, trace paths, and matched unprofiled sample. It
+marks the manifest `captured` after exit zero and all five files exist; the
+report independently validates the raw GPU outputs and traces. The capture
+never replaces a headline sample. Use `--diagnostic-ordinal` on the
+coordinator to change the condition before the first submission.
 
 When `--diagnostic-manifest` is supplied, the report independently validates both raw rank trace files with `validate_trace.py`, checks their GPU identity and diagnostic log against the same-allocation full run, and reports each rank's `loop_total` minus its nonoverlapping host phases. OpenCL event time remains a separate overlapping device timeline. The report cites rank, trace sequence, step time, old/new partition offsets and counts, and host/device timing for iteration 0 and iterations adjacent to every scheduled rebalance boundary. It does not infer a cause from one diagnostic invocation. A matching fast/control trace and the isolated A/B/A follow-up are still needed if seed 123 reverses. Without a diagnostic manifest, the report remains explicitly provisional. If measured rank-local host phases fail to reconcile with that rank's loop, state the missing measurement and do not attribute the remainder to a particular component.
 

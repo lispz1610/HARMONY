@@ -49,6 +49,43 @@ ranks = [dict(rank=rank, host=f'node{rank}', gpu_count=1, local_index=0, global_
 if os.environ.get('FAKE_WRONG_GPU_COUNT'):
     ranks[1]['gpu_count'] = 2
 Path(value('--device-inventory-json')).write_text(json.dumps({'schema_version': 1, 'ranks': ranks}))
+if os.environ.get('FAKE_WRITE_TRACE') and '--diagnostics-prefix' in sys.argv:
+    columns = ['schema_version', 'rank', 'seq', 'iteration', 'seed', 'algorithm',
+               'record_type', 'phase', 'part', 'device_global', 'owner_rank',
+               'local_index', 'offset', 'count', 'duration_s', 'device_event_s',
+               'boundary_shift_elements_estimate', 'transfer_bytes_measured',
+               'device_name', 'device_kind', 'device_identity']
+    for rank in (0, 1):
+        path = Path(value('--diagnostics-prefix') + f'.rank{rank}.csv')
+        with path.open('w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            seq = 0
+            def emit(iteration, record_type, phase='', **fields):
+                global seq
+                writer.writerow(dict(schema_version=1, rank=rank, seq=seq,
+                                     iteration=iteration, seed=value('--seed'),
+                                     algorithm=value('--balance-algo'),
+                                     record_type=record_type, phase=phase, **fields))
+                seq += 1
+            emit(-1, 'inventory', device_global=rank, owner_rank=rank,
+                 local_index=0, device_name='fake GPU', device_kind='gpu',
+                 device_identity=f'uuid:gpu-{rank}')
+            for iteration in range(count):
+                for phase in ('old', 'new'):
+                    for part in (0, 1):
+                        emit(iteration, 'partition', phase, part=part,
+                             device_global=part, owner_rank=part, local_index=0,
+                             offset=part * 50000, count=50000)
+                if iteration > 0 and iteration % 10 == 0:
+                    emit(iteration, 'phase', 'rebalance_plan', duration_s=0.001)
+                    emit(iteration, 'phase', 'rebalance_apply', duration_s=0.001)
+                emit(iteration, 'phase', 'runtime_execute', duration_s=0.01)
+                emit(iteration, 'device_event', part=rank, device_event_s=0.005)
+                emit(iteration, 'phase', 'mpi_step_max', duration_s=0.01)
+                emit(iteration, 'phase', 'mpi_device_times', duration_s=0.001)
+            for phase in ('loop_total', 'gather', 'reference', 'mpi_validation'):
+                emit(count, 'phase', phase, duration_s=1.0 if phase == 'loop_total' else 0.01)
 summary_mode = 'cpu_simulation' if os.environ.get('FAKE_SUMMARY_CPU') else mode
 print(f'mode={summary_mode} validation=PASS loop_time_s=1.0 '
       'validation_time_s=0.1 total_time_s=1.1')
@@ -252,6 +289,39 @@ class ExecuteGates(unittest.TestCase):
             self.assertEqual(report.returncode, 0, report.stderr)
             self.assertIn('Validated 30 adjacent pairs',
                           (root / 'full-report.md').read_text())
+
+    def test_smoke_rejects_missing_rank_traces_after_gpu_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'smoke'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(process.returncode, 0)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['mode'], 'smoke')
+            self.assertEqual(run['status'], 'rejected')
+            self.assertEqual(run['halo_reference']['status'], 'passed')
+            samples = [json.loads(Path(row['manifest']).read_text())
+                       for row in run['invocations']]
+            self.assertEqual([row['status'] for row in samples], ['accepted', 'rejected'])
+            self.assertIn('rank traces failed validation', samples[1]['rejection_reason'])
+            self.assertNotIn('smoke_comparison', run)
+
+    def test_smoke_accepts_two_rank_traces_and_records_overhead(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'smoke'
+            env['FAKE_WRITE_TRACE'] = '1'
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['status'], 'completed')
+            self.assertEqual(run['rejected_samples'], 0)
+            comparison = run['smoke_comparison']
+            self.assertEqual(comparison['trace_overhead_ratio'], 1.0)
+            self.assertEqual(len(comparison['trace']['rank_traces']), 2)
+            self.assertTrue((root / 'run' / 'smoke_trace_summary.json').is_file())
 
 
 if __name__ == '__main__':

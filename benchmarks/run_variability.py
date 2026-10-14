@@ -40,13 +40,14 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations, aba_workload=None):
     rows = []
     count = 0
 
-    def add(phase, repetition, workload, seed, algorithm, pair_id=None):
+    def add(phase, repetition, workload, seed, algorithm, pair_id=None,
+            n=1000000, diagnostics=False):
         nonlocal count
         count += 1
         stem = f'{count:03d}_{workload}_{algorithm}_{seed}'
         prefix = run_dir / phase / stem
-        iterations = 100 if phase in ('full', 'warmup', 'aba') else pilot_iterations
-        argv = [str(bin_dir / f'{workload}.out'), '--n', '1000000',
+        iterations = 100 if phase in ('full', 'warmup', 'aba', 'smoke') else pilot_iterations
+        argv = [str(bin_dir / f'{workload}.out'), '--n', str(n),
                 '--iterations', str(iterations), '--balance-interval', '10',
                 '--perturbation', '0.10', '--seed', str(seed),
                 '--balance-algo', algorithm,
@@ -54,14 +55,21 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations, aba_workload=None):
                 '--output-csv', str(prefix) + '.csv',
                 '--device-inventory-json', str(prefix) + '.inventory.json',
                 '--require-two-rank-gpu', '--quiet-runtime-metrics']
+        diagnostic_prefix = str(prefix) + '.trace' if diagnostics else None
+        if diagnostics:
+            argv += ['--diagnostics-prefix', diagnostic_prefix]
         rows.append(dict(phase=phase, ordinal=count, repetition=repetition,
                          workload=workload, seed=seed, algorithm=algorithm,
-                         pair_id=pair_id, iterations=iterations, argv=argv,
+                         pair_id=pair_id, iterations=iterations, n=n,
+                         diagnostics_prefix=diagnostic_prefix, argv=argv,
                          csv=str(prefix) + '.csv', log=str(prefix) + '.log',
                          inventory=str(prefix) + '.inventory.json',
                          manifest=str(prefix) + '.manifest.json'))
 
-    if mode == 'aba':
+    if mode == 'smoke':
+        add('smoke', 1, 'kneighbor', 123, 'hwtopolb', n=100000)
+        add('smoke', 1, 'kneighbor', 123, 'hwtopolb', n=100000, diagnostics=True)
+    elif mode == 'aba':
         for algorithm in ('erad', 'hwtopolb', 'erad'):
             add('aba', 1, aba_workload, 123, algorithm)
     elif mode == 'full':
@@ -71,7 +79,7 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations, aba_workload=None):
         repetitions = range(5)
     elif mode == 'pilot':
         repetitions = range(2)
-    for repetition in repetitions if mode != 'aba' else ():
+    for repetition in repetitions if mode in ('pilot', 'full') else ():
         seeds = SEEDS[repetition % len(SEEDS):] + SEEDS[:repetition % len(SEEDS)]
         algorithms = ALGORITHMS if repetition % 2 == 0 else ALGORITHMS[::-1]
         for workload in WORKLOADS:
@@ -216,6 +224,58 @@ def accepted_output(row):
         raise ValueError(f'Incomplete sample artifacts: {error}') from error
 
 
+def validate_smoke_csv(row):
+    with open(row['csv'], newline='', encoding='utf-8') as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != ['iteration', 'step_time_s', 'action', 'rebalanced',
+                                 'rebalance_gain', 'execution_mode']:
+            raise ValueError('Smoke CSV has an unexpected schema')
+        for iteration, record in enumerate(reader):
+            rebalance = iteration > 0 and iteration % 10 == 0
+            if record['action'] != ('rebalance' if rebalance else 'compute') or \
+                    record['rebalanced'] != ('1' if rebalance else '0'):
+                raise ValueError(f'Smoke iteration {iteration} has wrong rebalance progress')
+
+
+def validate_smoke_trace(row, run_dir, mapping, times):
+    prefix = row['diagnostics_prefix']
+    summary = run_dir / 'smoke_trace_summary.json'
+    try:
+        result = subprocess.run([
+            sys.executable, str(Path(__file__).with_name('validate_trace.py')),
+            prefix, '--ranks', '2', '--iterations', '100', '--elements', '100000',
+            '--balance-interval', '10', '--summary-json', str(summary),
+        ], capture_output=True, text=True, check=False, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('Smoke rank trace validation timed out') from error
+    if result.returncode != 0:
+        raise ValueError(f'Smoke rank traces failed validation: {result.stderr.strip()}')
+    paths = [Path(f'{prefix}.rank{rank}.csv') for rank in (0, 1)]
+    if not summary.is_file() or any(not path.is_file() for path in paths):
+        raise ValueError('Smoke trace summary or rank trace is missing')
+    contents = json.loads(summary.read_text(encoding='utf-8'))
+    if contents.get('seed') != '123' or contents.get('algorithm') != 'hwtopolb' or \
+            contents.get('iterations') != 100 or contents.get('elements') != 100000:
+        raise ValueError('Smoke trace summary differs from the planned condition')
+    ranks = contents.get('ranks')
+    if not isinstance(ranks, list) or len(ranks) != 2:
+        raise ValueError('Smoke trace summary lacks both ranks')
+    for rank, path in enumerate(paths):
+        with path.open(newline='', encoding='utf-8') as stream:
+            inventory = [record for record in csv.DictReader(stream)
+                         if record['record_type'] == 'inventory']
+        expected = mapping[rank]
+        if len(inventory) != 1 or inventory[0]['device_global'] != str(expected['global_index']) or \
+                inventory[0]['device_identity'] != \
+                f"{expected['identity_kind']}:{expected['identity']}":
+            raise ValueError(f'Smoke rank {rank} trace GPU differs from device inventory')
+    loops = [float(item['host_phase_totals_s']['loop_total']) for item in ranks]
+    if not math.isclose(max(loops), times['loop_time_s'], rel_tol=1e-4, abs_tol=1e-5):
+        raise ValueError('Smoke rank-local loop totals differ from benchmark loop time')
+    return dict(summary=str(summary), summary_sha256=digest(summary),
+                rank_traces=[dict(path=str(path), sha256=digest(path)) for path in paths])
+
+
 def execute(args, rows):
     bin_dir = args.bin_dir.resolve()
     build_manifest = args.build_manifest.resolve()
@@ -225,13 +285,14 @@ def execute(args, rows):
     run = dict(schema_version=1, mode=args.mode, status='running',
                build_manifest=str(build_manifest), build_manifest_sha256=digest(build_manifest),
                build=build, environment=environment_manifest(pbs),
-               input_parameters=dict(n=1000000, full_iterations=100,
+               input_parameters=dict(n=100000 if args.mode == 'smoke' else 1000000,
+                                     full_iterations=100,
                                      pilot_iterations=args.pilot_iterations,
                                      rebalance_interval=10, perturbation=0.10,
                                      kneighbor_k=5, leanmd_cutoff=4),
                invocations=rows, baseline_mapping=None)
     write_json(args.run_dir / 'run_manifest.json', run)
-    if args.mode in ('full', 'aba'):
+    if args.mode in ('full', 'aba', 'smoke'):
         halo = bin_dir / 'test_async_halo_opencl.out'
         halo_log = args.run_dir / 'halo_reference.log'
         check = dict(command=[pbs['launcher'], str(halo)], log=str(halo_log),
@@ -279,7 +340,10 @@ def execute(args, rows):
             build_verified(bin_dir, build_manifest)
             if digest(build_manifest) != run['build_manifest_sha256']:
                 raise ValueError('Build manifest changed during the run')
-            if any(Path(row[key]).exists() for key in ('csv', 'log', 'inventory')):
+            if any(Path(row[key]).exists() for key in ('csv', 'log', 'inventory')) or \
+                    (row['diagnostics_prefix'] and any(
+                        Path(f"{row['diagnostics_prefix']}.rank{rank}.csv").exists()
+                        for rank in (0, 1))):
                 raise ValueError('Sample artifact path already exists')
             sample['status'] = 'running'
             sample['started_at'] = datetime.now(timezone.utc).isoformat()
@@ -291,6 +355,12 @@ def execute(args, rows):
             if exit_code != 0:
                 raise ValueError(f'Benchmark exited {exit_code}')
             times, mapping = accepted_output(row)
+            if times['loop_time_s'] <= 0:
+                raise ValueError('Benchmark loop time must be positive')
+            if args.mode == 'smoke':
+                validate_smoke_csv(row)
+                if row['diagnostics_prefix']:
+                    sample['trace'] = validate_smoke_trace(row, args.run_dir, mapping, times)
             if row['pair_id']:
                 previous = pairs.get(row['pair_id'])
                 if previous and previous['mapping'] != mapping:
@@ -328,6 +398,17 @@ def execute(args, rows):
         if timed_out:
             break
     run['status'] = 'completed' if failures == 0 else 'rejected'
+    if args.mode == 'smoke' and failures == 0:
+        unprofiled, profiled = (
+            json.loads(Path(row['manifest']).read_text(encoding='utf-8')) for row in rows)
+        run['smoke_comparison'] = dict(
+            condition=dict(workload='kneighbor', seed=123, algorithm='hwtopolb',
+                           n=100000, iterations=100),
+            unprofiled_loop_s=unprofiled['times']['loop_time_s'],
+            profiled_loop_s=profiled['times']['loop_time_s'],
+            trace_overhead_ratio=(profiled['times']['loop_time_s'] /
+                                  unprofiled['times']['loop_time_s']),
+            trace=profiled['trace'])
     run['rejected_samples'] = sum(
         json.loads(Path(row['manifest']).read_text(encoding='utf-8'))['status'] == 'rejected'
         for row in rows if Path(row['manifest']).is_file())
@@ -341,7 +422,7 @@ def main():
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--dry-run', action='store_true')
     action.add_argument('--execute', action='store_true')
-    parser.add_argument('--mode', choices=('pilot', 'full', 'aba'), required=True)
+    parser.add_argument('--mode', choices=('pilot', 'smoke', 'full', 'aba'), required=True)
     parser.add_argument('--aba-workload', choices=WORKLOADS)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=Path('build/cluster'))

@@ -1,122 +1,88 @@
 # Controlled GPU variance run
 
-Build on the cluster frontend with `bash cluster_build.sh`. This writes
-`build/cluster/build_manifest.json` with source revision, source digest, compiler,
-flags, exact benchmark commands, OpenCL library, and SHA-256 values for both
-benchmarks and the two-rank asynchronous OpenCL halo test.
-The source digest covers C++ headers and sources in `dcl/` and `benchmarks/`,
-plus OpenCL kernels. The binary hashes are the execution gate.
-
-Preview without PBS, MPI, binaries, or filesystem writes:
+Run the coordinator on the cluster frontend from the published integration
+branch. Choose one stable experiment ID and reuse it for every invocation:
 
 ```sh
-python3 benchmarks/run_variability.py --dry-run --mode pilot --run-dir Results/pilot-2026-10-13
-python3 benchmarks/run_variability.py --dry-run --mode full --run-dir Results/full-2026-10-13
-python3 benchmarks/run_variability.py --dry-run --mode aba --aba-workload kneighbor --run-dir Results/aba-kneighbor-2026-10-13
+git fetch origin
+git switch --track origin/codex/implement-gpu-variance-spec
+python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a --preview
+python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
-The pilot has two 8-iteration repetitions of every workload, seed, and algorithm
-condition, with rotated seeds and alternating algorithm order. It is diagnostic
-and stays outside full-matrix statistics. The full plan has four warm-ups and
-60 timed samples (five repetitions per condition). Each ERAD/HWTOPOLB pair is
-adjacent. Both modes use `N=1,000,000`, interval 10, perturbation 0.10,
-k-neighbor `k=5`, and LeanMD cutoff 4. A different input needs a separate,
-clearly labeled protocol and run directory.
+The preview prints the pilot, diagnostic smoke, and full schedules without
+building, submitting, or writing files. The second command builds with
+`cluster_build.sh` if needed, verifies the C++20/OpenCL binaries and their
+source revision, then submits the pilot. **Run the same second command again**
+after each PBS job finishes. A call made while a job is queued or running only
+reports its state. Each completed call advances one gate:
 
-Submit from the cluster frontend with a new, unique output path each time:
+| Stage | PBS work | Evidence required before the next stage |
+| --- | --- | --- |
+| Pilot | 24 rotated eight-iteration GPU samples | All accepted; pilot analyzer validates order, rank mapping, iteration zero, and reference checks. |
+| Diagnostic smoke | Two 100-iteration k-neighbor seed-123 HWTOPOLB samples at `N=100,000`, one without a trace and one with rank-local traces, plus a two-rank halo reference | Both accepted on the same GPU mapping; complete trace from both ranks; trace overhead recorded outside headline timings. |
+| Full matrix | Two-rank halo reference, four warm-ups, 60 unprofiled 100-iteration samples at `N=1,000,000`, then one separate traced capture on the same allocation | All samples accepted; halo, numerical reference, and trace checks pass; 30 adjacent pairs appear in the report. |
+
+The default full-matrix diagnostic capture is invocation 8, k-neighbor /
+HWTOPOLB / seed 123. Choose another full-matrix ordinal (5–64) with
+`--diagnostic-ordinal ORDINAL` and repeat that option on every invocation.
+`--diagnostic-ordinal 0` disables the full-matrix capture and leaves phase
+attribution provisional. The smoke and capture are diagnostic runs and never
+enter the 30 paired performance comparisons.
+
+When the final report shows a persistent seed-123 reversal, request an
+isolated A/B/A run for each affected workload. Add the option to the same
+experiment ID and rerun until its PBS job is complete:
 
 ```sh
-export HARMONY_VARIABILITY_MODE=pilot
-export HARMONY_VARIABILITY_RUN_DIR="$PWD/Results/pilot-$(date -u +%Y%m%dT%H%M%SZ)"
-export HARMONY_PBS_OUTPUT_PATH="${HARMONY_VARIABILITY_RUN_DIR}.pbs.out"
-test ! -e "$HARMONY_VARIABILITY_RUN_DIR"
-test ! -e "$HARMONY_PBS_OUTPUT_PATH"
-qsub -o "$HARMONY_PBS_OUTPUT_PATH" -j oe -V job_harmony_variability.pbs
+python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a \
+  --aba-workload kneighbor
 ```
 
-Inspect the pilot run manifest and all 24 sample manifests, CSVs, logs, and
-device inventories. Every sample must be accepted with finite timing,
-`validation=PASS`, two physical GPUs, and complete GPU iterations. Run the
-two-rank diagnostic trace separately and compare it with an uninstrumented
-condition before interpreting phase timings. Do not include pilot or traced
-runs in the full-matrix statistics.
+Use `--aba-workload leanmd` as well if LeanMD reverses. Requests are additive;
+already accepted A/B/A runs are not repeated. The coordinator generates a new
+report containing the three raw ERAD/HWTOPOLB/ERAD timings, separately from
+the original paired estimate.
 
-After the pilot, diagnostic, and numerical checks pass, repeat with
-`HARMONY_VARIABILITY_MODE=full` and a fresh `Results/full-...` directory. The
-full executor first runs the prebuilt two-rank asynchronous OpenCL halo test
-on the same PBS allocation. It requires exit code 0 and the CPU-reference
-`PASS` marker; `SKIP`, mismatch, timeout, or missing binary rejects the run
-before any warm-up or timed sample. Preserve `halo_reference.log` and the
-`halo_reference` result in `run_manifest.json`.
+## What a rerun preserves
 
-PBS stdout/stderr is written to the unique `HARMONY_PBS_OUTPUT_PATH` sibling
-path and recorded in the run manifest. The PBS script writes its own exit code
-and job ID to `${HARMONY_VARIABILITY_RUN_DIR}.pbs.status`. Once the scheduler
-has finished writing output, copy both sibling artifacts into the run directory
-without replacing any existing file:
+All output is under `Results/controlled-EXPERIMENT_ID/`, which is ignored by
+Git. `workflow.json` records the pinned build hash, PBS job IDs, stage results,
+and report hashes. Each stage has a unique run directory and sibling PBS output
+and script-status files. After a terminal scheduler record with exit status
+zero, the coordinator copies the PBS output, script status, scheduler record,
+and build manifest into that stage directory without overwriting existing
+files. It validates the raw run before submitting the next stage. Pilot and
+full reports are written once and checked by hash on subsequent invocations.
 
-```sh
-cp -n "$HARMONY_PBS_OUTPUT_PATH" "$HARMONY_VARIABILITY_RUN_DIR/pbs.out"
-cp -n "${HARMONY_VARIABILITY_RUN_DIR}.pbs.status" "$HARMONY_VARIABILITY_RUN_DIR/pbs.status"
-qstat -xf JOBID > "$HARMONY_VARIABILITY_RUN_DIR/pbs.scheduler-status.txt"
-```
+The coordinator holds a lock while checking and advancing state. It records a
+submission intent **before** calling `qsub`, so an interrupted or ambiguous
+submission cannot silently create a second job. If it reports an uncertain
+submission, inspect `qstat` for the recorded job name and resume with
+`--adopt-job-id JOBID`. Adoption verifies the job name. Never start a new ID
+merely because a queued job has not produced a run directory yet.
 
-If `qstat` no longer retains the job, record the exit status from the site
-accounting command in `pbs.scheduler-status.txt`. The script status is not a
-substitute for the scheduler's final status. Do not infer success from CSV
-presence. Retain all raw sample logs, CSVs, inventories, per-sample manifests,
-the run manifest, PBS artifacts, and build manifest together in the ignored
-dated results archive. Keep the historical archive untouched.
-The executor does not resume or overwrite a run directory. It verifies both
-binary digests before every invocation. Missing PBS job/nodefile, wrong two-node
-slot shape, missing `prun`, or changed binaries refuse execution.
+If `qstat -xf JOBID` becomes unavailable after completion, provide a saved
+raw terminal `qstat -xf` record with `--scheduler-record MODE=PATH`, where MODE
+is `pilot`, `smoke`, `full`, `aba-kneighbor`, or `aba-leanmd`. The record must
+contain the matching job ID and exit status. The script does not infer
+scheduler success from CSV presence or the PBS script status alone.
 
-The executor depends on benchmark support for `--require-two-rank-gpu`,
-`--device-inventory-json`, `loop_time_s`, `validation_time_s`, and
-`validation=PASS` from issue #6. Build the integrated branch before submission.
+A rejected sample, failed PBS job, changed binary/source revision, changed
+workflow option, or modified preserved artifact stops this experiment ID.
+Keep its raw evidence and use a **new** ID after repairing the cause. The
+sample timeout defaults to 1,800 seconds; `--sample-timeout-seconds N` may be
+set at the first invocation and must remain the same thereafter.
 
-Every sample has a separate CSV, log, device inventory JSON, and status manifest.
-The run manifest records the PBS allocation, build provenance hash, exact
-commands, input parameters, module list, MPI version, CPU model, and available
-GPU clock/power/contention observations. It also records the first accepted
-rank-to-device mapping as the run baseline. Each sample manifest records its
-launcher exit code, or `null` if it timed out or did not start. An unavailable optional observation
-is represented by `value: null` with an `unavailable_reason`. A sample is
-accepted only with complete GPU CSV iterations, a `gpu_opencl` summary,
-`validation=PASS`, finite
-`loop_time_s` and `validation_time_s`, and two stable, distinct physical GPU
-identities. A rejected sample and its raw artifacts remain in place. A paired
-sample is also rejected when its partner fails or the rank/device mapping
-changes. Never use pilot or diagnostic samples as full timed data.
+The build manifest records the compiler, exact flags, source revision and
+digest, OpenCL library, and binary SHA-256 hashes. Each sample requires exactly
+two ranks and one verifiable physical OpenCL GPU per rank, ordered GPU CSV
+iterations, `validation=PASS`, a `gpu_opencl` summary, finite positive loop
+time, and stable mapping. Unavailable clock, power, or contention observations
+are recorded as unavailable. A local CPU simulation or this script's mock PBS
+tests do not validate GPU kernels or establish a performance gain.
 
-Each rank inventory also records CPU affinity, or an explicit reason when it
-cannot be read. Each benchmark invocation has a default 1,800-second timeout.
-On timeout, the runner terminates the local launcher process group, preserves
-the partial log and sample manifest, marks the run rejected, and stops the
-remaining schedule. Set `HARMONY_SAMPLE_TIMEOUT_SECONDS` before `qsub` only
-when the allocation walltime and input size justify another positive limit.
-
-If seed 123 still reverses the result in the full matrix, submit a separate
-isolated A/B/A job for each affected workload. Use a fresh output directory
-and the same frontend build manifest:
-
-```sh
-export HARMONY_VARIABILITY_MODE=aba
-export HARMONY_ABA_WORKLOAD=kneighbor
-export HARMONY_VARIABILITY_RUN_DIR="$PWD/Results/aba-kneighbor-$(date -u +%Y%m%dT%H%M%SZ)"
-export HARMONY_PBS_OUTPUT_PATH="${HARMONY_VARIABILITY_RUN_DIR}.pbs.out"
-test ! -e "$HARMONY_VARIABILITY_RUN_DIR"
-test ! -e "$HARMONY_PBS_OUTPUT_PATH"
-qsub -o "$HARMONY_PBS_OUTPUT_PATH" -j oe -V job_harmony_variability.pbs
-```
-
-Repeat with `HARMONY_ABA_WORKLOAD=leanmd` if that workload also reverses.
-The `aba` mode runs the two-rank halo reference and then exactly three
-unprofiled seed-123 invocations in ERAD/HWTOPOLB/ERAD order on one PBS
-allocation. It requires the same input and binary hashes as the full matrix;
-retain all three raw CSVs, logs, inventories, manifests, PBS output, and exit
-status. Pass each accepted A/B/A directory with `--aba-run-dir` when generating
-the final report. These runs never enter its 30 paired samples.
-
-This workspace has no PBS launcher or real GPU. The two-rank cluster execution
-and all hardware measurements are pending manual validation.
+After the workflow finishes, preserve the entire
+`Results/controlled-EXPERIMENT_ID/` tree, including all raw CSVs, logs,
+inventories, manifests, rank traces, PBS records, and reports, and provide it
+for review before closing the GPU-dependent issues.
