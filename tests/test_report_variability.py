@@ -320,11 +320,13 @@ class ReportCommandTests(unittest.TestCase):
         nodefile.write_text('node0\nnode1\n')
         env = dict(os.environ, PBS_JOBID='123.cluster', PBS_NODEFILE=str(nodefile))
         command = [sys.executable, str(CAPTURE), '--dry-run', '--run-dir', str(self.run),
-                   '--sample-ordinal', '5', '--output-dir', str(self.root / 'diagnostic')]
+                   '--sample-ordinal', '5', '--output-dir', str(self.root / 'diagnostic'),
+                   '--sample-timeout-seconds', '7']
         result = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         preview = json.loads(result.stdout)
         self.assertIn('--diagnostics-prefix', preview['command'])
+        self.assertEqual(preview['sample_timeout_seconds'], 7)
         self.assertEqual(preview['pbs']['job_id'], '123.cluster')
         self.assertFalse((self.root / 'diagnostic').exists())
         env['PBS_JOBID'] = 'other.cluster'
