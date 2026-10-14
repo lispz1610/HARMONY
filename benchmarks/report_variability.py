@@ -249,6 +249,102 @@ def halo_reference(run, root):
     return True, 'verified from the full-run halo log and exit status'
 
 
+def aba_evidence(run_dir, full_run):
+    """Validate an isolated same-allocation seed-123 A/B/A sequence."""
+    root = run_dir.resolve()
+    run = json_file(root / 'run_manifest.json')
+    if run.get('schema_version') != 1 or run.get('mode') != 'aba' or \
+            run.get('status') != 'completed' or run.get('rejected_samples') != 0:
+        raise InvalidRun('Expected a completed, unrejected A/B/A run')
+    if run.get('build_manifest_sha256') != full_run['build_manifest_sha256'] or \
+            run.get('input_parameters') != full_run['input_parameters']:
+        raise InvalidRun('A/B/A build or fixed input differs from the full matrix')
+    pbs = run.get('environment', {}).get('pbs', {})
+    if not isinstance(pbs, dict) or not pbs.get('job_id') or \
+            not isinstance(pbs.get('slots'), list) or len(pbs['slots']) != 2 or \
+            len(set(pbs['slots'])) != 2 or not str(pbs.get('launcher', '')).endswith('prun'):
+        raise InvalidRun('A/B/A lacks a two-node PBS allocation')
+    halo_ok, halo_detail = halo_reference(run, root)
+    if not halo_ok:
+        raise InvalidRun(f'A/B/A halo reference failed: {halo_detail}')
+    planned = run.get('invocations')
+    if not isinstance(planned, list) or len(planned) != 3 or \
+            not isinstance(planned[0], dict) or planned[0].get('workload') not in WORKLOADS:
+        raise InvalidRun('A/B/A must contain exactly three invocations of one workload')
+    workload = planned[0]['workload']
+    expected = schedule(root, Path('/unused/binaries'), 'aba', 8, workload)
+    baseline = None
+    result = []
+    for row, reference in zip(planned, expected):
+        label = f"A/B/A invocation {reference['ordinal']}"
+        if not isinstance(row, dict) or any(row.get(key) != reference[key] for key in
+                ('phase', 'ordinal', 'repetition', 'workload', 'seed', 'algorithm',
+                 'pair_id', 'iterations', 'csv', 'log', 'inventory', 'manifest')):
+            raise InvalidRun(f'{label}: wrong condition, order, or artifact path')
+        argv = row.get('argv')
+        if not isinstance(argv, list) or not str(argv[0]).endswith(f'/{workload}.out') or \
+                any(argv.count(flag) != 1 for flag in ('--require-two-rank-gpu',
+                                                        '--quiet-runtime-metrics')) or \
+                '--diagnostics-prefix' in argv:
+            raise InvalidRun(f'{label}: missing strict unprofiled benchmark arguments')
+        required = {'--n': '1000000', '--iterations': '100', '--balance-interval': '10',
+                    '--perturbation': '0.10', '--seed': '123',
+                    '--balance-algo': row['algorithm'],
+                    '--k': '5' if workload == 'kneighbor' else '4',
+                    '--output-csv': row['csv'], '--device-inventory-json': row['inventory']}
+        for flag, value in required.items():
+            if argv.count(flag) != 1 or argv[argv.index(flag) + 1:argv.index(flag) + 2] != [value]:
+                raise InvalidRun(f'{label}: wrong {flag} argument')
+        paths = {key: artifact(root, row.get(key), f'{label} {key}')
+                 for key in ('csv', 'log', 'inventory', 'manifest')}
+        sample = json_file(paths['manifest'])
+        if sample.get('status') != 'accepted' or sample.get('rejection_reason') is not None or \
+                sample.get('build_manifest_sha256') != run['build_manifest_sha256'] or \
+                any(sample.get(key) != row[key] for key in reference if key in row):
+            raise InvalidRun(f'{label}: rejected or inconsistent sample manifest')
+        try:
+            times, mapping = accepted_output(row)
+        except (ValueError, IndexError) as error:
+            raise InvalidRun(f'{label}: {error}') from error
+        if sample.get('mapping') != mapping or sample.get('times') != times:
+            raise InvalidRun(f'{label}: manifest differs from raw GPU evidence')
+        if baseline is None:
+            baseline = mapping
+        elif mapping != baseline:
+            raise InvalidRun(f'{label}: physical rank-to-GPU mapping changed')
+        total = log_number(paths['log'].read_text(encoding='utf-8'), 'total_time_s', label)
+        if total + 1e-9 < times['loop_time_s']:
+            raise InvalidRun(f'{label}: full wall is shorter than the loop')
+        result.append(dict(row=row, times=times, total=total, paths=paths,
+                           started_at=sample.get('started_at'),
+                           completed_at=sample.get('completed_at')))
+    return dict(run=run, workload=workload, samples=result, mapping=baseline)
+
+
+def render_aba(evidence):
+    run = evidence['run']
+    pbs = run['environment']['pbs']
+    lines = ['', '## Isolated seed-123 ERAD/HWTOPOLB/ERAD sequence', '',
+             f"PBS job `{pbs['job_id']}` on `{', '.join(pbs['slots'])}`; workload "
+             f"`{evidence['workload']}`; build SHA-256 `{run['build_manifest_sha256']}`. "
+             'All three invocations used the same allocation and stable rank-to-GPU '
+             'mapping. They are excluded from the 30 headline pairs.', '',
+             '| Order | Algorithm | Loop (s) | Validation (s) | Full wall (s) | '
+             'UTC start/end | Raw CSV/log/inventory |',
+             '| ---: | --- | ---: | ---: | ---: | --- | --- |']
+    for item in evidence['samples']:
+        row, times = item['row'], item['times']
+        lines.append(f"| {row['ordinal']} | {row['algorithm'].upper()} | "
+                     f"{times['loop_time_s']:.6f} | {times['validation_time_s']:.6f} | "
+                     f"{item['total']:.6f} | {item['started_at'] or 'unavailable'} / "
+                     f"{item['completed_at'] or 'unavailable'} | "
+                     f"`{row['csv']}`; `{row['log']}`; `{row['inventory']}` |")
+    lines += ['', 'This order check can show whether a slow condition repeats within one '
+              'allocation. It does not by itself identify a kernel, migration, MPI, or '
+              'cluster-state cause; compare the rank-local traces before attribution.', '']
+    return '\n'.join(lines)
+
+
 def diagnostic_evidence(manifest_path, run, rows):
     manifest_path = manifest_path.resolve()
     evidence = json_file(manifest_path)
@@ -408,20 +504,48 @@ def render_diagnostic(diag):
               'not added to host phases. Post-loop validation is outside `loop_total`. '
               'Boundary shifts are element-count estimates; transfer bytes are unknown '
               'unless the trace contains a measured byte count.', '']
+    lines += ['### Iterations around scheduled rebalance boundaries', '',
+              'Each row identifies its diagnostic run, rank trace, iteration, and '
+              'trace sequence. Partition values are `offset/count`; old and new '
+              'values are both shown for every global partition. Host phase '
+              'durations are rank-local and must not be summed with device events.', '',
+              '| Rank | Iteration | Step time (s) | Host phases (seconds; trace sequence) | '
+              'OpenCL device events (seconds; trace sequence) | '
+              'Partition old → new (offset/count; trace sequence) | Trace |',
+              '| ---: | ---: | ---: | --- | --- | --- | --- |']
+    with diag['paths']['csv'].open(newline='', encoding='utf-8') as stream:
+        step_times = {int(row['iteration']): row['step_time_s']
+                      for row in csv.DictReader(stream)}
+    selected = {0}
+    for boundary in range(10, 100, 10):
+        selected.update((boundary - 1, boundary, boundary + 1))
     for item in diag['ranks']:
-        first = [row for row in item['raw'] if row['iteration'] == '0' and
-                 row['record_type'] in ('phase', 'partition', 'device_event')]
-        lines += [f"### Rank {item['rank']}, iteration 0 (before rebalance)", '',
-                  '| Trace seq | Type/phase | Partition | Device/owner | Offset/count | Host duration (s) | '
-                  'Device event (s) |',
-                  '| ---: | --- | ---: | --- | --- | ---: | ---: |']
-        for row in first:
-            lines.append(f"| {row['seq']} | {row['record_type']}/{row['phase']} | "
-                         f"{row['part'] or '-'} | {row['device_global'] or '-'} / "
-                         f"{row['owner_rank'] or '-'} | {row['offset'] or '-'} / "
-                         f"{row['count'] or '-'} | {row['duration_s'] or '-'} | "
-                         f"{row['device_event_s'] or '-'} |")
-        lines.append('')
+        indexed = {}
+        for row in item['raw']:
+            if row['iteration'].isdigit() and int(row['iteration']) in selected:
+                indexed.setdefault(int(row['iteration']), []).append(row)
+        for iteration in sorted(selected):
+            records = indexed.get(iteration, [])
+            phases = [f"{row['phase']}={row['duration_s']} (trace#seq={row['seq']})"
+                      for row in records if row['record_type'] == 'phase']
+            events = [f"{row['phase']}={row['device_event_s']} (trace#seq={row['seq']})"
+                      for row in records if row['record_type'] == 'device_event']
+            partitions = []
+            old = {row['part']: row for row in records
+                   if row['record_type'] == 'partition' and row['phase'] == 'old'}
+            new = {row['part']: row for row in records
+                   if row['record_type'] == 'partition' and row['phase'] == 'new'}
+            for part in sorted(old, key=int):
+                before, after = old[part], new[part]
+                partitions.append(
+                    f"p{part}: {before['offset']}/{before['count']} "
+                    f"(trace#seq={before['seq']}) → {after['offset']}/{after['count']} "
+                    f"(trace#seq={after['seq']})")
+            lines.append(f"| {item['rank']} | iteration {iteration} | "
+                         f"{step_times[iteration]} | {'; '.join(phases)} | "
+                         f"{'; '.join(events) or 'unavailable'} | "
+                         f"{'; '.join(partitions)} | `{item['trace']}` |")
+    lines.append('')
     lines += ['The trace establishes timing and partition records for this diagnostic '
               'invocation only. A seed-dependent causal explanation requires matching '
               'fast/control traces and, when the seed-123 reversal persists, the separate '
@@ -478,13 +602,14 @@ def render(run, rows, pairs, halo_ok, halo_detail):
              f"Two-rank asynchronous halo reference: {'PASS' if halo_ok else 'pending/unavailable'} "
              f"({halo_detail}).",
              'The benchmark validation and halo reference are separate correctness gates.', '',
-             '| Rank | Node | GPU | Physical identity | OpenCL platform/version | Device/driver |',
-             '| ---: | --- | --- | --- | --- | --- |']
+             '| Rank | Node | GPU | Physical identity | OpenCL platform/version | Device/driver | CPU affinity |',
+             '| ---: | --- | --- | --- | --- | --- | --- |']
     for device in rows[0]['mapping']:
         lines.append(f"| {device['rank']} | {device['host']} | {device['name']} | "
                      f"{device['identity_kind']}:{device['identity']} | "
                      f"{device['platform_name']} / {device['platform_version']} | "
-                     f"{device['device_version']} / {device['driver_version']} |")
+                     f"{device['device_version']} / {device['driver_version']} | "
+                     f"{observation(device.get('cpu_affinity'))} |")
     lines += ['', '| Environment | Observation |', '| --- | --- |']
     for key in ('module_list', 'mpi_version', 'cpu_model', 'gpu_clock', 'gpu_power',
                 'gpu_contention', 'affinity'):
@@ -566,6 +691,7 @@ def main():
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--diagnostic-manifest', type=Path)
+    parser.add_argument('--aba-run-dir', type=Path, action='append')
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f'output already exists: {args.output}')
@@ -576,6 +702,8 @@ def main():
         if args.diagnostic_manifest:
             diag = diagnostic_evidence(args.diagnostic_manifest, run, rows)
             report += render_diagnostic(diag)
+        for aba_dir in args.aba_run_dir or []:
+            report += render_aba(aba_evidence(aba_dir, run))
         with args.output.open('x', encoding='utf-8') as stream:
             stream.write(report)
     except (InvalidRun, OSError, ValueError, TypeError, KeyError, IndexError) as error:

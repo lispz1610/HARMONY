@@ -2,6 +2,11 @@
 #define HARMONY_BENCHMARK_SAMPLE_ADMISSION_HPP
 
 #include <mpi.h>
+#ifdef __linux__
+#include <sched.h>
+#include <cerrno>
+#include <cstring>
+#endif
 
 #include <array>
 #include <fstream>
@@ -33,6 +38,27 @@ inline std::string json_string(const std::string& text) {
     }
     out << '"';
     return out.str();
+}
+
+inline std::string cpu_affinity_json() {
+#ifdef __linux__
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        std::ostringstream cpus;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &mask)) {
+                if (cpus.tellp() > 0) cpus << ',';
+                cpus << cpu;
+            }
+        }
+        return "{\"value\":" + json_string(cpus.str()) + ",\"unavailable_reason\":null}";
+    }
+    return "{\"value\":null,\"unavailable_reason\":" +
+           json_string(std::strerror(errno)) + '}';
+#else
+    return "{\"value\":null,\"unavailable_reason\":\"unsupported platform\"}";
+#endif
 }
 
 inline bool admit_sample(const dcl::Runtime& runtime, bool strict,
@@ -68,7 +94,8 @@ inline bool admit_sample(const dcl::Runtime& runtime, bool strict,
            << ",\"device_version\":" << json_string(device ? device->device_version : "")
            << ",\"driver_version\":" << json_string(device ? device->driver_version : "")
            << ",\"identity_kind\":" << json_string(device ? device->identity_kind : "unavailable")
-           << ",\"identity\":" << json_string(device ? device->identity : "") << '}';
+           << ",\"identity\":" << json_string(device ? device->identity : "")
+           << ",\"cpu_affinity\":" << cpu_affinity_json() << '}';
     const std::string local_record = record.str();
     int local_size = static_cast<int>(local_record.size());
     std::vector<int> sizes(runtime.size(), 0);

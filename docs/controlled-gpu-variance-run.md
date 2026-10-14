@@ -12,6 +12,7 @@ Preview without PBS, MPI, binaries, or filesystem writes:
 ```sh
 python3 benchmarks/run_variability.py --dry-run --mode pilot --run-dir Results/pilot-2026-10-13
 python3 benchmarks/run_variability.py --dry-run --mode full --run-dir Results/full-2026-10-13
+python3 benchmarks/run_variability.py --dry-run --mode aba --aba-workload kneighbor --run-dir Results/aba-kneighbor-2026-10-13
 ```
 
 The pilot has two 8-iteration repetitions of every workload, seed, and algorithm
@@ -84,6 +85,35 @@ accepted only with complete GPU CSV iterations, `validation=PASS`, finite
 identities. A rejected sample and its raw artifacts remain in place. A paired
 sample is also rejected when its partner fails or the rank/device mapping
 changes. Never use pilot or diagnostic samples as full timed data.
+
+Each rank inventory also records CPU affinity, or an explicit reason when it
+cannot be read. Each benchmark invocation has a default 1,800-second timeout.
+On timeout, the runner terminates the local launcher process group, preserves
+the partial log and sample manifest, marks the run rejected, and stops the
+remaining schedule. Set `HARMONY_SAMPLE_TIMEOUT_SECONDS` before `qsub` only
+when the allocation walltime and input size justify another positive limit.
+
+If seed 123 still reverses the result in the full matrix, submit a separate
+isolated A/B/A job for each affected workload. Use a fresh output directory
+and the same frontend build manifest:
+
+```sh
+export HARMONY_VARIABILITY_MODE=aba
+export HARMONY_ABA_WORKLOAD=kneighbor
+export HARMONY_VARIABILITY_RUN_DIR="$PWD/Results/aba-kneighbor-$(date -u +%Y%m%dT%H%M%SZ)"
+export HARMONY_PBS_OUTPUT_PATH="${HARMONY_VARIABILITY_RUN_DIR}.pbs.out"
+test ! -e "$HARMONY_VARIABILITY_RUN_DIR"
+test ! -e "$HARMONY_PBS_OUTPUT_PATH"
+qsub -o "$HARMONY_PBS_OUTPUT_PATH" -j oe -V job_harmony_variability.pbs
+```
+
+Repeat with `HARMONY_ABA_WORKLOAD=leanmd` if that workload also reverses.
+The `aba` mode runs the two-rank halo reference and then exactly three
+unprofiled seed-123 invocations in ERAD/HWTOPOLB/ERAD order on one PBS
+allocation. It requires the same input and binary hashes as the full matrix;
+retain all three raw CSVs, logs, inventories, manifests, PBS output, and exit
+status. Pass each accepted A/B/A directory with `--aba-run-dir` when generating
+the final report. These runs never enter its 30 paired samples.
 
 This workspace has no PBS launcher or real GPU. The two-rank cluster execution
 and all hardware measurements are pending manual validation.

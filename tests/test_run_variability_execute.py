@@ -10,7 +10,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'benchmarks' / 'run_variability.py'
 FAKE_PRUN = '''#!/usr/bin/env python3
-import csv, json, os, sys
+import csv, json, os, sys, time
 from pathlib import Path
 if '--version' in sys.argv:
     print('fake-prun 1.0')
@@ -27,6 +27,9 @@ if sys.argv[1].endswith('test_async_halo_opencl.out'):
 def value(name):
     return sys.argv[sys.argv.index(name) + 1]
 output = Path(value('--output-csv'))
+if os.environ.get('FAKE_SAMPLE_HANG'):
+    print('partial output before timeout', flush=True)
+    time.sleep(30)
 count = int(value('--iterations'))
 mode = 'cpu_simulation' if os.environ.get('FAKE_CPU') else 'gpu_opencl'
 with output.open('w', newline='') as stream:
@@ -145,6 +148,38 @@ class ExecuteGates(unittest.TestCase):
             second = subprocess.run(command, env=env, capture_output=True, text=True)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn('File exists', second.stderr)
+
+    def test_sample_timeout_rejects_run_and_preserves_partial_log(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            env['FAKE_SAMPLE_HANG'] = '1'
+            command += ['--sample-timeout-seconds', '1']
+            process = subprocess.run(command, env=env, capture_output=True, text=True, timeout=12)
+            self.assertNotEqual(process.returncode, 0)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['status'], 'rejected')
+            samples = list((root / 'run').rglob('*.manifest.json'))
+            self.assertEqual(len(samples), 1)
+            sample = json.loads(samples[0].read_text())
+            self.assertEqual(sample['status'], 'rejected')
+            self.assertIn('timed out', sample['rejection_reason'])
+            self.assertIn('partial output before timeout', Path(sample['log']).read_text())
+
+    def test_aba_executes_three_ordered_samples_after_halo_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, env, _, _ = self.fixture(root)
+            command[command.index('pilot')] = 'aba'
+            command += ['--aba-workload', 'kneighbor']
+            process = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            run = json.loads((root / 'run' / 'run_manifest.json').read_text())
+            self.assertEqual(run['mode'], 'aba')
+            self.assertEqual(run['halo_reference']['status'], 'passed')
+            self.assertEqual([row['algorithm'] for row in run['invocations']],
+                             ['erad', 'hwtopolb', 'erad'])
+            self.assertEqual(len(list((root / 'run').rglob('*.manifest.json'))), 3)
 
     def test_full_run_stops_before_samples_when_halo_reference_skips(self):
         with tempfile.TemporaryDirectory() as temporary:

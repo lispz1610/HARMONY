@@ -26,10 +26,18 @@ module load gnu13/13.2.0
 module load openmpi5/5.0.5
 module load prun/2.2
 : "${HARMONY_VARIABILITY_RUN_DIR:?Set a fresh HARMONY_VARIABILITY_RUN_DIR before qsub}"
-python3 benchmarks/run_variability.py --execute --mode "${HARMONY_VARIABILITY_MODE:-pilot}" \
-    --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \
-    --bin-dir "$PBS_O_WORKDIR/build/cluster" \
-    --build-manifest "$PBS_O_WORKDIR/build/cluster/build_manifest.json"
+mode="${HARMONY_VARIABILITY_MODE:-pilot}"
+runner_args=(--execute --mode "$mode" --run-dir "$HARMONY_VARIABILITY_RUN_DIR"
+    --bin-dir "$PBS_O_WORKDIR/build/cluster"
+    --build-manifest "$PBS_O_WORKDIR/build/cluster/build_manifest.json")
+if [[ "$mode" == aba ]]; then
+    : "${HARMONY_ABA_WORKLOAD:?Set kneighbor or leanmd for an isolated A/B/A run}"
+    runner_args+=(--aba-workload "$HARMONY_ABA_WORKLOAD")
+fi
+if [[ -n "${HARMONY_SAMPLE_TIMEOUT_SECONDS:-}" ]]; then
+    runner_args+=(--sample-timeout-seconds "$HARMONY_SAMPLE_TIMEOUT_SECONDS")
+fi
+python3 benchmarks/run_variability.py "${runner_args[@]}"
 if [[ "${HARMONY_VARIABILITY_MODE:-pilot}" == full && -n "${HARMONY_DIAGNOSTIC_SAMPLE_ORDINAL:-}" ]]; then
     python3 benchmarks/capture_diagnostic.py --execute \
         --run-dir "$HARMONY_VARIABILITY_RUN_DIR" \

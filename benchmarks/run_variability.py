@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -35,7 +36,7 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
-def schedule(run_dir, bin_dir, mode, pilot_iterations):
+def schedule(run_dir, bin_dir, mode, pilot_iterations, aba_workload=None):
     rows = []
     count = 0
 
@@ -44,7 +45,7 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations):
         count += 1
         stem = f'{count:03d}_{workload}_{algorithm}_{seed}'
         prefix = run_dir / phase / stem
-        iterations = 100 if phase in ('full', 'warmup') else pilot_iterations
+        iterations = 100 if phase in ('full', 'warmup', 'aba') else pilot_iterations
         argv = [str(bin_dir / f'{workload}.out'), '--n', '1000000',
                 '--iterations', str(iterations), '--balance-interval', '10',
                 '--perturbation', '0.10', '--seed', str(seed),
@@ -60,14 +61,17 @@ def schedule(run_dir, bin_dir, mode, pilot_iterations):
                          inventory=str(prefix) + '.inventory.json',
                          manifest=str(prefix) + '.manifest.json'))
 
-    if mode == 'full':
+    if mode == 'aba':
+        for algorithm in ('erad', 'hwtopolb', 'erad'):
+            add('aba', 1, aba_workload, 123, algorithm)
+    elif mode == 'full':
         for workload in WORKLOADS:
             for algorithm in ALGORITHMS:
                 add('warmup', 0, workload, SEEDS[0], algorithm)
         repetitions = range(5)
-    else:
+    elif mode == 'pilot':
         repetitions = range(2)
-    for repetition in repetitions:
+    for repetition in repetitions if mode != 'aba' else ():
         seeds = SEEDS[repetition % len(SEEDS):] + SEEDS[:repetition % len(SEEDS)]
         algorithms = ALGORITHMS if repetition % 2 == 0 else ALGORITHMS[::-1]
         for workload in WORKLOADS:
@@ -116,6 +120,28 @@ def observation(command):
         return dict(value=value, unavailable_reason=None)
     except (OSError, subprocess.SubprocessError) as error:
         return dict(value=None, unavailable_reason=str(error))
+
+
+def run_bounded(command, log, seconds):
+    """Stop the launcher and its local process group when a sample hangs."""
+    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    try:
+        return process.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise
 
 
 def environment_manifest(pbs):
@@ -179,7 +205,10 @@ def accepted_output(row):
                      else (item['host'], item['identity'])) for item in ranks}
         if len(physical) != 2:
             raise ValueError('The two ranks resolved to the same physical GPU')
-        mapping = [{key: item[key] for key in required} for item in sorted(ranks, key=lambda x: x['rank'])]
+        mapping = [{**{key: item[key] for key in required},
+                    'cpu_affinity': item.get('cpu_affinity',
+                                             {'value': None, 'unavailable_reason': 'not recorded'})}
+                   for item in sorted(ranks, key=lambda x: x['rank'])]
         return times, mapping
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise ValueError(f'Incomplete sample artifacts: {error}') from error
@@ -200,7 +229,7 @@ def execute(args, rows):
                                      kneighbor_k=5, leanmd_cutoff=4),
                invocations=rows)
     write_json(args.run_dir / 'run_manifest.json', run)
-    if args.mode == 'full':
+    if args.mode in ('full', 'aba'):
         halo = bin_dir / 'test_async_halo_opencl.out'
         halo_log = args.run_dir / 'halo_reference.log'
         check = dict(command=[pbs['launcher'], str(halo)], log=str(halo_log),
@@ -210,9 +239,7 @@ def execute(args, rows):
         write_json(args.run_dir / 'run_manifest.json', run)
         with open(halo_log, 'x', encoding='utf-8') as log:
             try:
-                result = subprocess.run(check['command'], stdout=log,
-                                        stderr=subprocess.STDOUT, timeout=180, check=False)
-                check['exit_code'] = result.returncode
+                check['exit_code'] = run_bounded(check['command'], log, 180)
             except subprocess.TimeoutExpired:
                 check['status'] = 'rejected'
                 check['rejection_reason'] = 'Asynchronous halo reference timed out'
@@ -236,6 +263,7 @@ def execute(args, rows):
     pairs = {}
     failures = 0
     failed_pairs = set()
+    timed_out = False
     for row in rows:
         sample = dict(row, status='planned', rejection_reason=None,
                       build_manifest_sha256=run['build_manifest_sha256'],
@@ -255,10 +283,10 @@ def execute(args, rows):
             sample['started_at'] = datetime.now(timezone.utc).isoformat()
             write_json(path, sample)
             with open(row['log'], 'x', encoding='utf-8') as log:
-                result = subprocess.run([pbs['launcher'], *row['argv']], stdout=log,
-                                        stderr=subprocess.STDOUT, check=False)
-            if result.returncode != 0:
-                raise ValueError(f'Benchmark exited {result.returncode}')
+                exit_code = run_bounded([pbs['launcher'], *row['argv']], log,
+                                        args.sample_timeout_seconds)
+            if exit_code != 0:
+                raise ValueError(f'Benchmark exited {exit_code}')
             times, mapping = accepted_output(row)
             if row['pair_id']:
                 previous = pairs.get(row['pair_id'])
@@ -274,8 +302,13 @@ def execute(args, rows):
             elif mapping != baseline:
                 raise ValueError('Device mapping differs from run baseline')
             sample.update(status='accepted', times=times, mapping=mapping)
-        except (ValueError, OSError) as error:
-            sample.update(status='rejected', rejection_reason=str(error))
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                timed_out = True
+                reason = f'Benchmark sample timed out after {args.sample_timeout_seconds} seconds'
+            else:
+                reason = str(error)
+            sample.update(status='rejected', rejection_reason=reason)
             if row['pair_id']:
                 failed_pairs.add(row['pair_id'])
             previous = pairs.get(row['pair_id']) if row['pair_id'] else None
@@ -287,10 +320,12 @@ def execute(args, rows):
             failures += 1
         sample['completed_at'] = datetime.now(timezone.utc).isoformat()
         write_json(path, sample)
+        if timed_out:
+            break
     run['status'] = 'completed' if failures == 0 else 'rejected'
     run['rejected_samples'] = sum(
         json.loads(Path(row['manifest']).read_text(encoding='utf-8'))['status'] == 'rejected'
-        for row in rows)
+        for row in rows if Path(row['manifest']).is_file())
     run['completed_at'] = datetime.now(timezone.utc).isoformat()
     write_json(args.run_dir / 'run_manifest.json', run)
     return 0 if failures == 0 else 1
@@ -301,16 +336,22 @@ def main():
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--dry-run', action='store_true')
     action.add_argument('--execute', action='store_true')
-    parser.add_argument('--mode', choices=('pilot', 'full'), required=True)
+    parser.add_argument('--mode', choices=('pilot', 'full', 'aba'), required=True)
+    parser.add_argument('--aba-workload', choices=WORKLOADS)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=Path('build/cluster'))
     parser.add_argument('--build-manifest', type=Path, default=Path('build/cluster/build_manifest.json'))
     parser.add_argument('--pilot-iterations', type=int, default=8)
+    parser.add_argument('--sample-timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
     if args.pilot_iterations < 1 or args.pilot_iterations >= 10:
         parser.error('Pilot iterations must be from 1 to 9')
+    if args.sample_timeout_seconds < 1 or args.sample_timeout_seconds > 86400:
+        parser.error('Sample timeout must be from 1 to 86400 seconds')
+    if (args.mode == 'aba') != bool(args.aba_workload):
+        parser.error('--aba-workload is required only for aba mode')
     rows = schedule(args.run_dir.resolve(), args.bin_dir.resolve(), args.mode,
-                    args.pilot_iterations)
+                    args.pilot_iterations, args.aba_workload)
     if args.dry_run:
         print(json.dumps(dict(schema_version=1, mode=args.mode,
                               run_dir=str(args.run_dir.resolve()), invocations=rows), indent=2))

@@ -28,7 +28,9 @@ class ReportCommandTests(unittest.TestCase):
                              local_index=0, global_index=rank, name='GPU A',
                              platform_name='Vendor', platform_version='OpenCL 3.0',
                              device_version='OpenCL 3.0', driver_version='1',
-                             identity_kind='uuid', identity=f'gpu-{rank}')
+                             identity_kind='uuid', identity=f'gpu-{rank}',
+                             cpu_affinity=dict(value=f'{rank}, {rank + 2}',
+                                               unavailable_reason=None))
                         for rank in (0, 1)]
         self.rows = []
         for workload in WORKLOADS:
@@ -177,6 +179,8 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn('1.200000', report)
         self.assertIn('0.800000', report)
         self.assertIn('unavailable: no tool', report)
+        self.assertIn('CPU affinity', report)
+        self.assertIn('0, 2', report)
         self.assertIn('halo', report.lower())
         self.assertIn('inconclusive', report.lower())
 
@@ -269,6 +273,12 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn('Rank 0 determines the diagnostic global loop maximum', report)
         self.assertIn('rank0.csv', report)
         self.assertIn('iteration 0', report)
+        self.assertIn('iteration 9', report)
+        self.assertIn('iteration 10', report)
+        self.assertIn('iteration 11', report)
+        self.assertIn('Step time (s)', report)
+        self.assertIn('old → new', report)
+        self.assertIn('trace#seq=', report)
         self.assertIn('No causal attribution', report)
 
     def test_diagnostic_capture_preview_requires_same_pbs_allocation_without_running(self):
@@ -399,6 +409,49 @@ class ReportCommandTests(unittest.TestCase):
         self.assertTrue(group.endswith('| no |'))
         self.assertIn('inconclusive', report.lower())
         self.assertIn('UTC end ERAD/HWTOPOLB', report)
+
+    def test_isolated_aba_evidence_keeps_order_and_raw_times_outside_pairs(self):
+        aba_root = self.root / 'aba'
+        (aba_root / 'aba').mkdir(parents=True)
+        aba_rows = []
+        for ordinal, algorithm in enumerate(('erad', 'hwtopolb', 'erad'), 1):
+            source = next(row for row in self.rows if row['phase'] == 'full' and
+                          row['workload'] == 'kneighbor' and row['seed'] == 123 and
+                          row['algorithm'] == algorithm)
+            stem = aba_root / 'aba' / f'{ordinal:03d}_kneighbor_{algorithm}_123'
+            row = dict(source, phase='aba', repetition=1, ordinal=ordinal, pair_id=None,
+                       csv=f'{stem}.csv', log=f'{stem}.log',
+                       inventory=f'{stem}.inventory.json', manifest=f'{stem}.manifest.json')
+            row['argv'] = list(source['argv'])
+            for flag, key in (('--output-csv', 'csv'), ('--device-inventory-json', 'inventory')):
+                row['argv'][row['argv'].index(flag) + 1] = row[key]
+            for key in ('csv', 'log', 'inventory'):
+                Path(row[key]).write_bytes(Path(source[key]).read_bytes())
+            sample = json.loads(Path(source['manifest']).read_text())
+            sample.update(row)
+            Path(row['manifest']).write_text(json.dumps(sample))
+            aba_rows.append(row)
+        halo_log = aba_root / 'halo_reference.log'
+        halo_log.write_text('PASS: asynchronous OpenCL halo matches two-step CPU reference\n')
+        aba = dict(self.run_data, mode='aba', invocations=aba_rows,
+                   environment=dict(self.run_data['environment'],
+                                    pbs=dict(self.run_data['environment']['pbs'], job_id='456.cluster')),
+                   halo_reference=dict(command=['/bin/prun', '/bin/test_async_halo_opencl.out'],
+                                       log=str(halo_log), binary_sha256='a' * 64,
+                                       status='passed', exit_code=0))
+        (aba_root / 'run_manifest.json').write_text(json.dumps(aba))
+        result = self.invoke('--aba-run-dir', str(aba_root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        self.assertIn('ERAD/HWTOPOLB/ERAD', report)
+        self.assertIn('456.cluster', report)
+        self.assertIn('30 adjacent pairs', report)
+        self.assertIn('1.000000', report)
+        self.assertIn('0.800000', report)
+        self.output.unlink()
+        Path(aba_rows[1]['csv']).unlink()
+        self.assertNotEqual(self.invoke('--aba-run-dir', str(aba_root)).returncode, 0)
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == '__main__':

@@ -51,6 +51,21 @@ class RunnerCLITests(unittest.TestCase):
         self.assertEqual([row['seed'] for row in samples[:6:2]], [42, 123, 456])
         self.assertEqual([row['seed'] for row in samples[12:18:2]], [123, 456, 42])
 
+    def test_aba_preview_is_isolated_seed_123_same_workload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'aba'
+            process = subprocess.run([sys.executable, str(SCRIPT), '--dry-run',
+                                      '--mode', 'aba', '--aba-workload', 'kneighbor',
+                                      '--run-dir', str(root)], capture_output=True, text=True)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertFalse(root.exists())
+            samples = json.loads(process.stdout)['invocations']
+            self.assertEqual([row['algorithm'] for row in samples],
+                             ['erad', 'hwtopolb', 'erad'])
+            self.assertEqual([row['seed'] for row in samples], [123] * 3)
+            self.assertEqual([row['workload'] for row in samples], ['kneighbor'] * 3)
+            self.assertTrue(all('/aba/' in row['csv'] for row in samples))
+
 
 if __name__ == '__main__':
     unittest.main()

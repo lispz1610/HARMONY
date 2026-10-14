@@ -17,6 +17,7 @@
 #endif
 #include "sample_admission.hpp"
 #include "diagnostic_trace.hpp"
+#include "benchmark_results.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,14 +33,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-
-struct StepRecord {
-    int iteration{0};
-    double step_time_s{0.0};
-    std::string action;
-    int rebalanced{0};
-    double rebalance_gain{0.0};
-};
 
 int main(int argc, char** argv) {
     int k = 5;
@@ -179,7 +172,7 @@ int main(int argc, char** argv) {
     }
     trace.inventory(runtime.devices());
 
-    std::vector<StepRecord> records;
+    std::vector<benchmark::StepRecord> records;
     records.reserve(static_cast<std::size_t>(iterations));
 
     std::vector<double> prev_device_times;
@@ -368,59 +361,19 @@ int main(int argc, char** argv) {
     }
     const auto validation_end = std::chrono::steady_clock::now();
     const auto total_bench_end = std::chrono::steady_clock::now();
-    const double local_loop_s = std::chrono::duration<double>(loop_end - total_bench_start).count();
-    const double local_validation_s = std::chrono::duration<double>(validation_end - validation_start).count();
-    const double local_duration_s = std::chrono::duration<double>(total_bench_end - total_bench_start).count();
-    double loop_duration_s = 0.0;
-    double validation_duration_s = 0.0;
-    double total_duration_s = 0.0;
-    dcl::detail::check_mpi(MPI_Allreduce(&local_loop_s, &loop_duration_s, 1, MPI_DOUBLE, MPI_MAX,
-                           runtime.communicator()), "MPI_Allreduce(loop duration)");
-    dcl::detail::check_mpi(MPI_Allreduce(&local_validation_s, &validation_duration_s, 1, MPI_DOUBLE, MPI_MAX,
-                           runtime.communicator()), "MPI_Allreduce(validation duration)");
-    dcl::detail::check_mpi(MPI_Allreduce(&local_duration_s, &total_duration_s, 1, MPI_DOUBLE, MPI_MAX,
-                           runtime.communicator()), "MPI_Allreduce(full duration)");
+    const benchmark::Durations durations = benchmark::reduce_durations(
+        runtime.communicator(), total_bench_start, loop_end,
+        validation_start, validation_end, total_bench_end);
 
     if (!trace.finish(runtime.communicator())) {
         MPI_Finalize();
         return 1;
     }
 
-    if (rank == 0) {
-        std::ofstream csv(output_csv);
-        if (!csv.is_open()) {
-            std::cerr << "Failed to open output CSV: " << output_csv << "\n";
-            MPI_Finalize();
-            return 1;
-        }
-
-        csv << "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n";
-        int num_rebalances = 0;
-        double sum_gain = 0.0;
-
-        for (const auto& rec : records) {
-            csv << rec.iteration << ","
-                << std::fixed << std::setprecision(9) << rec.step_time_s << ","
-                << rec.action << ","
-                << rec.rebalanced << ","
-                << std::fixed << std::setprecision(9) << rec.rebalance_gain << ","
-                << (opencl_available ? "gpu_opencl" : "cpu_simulation") << "\n";
-            if (rec.rebalanced == 1) {
-                num_rebalances++;
-                sum_gain += rec.rebalance_gain;
-            }
-        }
-        csv.close();
-
-        const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
-        std::cout << "[kneighbor] algo=" << balance_algo
-                  << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
-                  << " total_time_s=" << total_duration_s
-                  << " loop_time_s=" << loop_duration_s
-                  << " validation_time_s=" << validation_duration_s
-                  << " validation=PASS"
-                  << " num_rebalances=" << num_rebalances
-                  << " avg_rebalance_gain=" << avg_gain << "\n";
+    if (rank == 0 && !benchmark::write_results(
+            output_csv, "kneighbor", balance_algo, opencl_available, records, durations)) {
+        MPI_Finalize();
+        return 1;
     }
 
     MPI_Finalize();
