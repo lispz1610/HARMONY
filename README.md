@@ -467,6 +467,20 @@ submission without duplicating jobs. See
 `docs/controlled-gpu-variance-run.md` for failure recovery and optional
 seed-123 A/B/A runs. Real GPU/PBS results remain necessary.
 
+To check HARMONY separately on the older `compute-0-7`, `compute-0-8`, and
+`compute-0-2` machines, queue three independent one-rank jobs with one command:
+
+```bash
+python3 benchmarks/queue_single_node.py --experiment-id legacy-20261014-a
+```
+
+This keeps the two-node A100 variance workflow above intact. Each job requests
+one CPU/GPU chunk on its named host, probes a real OpenCL GPU, runs the short
+main program, and checks both benchmark workloads and balancing algorithms
+against their numerical references. Results are separated under
+`Results/single-node-EXPERIMENT_ID/`. See
+`docs/single-node-gpu-checks.md` for admission rules and recovery.
+
 Or use the automation script (sets `MPI_LAUNCHER` if needed):
 
 ```bash
