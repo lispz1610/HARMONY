@@ -8,8 +8,6 @@
 
 # ─── Build artefacts ──────────────────────────────────────────────────────────
 build/
-Results/
-__pycache__/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

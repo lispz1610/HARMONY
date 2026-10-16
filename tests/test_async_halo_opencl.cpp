@@ -34,16 +34,12 @@ int main(int argc, char** argv) {
     dcl::Runtime runtime = dcl::Runtime::create(argc, argv);
     runtime.discover_devices({dcl::DeviceKind::gpu, 0});
     const int local_count = static_cast<int>(runtime.devices().size());
-    const int local_ready = runtime.size() == 2 && local_count == 1 ? 1 : 0;
-    int all_ready = 0;
-    if (MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT, MPI_MIN,
-                      runtime.communicator()) != MPI_SUCCESS) {
-        std::cerr << "Failed to verify two-rank OpenCL GPU allocation\n";
-        MPI_Abort(runtime.communicator(), 1);
-    }
-    if (!all_ready) {
+    int total_count = 0;
+    MPI_Allreduce(&local_count, &total_count, 1, MPI_INT, MPI_SUM,
+                  runtime.communicator());
+    if (total_count < 2) {
         if (runtime.rank() == 0) {
-            std::cout << "SKIP: asynchronous halo test needs exactly one OpenCL GPU on each of two ranks\n";
+            std::cout << "SKIP: asynchronous halo test needs two OpenCL GPU partitions\n";
         }
         MPI_Finalize();
         return 77;

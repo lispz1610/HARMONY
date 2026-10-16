@@ -71,10 +71,6 @@ void Runtime::synchronize(bool force_finish) {
     impl_->synchronize(force_finish);
 }
 
-void Runtime::set_verbose_metrics(bool enabled) noexcept {
-    impl_->set_verbose_metrics(enabled);
-}
-
 void Runtime::set_topo_metrics(const TopoMetrics& metrics) {
     impl_->set_topo_metrics(metrics);
 }

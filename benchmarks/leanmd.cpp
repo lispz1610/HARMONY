@@ -15,9 +15,6 @@
 #include "../dcl/runtime.cpp"
 #include "../dcl/algorithms.hpp"
 #endif
-#include "sample_admission.hpp"
-#include "diagnostic_trace.hpp"
-#include "benchmark_results.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +31,14 @@
 #include <string>
 #include <vector>
 
+struct StepRecord {
+    int iteration{0};
+    double step_time_s{0.0};
+    std::string action;
+    int rebalanced{0};
+    double rebalance_gain{0.0};
+};
+
 int main(int argc, char** argv) {
     std::size_t n = 1000000;
     int iterations = 100;
@@ -43,10 +48,6 @@ int main(int argc, char** argv) {
     std::string output_csv = "leanmd.csv";
     int cutoff = 4;
     unsigned int seed = 0;
-    bool quiet_runtime_metrics = false;
-    bool require_two_rank_gpu = false;
-    std::string device_inventory_json;
-    std::string diagnostics_prefix;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -66,19 +67,10 @@ int main(int argc, char** argv) {
             cutoff = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--seed" && i + 1 < argc) {
             seed = static_cast<unsigned int>(std::stoul(argv[++i]));
-        } else if (arg == "--quiet-runtime-metrics") {
-            quiet_runtime_metrics = true;
-        } else if (arg == "--require-two-rank-gpu") {
-            require_two_rank_gpu = true;
-        } else if (arg == "--device-inventory-json" && i + 1 < argc) {
-            device_inventory_json = argv[++i];
-        } else if (arg == "--diagnostics-prefix" && i + 1 < argc) {
-            diagnostics_prefix = argv[++i];
         }
     }
 
     dcl::Runtime runtime = dcl::Runtime::create(argc, argv);
-    runtime.set_verbose_metrics(!quiet_runtime_metrics);
     const int rank = runtime.rank();
     if (n == 0 || n > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         iterations <= 0) {
@@ -90,14 +82,8 @@ int main(int argc, char** argv) {
     runtime.discover_devices({dcl::DeviceKind::gpu, 0});
     int local_devices = static_cast<int>(runtime.devices().size());
     int total_devices = 0;
-    dcl::detail::check_mpi(MPI_Allreduce(&local_devices, &total_devices, 1, MPI_INT, MPI_SUM, runtime.communicator()),
-                           "MPI_Allreduce(total GPUs)");
+    MPI_Allreduce(&local_devices, &total_devices, 1, MPI_INT, MPI_SUM, runtime.communicator());
     const bool opencl_available = total_devices > 0;
-    if (!benchmark::admit_sample(runtime, require_two_rank_gpu, device_inventory_json)) {
-        MPI_Finalize();
-        return 1;
-    }
-    benchmark::DiagnosticTrace trace(diagnostics_prefix, rank, seed, balance_algo);
     for (const auto& device : runtime.devices()) {
         std::cout << "[device] rank=" << rank
                   << " global_index=" << device.global_index
@@ -174,29 +160,19 @@ int main(int argc, char** argv) {
             .build();
     }
 
-    if (!trace.prepare(runtime.communicator())) {
-        MPI_Finalize();
-        return 1;
-    }
-    trace.inventory(runtime.devices());
-
-    std::vector<benchmark::StepRecord> records;
+    std::vector<StepRecord> records;
     records.reserve(static_cast<std::size_t>(iterations));
 
     std::vector<double> prev_device_times;
     const auto total_bench_start = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point loop_end;
 
     for (int it = 0; it < iterations; ++it) {
         const auto step_start = std::chrono::steady_clock::now();
-        const auto old_snapshot = trace.enabled() ? runtime.partitions() : std::vector<dcl::DevicePartition>{};
-        trace.partitions(it, "old", runtime.partitions());
         bool do_rebalance = (balance_interval > 0 && it > 0 && (it % balance_interval == 0) && !prev_device_times.empty());
         double gain = 0.0;
 
         if (do_rebalance) {
             const auto& old_parts = runtime.partitions();
-            const auto plan_start = std::chrono::steady_clock::now();
             double total_cap = 0.0;
             std::vector<double> capacity(old_parts.size(), 0.0);
             double t_max_current = 0.0;
@@ -215,11 +191,7 @@ int main(int argc, char** argv) {
             if (rank == 0) {
                 new_loads = algo_fn(prev_device_times, runtime.partitions());
             }
-            const auto plan_end = std::chrono::steady_clock::now();
-            trace.phase(it, "rebalance_plan", plan_start, plan_end);
             runtime.rebalance_to(new_loads);
-            const auto apply_end = std::chrono::steady_clock::now();
-            trace.phase(it, "rebalance_apply", plan_end, apply_end);
 
             const auto& new_parts = runtime.partitions();
             double t_max_projected = t_max_current;
@@ -240,11 +212,9 @@ int main(int argc, char** argv) {
             gain = std::max(0.0, t_max_current - t_max_projected);
         }
 
-        trace.partitions(it, "new", runtime.partitions(), trace.enabled() ? &old_snapshot : nullptr);
         const auto& partitions = runtime.partitions();
         std::vector<double> local_device_times(partitions.size(), 0.0);
 
-        const auto execution_start = std::chrono::steady_clock::now();
         if (opencl_available) {
             auto builder = runtime.step("leanmd_step");
             dcl::AutoBalancePolicy timing_policy;
@@ -257,9 +227,7 @@ int main(int argc, char** argv) {
             builder.tag_field(h_force, dcl::StepFieldRole::write_target);
             builder.invoke(binding, dcl::LaunchGeometry{0, n, std::nullopt});
             builder.synchronize_at_end(true);
-            const auto execute_start = std::chrono::steady_clock::now();
             runtime.execute(builder.build());
-            trace.phase(it, "runtime_execute", execute_start, std::chrono::steady_clock::now());
             
             for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
                 const auto& p = partitions[p_idx];
@@ -307,25 +275,51 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (!opencl_available) trace.phase(it, "cpu_simulation", execution_start, std::chrono::steady_clock::now());
-        trace.device_events(it, partitions, local_device_times, opencl_available);
         const auto step_end = std::chrono::steady_clock::now();
         double local_step_time = std::chrono::duration<double>(step_end - step_start).count();
 
         double t_max_step = 0.0;
-        dcl::detail::check_mpi(MPI_Allreduce(&local_step_time, &t_max_step, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator()),
-                               "MPI_Allreduce(step time)");
-        const auto step_reduce_end = std::chrono::steady_clock::now();
-        trace.phase(it, "mpi_step_max", step_end, step_reduce_end);
+        MPI_Allreduce(&local_step_time, &t_max_step, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
         std::vector<double> device_times(partitions.size(), 0.0);
-        dcl::detail::check_mpi(MPI_Allreduce(local_device_times.data(), device_times.data(),
-                               static_cast<int>(partitions.size()), MPI_DOUBLE, MPI_MAX, runtime.communicator()),
-                               "MPI_Allreduce(device times)");
+        MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
-        const auto device_reduce_end = std::chrono::steady_clock::now();
-        trace.phase(it, "mpi_device_times", step_reduce_end, device_reduce_end);
-        if (it == iterations - 1) loop_end = device_reduce_end;
+        if (it == iterations - 1) {
+            if (opencl_available) runtime.gather(h_force, force_out.data(), n * sizeof(float));
+            int local_mismatch = 0;
+            for (const auto& part : partitions) {
+                if (!opencl_available && part.owning_rank != rank) continue;
+                if (opencl_available && rank != 0) continue;
+                for (std::size_t i = part.global_offset;
+                     i < part.global_offset + part.element_count; ++i) {
+                    float expected = 0.0f;
+                    const std::size_t start = i > static_cast<std::size_t>(cutoff)
+                        ? i - static_cast<std::size_t>(cutoff) : 0;
+                    const std::size_t end = std::min(n - 1, i + static_cast<std::size_t>(cutoff));
+                    for (std::size_t j = start; j <= end; ++j) {
+                        if (i == j) continue;
+                        const float dx = pos_x[i] - pos_x[j];
+                        const float dy = pos_y[i] - pos_y[j];
+                        const float dz = pos_z[i] - pos_z[j];
+                        const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
+                        const float inv = 1.0f / r2;
+                        const float inv6 = inv * inv * inv;
+                        expected += inv * inv6 * (2.0f * inv6 - 1.0f);
+                    }
+                    if (!std::isfinite(force_out[i]) ||
+                        std::fabs(force_out[i] - expected) >
+                            1e-4f + 1e-4f * std::fabs(expected)) {
+                        std::cerr << "LeanMD verification failed at index " << i << "\n";
+                        local_mismatch = 1;
+                        break;
+                    }
+                }
+            }
+            int any_mismatch = 0;
+            MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
+                          runtime.communicator());
+            if (any_mismatch != 0) MPI_Abort(runtime.communicator(), 1);
+        }
 
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});
@@ -337,63 +331,43 @@ int main(int argc, char** argv) {
         if (!opencl_available) runtime.set_simulated_times(device_times);
     }
 
-    trace.phase(iterations, "loop_total", total_bench_start, loop_end);
-    const auto validation_start = std::chrono::steady_clock::now();
-    const auto& partitions = runtime.partitions();
-    if (opencl_available) runtime.gather(h_force, force_out.data(), n * sizeof(float));
-    const auto gather_end = std::chrono::steady_clock::now();
-    trace.phase(iterations, "gather", validation_start, gather_end);
-    int local_mismatch = 0;
-    for (const auto& part : partitions) {
-        if (!opencl_available && part.owning_rank != rank) continue;
-        if (opencl_available && rank != 0) continue;
-        for (std::size_t i = part.global_offset;
-             i < part.global_offset + part.element_count; ++i) {
-            float expected = 0.0f;
-            const std::size_t start = i > static_cast<std::size_t>(cutoff)
-                ? i - static_cast<std::size_t>(cutoff) : 0;
-            const std::size_t end = std::min(n - 1, i + static_cast<std::size_t>(cutoff));
-            for (std::size_t j = start; j <= end; ++j) {
-                if (i == j) continue;
-                const float dx = pos_x[i] - pos_x[j];
-                const float dy = pos_y[i] - pos_y[j];
-                const float dz = pos_z[i] - pos_z[j];
-                const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
-                const float inv = 1.0f / r2;
-                const float inv6 = inv * inv * inv;
-                expected += inv * inv6 * (2.0f * inv6 - 1.0f);
-            }
-            if (!std::isfinite(force_out[i]) || !std::isfinite(expected) ||
-                std::fabs(force_out[i] - expected) >
-                    1e-4f + 1e-4f * std::fabs(expected)) {
-                std::cerr << "LeanMD verification failed at index " << i << "\n";
-                local_mismatch = 1;
-                break;
+    const auto total_bench_end = std::chrono::steady_clock::now();
+    const double local_duration_s = std::chrono::duration<double>(total_bench_end - total_bench_start).count();
+    double total_duration_s = 0.0;
+    MPI_Allreduce(&local_duration_s, &total_duration_s, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+    if (rank == 0) {
+        std::ofstream csv(output_csv);
+        if (!csv.is_open()) {
+            std::cerr << "Failed to open output CSV: " << output_csv << "\n";
+            MPI_Finalize();
+            return 1;
+        }
+
+        csv << "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n";
+        int num_rebalances = 0;
+        double sum_gain = 0.0;
+
+        for (const auto& rec : records) {
+            csv << rec.iteration << ","
+                << std::fixed << std::setprecision(9) << rec.step_time_s << ","
+                << rec.action << ","
+                << rec.rebalanced << ","
+                << std::fixed << std::setprecision(9) << rec.rebalance_gain << ","
+                << (opencl_available ? "gpu_opencl" : "cpu_simulation") << "\n";
+            if (rec.rebalanced == 1) {
+                num_rebalances++;
+                sum_gain += rec.rebalance_gain;
             }
         }
-    }
-    const auto reference_end = std::chrono::steady_clock::now();
-    trace.phase(iterations, "reference", gather_end, reference_end);
-    int any_mismatch = 0;
-    dcl::detail::check_mpi(MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
-                           runtime.communicator()), "MPI_Allreduce(LeanMD verification)");
-    trace.phase(iterations, "mpi_validation", reference_end, std::chrono::steady_clock::now());
-    if (any_mismatch != 0) MPI_Abort(runtime.communicator(), 1);
-    const auto validation_end = std::chrono::steady_clock::now();
-    const auto total_bench_end = std::chrono::steady_clock::now();
-    const benchmark::Durations durations = benchmark::reduce_durations(
-        runtime.communicator(), total_bench_start, loop_end,
-        validation_start, validation_end, total_bench_end);
+        csv.close();
 
-    if (!trace.finish(runtime.communicator())) {
-        MPI_Finalize();
-        return 1;
-    }
-
-    if (rank == 0 && !benchmark::write_results(
-            output_csv, "leanmd", balance_algo, opencl_available, records, durations)) {
-        MPI_Finalize();
-        return 1;
+        const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
+        std::cout << "[leanmd] algo=" << balance_algo
+                  << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
+                  << " total_time_s=" << total_duration_s
+                  << " num_rebalances=" << num_rebalances
+                  << " avg_rebalance_gain=" << avg_gain << "\n";
     }
 
     MPI_Finalize();
