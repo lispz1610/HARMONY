@@ -1,6 +1,6 @@
 # Controlled GPU variance run
 
-From the current `master` checkout on the cluster frontend, choose one
+From the published integration branch on the cluster frontend, choose one
 stable experiment ID and run:
 
 ```sh
@@ -8,16 +8,17 @@ python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
 The command builds with `cluster_build.sh` if needed, verifies the C++20/OpenCL
-binaries and their source revision, submits all four jobs, prints their IDs,
-and exits. You can close the terminal after `All PBS jobs queued` appears.
-The queue is pilot → diagnostic smoke → full matrix → CPU-only finalizer, using
-PBS `afterok` dependencies. The pilot job executes `analyze_pilot.py` before
-exiting successfully; the smoke runner validates both rank traces before it
-exits successfully. A failed gate prevents dependent jobs from starting. The
-finalizer collects scheduler and PBS artifacts, validates the run, and writes
-the full report. Use `--preview` separately for a read-only schedule.
+binaries and their source revision, and submits the pilot. It remains active
+on the frontend, checks PBS every 30 seconds, and advances automatically after
+each completed stage passes its evidence gate. Keep the frontend session alive
+until it prints `Workflow complete`. If the session disconnects, rerun the
+same command and experiment ID; queued and running PBS jobs are reused.
+Set `--poll-interval-seconds N` to change the check interval (1–3600 seconds).
+Use `--preview` separately if you want a read-only schedule first.
 
-The jobs run in this order:
+The stages are ordered because a scheduler dependency alone checks job exit,
+while this workflow must also validate the pilot and diagnostic evidence
+before submitting the full matrix:
 
 | Stage | PBS work | Evidence required before the next stage |
 | --- | --- | --- |
@@ -34,8 +35,8 @@ enter the 30 paired performance comparisons.
 
 When the final report shows a persistent seed-123 reversal, request an
 isolated A/B/A run for each affected workload. Add the option to the same
-experiment ID; that single invocation queues the A/B/A job and a new
-finalizer, then exits:
+experiment ID; that single invocation waits for its PBS job and updates the
+report:
 
 ```sh
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a \
@@ -50,24 +51,20 @@ the original paired estimate.
 ## What a rerun preserves
 
 All output is under `Results/controlled-EXPERIMENT_ID/`, which is ignored by
-Git. `workflow.json` records the pinned build hash, PBS job IDs, dependency
-chain, stage results, and report hashes. Each stage has a unique run directory and sibling PBS output
+Git. `workflow.json` records the pinned build hash, PBS job IDs, stage results,
+and report hashes. Each stage has a unique run directory and sibling PBS output
 and script-status files. After a terminal scheduler record with exit status
 zero, the coordinator copies the PBS output, script status, scheduler record,
 and build manifest into that stage directory without overwriting existing
-files. The PBS dependency chain gates execution; the finalizer independently
-validates raw results. Pilot and full reports are written once and checked by
-hash on subsequent finalization.
+files. It validates the raw run before submitting the next stage. Pilot and
+full reports are written once and checked by hash on subsequent invocations.
 
-The coordinator holds a lock while submitting. It records a
+The coordinator holds a lock while checking and advancing state. It records a
 submission intent **before** calling `qsub`, so an interrupted or ambiguous
 submission cannot silently create a second job. If it reports an uncertain
 submission, inspect `qstat` for the recorded job name and resume with
 `--adopt-job-id JOBID`. Adoption verifies the job name. Never start a new ID
-merely because a queued job has not produced a run directory yet. After an
-interrupted submission, rerun the same command and ID to queue only missing
-jobs. If a stage fails, its dependent jobs stay blocked; use `--once` on the
-frontend to collect the failed stage's available artifacts for inspection.
+merely because a queued job has not produced a run directory yet.
 
 If `qstat -xf JOBID` becomes unavailable after completion, provide a saved
 raw terminal `qstat -xf` record with `--scheduler-record MODE=PATH`, where MODE
@@ -79,8 +76,8 @@ A rejected sample, failed PBS job, changed binary/source revision, changed
 workflow option, or modified preserved artifact stops this experiment ID.
 Keep its raw evidence and use a **new** ID after repairing the cause. The
 sample timeout defaults to 1,800 seconds; `--sample-timeout-seconds N` may be
-set at the first invocation and must remain the same thereafter. `--watch`
-retains the older frontend polling mode when that behavior is needed.
+set at the first invocation and must remain the same thereafter.
+Use `--once` only when a scheduler check without waiting is desired.
 
 The build manifest records the compiler, exact flags, source revision and
 digest, OpenCL library, and binary SHA-256 hashes. Each sample requires exactly

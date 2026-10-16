@@ -458,12 +458,11 @@ coordinator instead of submitting each PBS stage by hand:
 python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
 ```
 
-The command queues the pilot, diagnostic smoke, full matrix, and a CPU-only
-finalizer with PBS `afterok` dependencies, then exits. The pilot job runs its
-analyzer before releasing the smoke job; the smoke job validates both rank
-traces before releasing the full matrix. The finalizer collects PBS records
-and writes the report. Rerun the same command and ID after an interrupted
-submission without duplicating jobs. See
+The command stays on the frontend, checks PBS every 30 seconds, and submits
+each next stage after validating the previous one. It builds and pins the
+binaries, validates the pilot and rank-local diagnostic smoke, then runs and
+reports the full matrix without duplicating jobs or overwriting raw evidence.
+If the session is interrupted, rerun the same command and ID to resume. See
 `docs/controlled-gpu-variance-run.md` for failure recovery and optional
 seed-123 A/B/A runs. Real GPU/PBS results remain necessary.
 
