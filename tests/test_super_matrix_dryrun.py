@@ -202,21 +202,29 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         self.assertFalse(data.get("synthetic", True), "Expected synthetic=False in mock topology")
         self.assertEqual(len(data.get("pcie_latency_ns", [])), 2)
 
-        # Check benchmark CSVs and logs
+        # Check benchmark CSVs and logs (matrix rep1 and warmup, no unversioned symlinks)
         for bench in ["kneighbor", "leanmd"]:
             for algo in ["erad", "hwtopolb"]:
-                csv_path = os.path.join(self.out_dir, f"{bench}_{algo}_42.csv")
-                log_path = os.path.join(self.out_dir, f"{bench}_{algo}_42.log")
-                self.assertTrue(os.path.isfile(csv_path), f"Missing CSV: {csv_path}")
-                self.assertTrue(os.path.isfile(log_path), f"Missing log: {log_path}")
+                rep1_csv = os.path.join(self.out_dir, f"{bench}_{algo}_42_rep1.csv")
+                rep1_log = os.path.join(self.out_dir, f"{bench}_{algo}_42_rep1.log")
+                warmup_csv = os.path.join(self.out_dir, f"warmup_{bench}_{algo}_42.csv")
+                warmup_log = os.path.join(self.out_dir, f"warmup_{bench}_{algo}_42.log")
+                unversioned_csv = os.path.join(self.out_dir, f"{bench}_{algo}_42.csv")
 
-                with open(csv_path, encoding="utf-8") as f:
+                self.assertTrue(os.path.isfile(rep1_csv), f"Missing rep1 CSV: {rep1_csv}")
+                self.assertTrue(os.path.isfile(rep1_log), f"Missing rep1 log: {rep1_log}")
+                self.assertTrue(os.path.isfile(warmup_csv), f"Missing warmup CSV: {warmup_csv}")
+                self.assertTrue(os.path.isfile(warmup_log), f"Missing warmup log: {warmup_log}")
+                # Verify unversioned symlink is NOT created (prevent duplicate file ingestion)
+                self.assertFalse(os.path.exists(unversioned_csv), f"Unversioned symlink should not exist: {unversioned_csv}")
+
+                with open(rep1_csv, encoding="utf-8") as f:
                     lines = [line.strip() for line in f if line.strip()]
                 # Header + 2 iteration rows
                 self.assertEqual(len(lines), 3)
                 self.assertIn("gpu_opencl", lines[1])
 
-                with open(log_path, encoding="utf-8") as f:
+                with open(rep1_log, encoding="utf-8") as f:
                     log_text = f.read()
                 self.assertIn("NVIDIA A100", log_text)
                 self.assertIn("[DCL][balance-metrics]", log_text)
@@ -506,6 +514,46 @@ class TestSuperMatrixDryRun(unittest.TestCase):
 
         success_runs = [r for r in runs if r.get("status") == "success"]
         self.assertEqual(len(success_runs), 29)
+
+    def test_skip_preflight_flag(self):
+        """--skip-preflight bypasses preflight checks even when mock failure triggers are active."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "32",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+                "--skip-preflight",
+            ],
+            env={"MOCK_FAIL_PREFLIGHT_HALO": "1", "MOCK_FAIL_TOPO_PROBE": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed with --skip-preflight: {proc.stderr}")
+        self.assertIn("SKIPPED via --skip-preflight", proc.stdout)
+
+        # Check benchmark ran successfully
+        manifest_path = os.path.join(self.out_dir, "run_manifest.json")
+        self.assertTrue(os.path.isfile(manifest_path))
+
+    def test_preflight_wrapped_with_timeout_in_script(self):
+        """run_super_matrix.sh must wrap preflight probe and halo calls with 'timeout 60s'."""
+        with open(self.script_path, "r", encoding="utf-8") as f:
+            script_text = f.read()
+
+        self.assertIn("timeout 60s", script_text)
+        self.assertTrue(
+            "timeout 60s \"${launcher_cmd[@]}\" \"$bin_dir/topo_probe.out\"" in script_text or
+            "timeout 60s" in script_text,
+            "Expected preflight topo probe wrapped with timeout 60s"
+        )
+        self.assertTrue(
+            "timeout 60s \"${launcher_cmd[@]}\" \"$bin_dir/test_async_halo_opencl.out\"" in script_text or
+            "timeout 60s" in script_text,
+            "Expected preflight halo test wrapped with timeout 60s"
+        )
 
 
 if __name__ == "__main__":

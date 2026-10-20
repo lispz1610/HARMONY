@@ -17,6 +17,7 @@ bench_interval="${BENCH_BALANCE_INTERVAL:-10}"
 bench_seeds="${BENCH_SEEDS:-42 123 456}"
 bench_timeout="${SAMPLE_TIMEOUT_SECONDS:-180}"
 dry_run="${DRY_RUN:-0}"
+skip_preflight="${BENCH_SKIP_PREFLIGHT:-0}"
 mpi_launcher="${MPI_LAUNCHER:-}"
 
 show_usage() {
@@ -34,6 +35,7 @@ Options:
   --seeds <LIST>           Seeds to evaluate, space or comma separated (default: "42 123 456")
   --timeout <INT>          Timeout per sample in seconds (default: 180 or \$SAMPLE_TIMEOUT_SECONDS)
   --launcher <CMD>         MPI launcher command or override (default: prun or \$MPI_LAUNCHER)
+  --skip-preflight         Bypass Stage 1 preflight checks (topo probe and halo test)
   --dry-run                Validate configuration and prebuilt binaries, display plan, and exit without running
   -h, --help               Display this help message and exit
 
@@ -44,6 +46,7 @@ Environment Variables:
   BENCH_ITERATIONS         Same as --iterations
   BENCH_BALANCE_INTERVAL   Same as --balance-interval
   BENCH_SEEDS              Same as --seeds
+  BENCH_SKIP_PREFLIGHT     Set to 1 to bypass preflight checks
   MPI_LAUNCHER             Same as --launcher
   DRY_RUN                  Set to 1 to enable dry-run mode
 EOF
@@ -83,6 +86,10 @@ while [[ $# -gt 0 ]]; do
         --launcher)
             mpi_launcher="$2"
             shift 2
+            ;;
+        --skip-preflight)
+            skip_preflight=1
+            shift
             ;;
         --dry-run)
             dry_run=1
@@ -286,6 +293,7 @@ entry = {
     "repetition": int(sys.argv[4]) if sys.argv[4] not in ("null", "None", "") else None,
     "benchmark": sys.argv[5],
     "algorithm": sys.argv[6],
+    "algo": sys.argv[6],
     "seed": int(sys.argv[7]),
     "step": int(sys.argv[8]) if sys.argv[8] not in ("null", "None", "") else None,
     "command": sys.argv[9],
@@ -409,23 +417,20 @@ execute_sample() {
         echo "[WARNING] Sample $run_id failed with exit code $exit_code: $bench $algo seed $seed" >&2
     fi
 
-    # Convenience symlinks for matrix rep 1
-    if [[ "$stage" == "matrix" && "$rep" == "1" ]]; then
-        ln -sf "$csv_basename" "${output_dir}/${bench}_${algo}_${seed}.csv" 2>/dev/null || true
-        ln -sf "$log_basename" "${output_dir}/${bench}_${algo}_${seed}.log" 2>/dev/null || true
-    fi
-
     record_sample_manifest "$run_id" "$stage" "$rep" "$bench" "$algo" "$seed" "$step" \
         "${cmd[*]}" "$csv_basename" "$log_basename" "$exit_code" "$elapsed" "$status"
 }
 
 # Stage 1: Preflight Verification
-echo "=== Stage 1: Preflight Verification ==="
-echo "Running topology probe: $bin_dir/topo_probe.out"
-"${launcher_cmd[@]}" "$bin_dir/topo_probe.out" --output-json "$output_dir/topo_metrics_cluster.json"
+if [[ "$skip_preflight" -eq 1 ]]; then
+    echo "=== Stage 1: Preflight Verification (SKIPPED via --skip-preflight) ==="
+else
+    echo "=== Stage 1: Preflight Verification ==="
+    echo "Running topology probe (timeout 60s): $bin_dir/topo_probe.out"
+    timeout 60s "${launcher_cmd[@]}" "$bin_dir/topo_probe.out" --output-json "$output_dir/topo_metrics_cluster.json"
 
-# Validate generated topology metrics
-python3 - "$output_dir/topo_metrics_cluster.json" <<'PY'
+    # Validate generated topology metrics
+    python3 - "$output_dir/topo_metrics_cluster.json" <<'PY'
 import json
 import sys
 
@@ -445,10 +450,11 @@ if len(metrics.get("pcie_latency_ns", [])) < 2:
     sys.exit(1)
 PY
 
-echo "Running asynchronous OpenCL halo test: $bin_dir/test_async_halo_opencl.out"
-if ! "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
-    echo "Preflight failed: test_async_halo_opencl.out returned non-zero status" >&2
-    exit 1
+    echo "Running asynchronous OpenCL halo test (timeout 60s): $bin_dir/test_async_halo_opencl.out"
+    if ! timeout 60s "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
+        echo "Preflight failed: test_async_halo_opencl.out returned non-zero status" >&2
+        exit 1
+    fi
 fi
 
 # Initialize Manifest

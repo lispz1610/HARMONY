@@ -104,7 +104,8 @@ echo "=== Executing Super Matrix Benchmark ==="
 bash "$PBS_O_WORKDIR/benchmarks/run_super_matrix.sh" \
     --bin-dir "$bin_dir" \
     --output-dir "$output_dir" \
-    --launcher prun
+    --launcher prun \
+    --skip-preflight
 
 echo "=== Post-Processing and Generating Report ==="
 python3 "$PBS_O_WORKDIR/benchmarks/analyze_super_matrix.py" \

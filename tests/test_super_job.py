@@ -233,6 +233,12 @@ class TestSuperJobExecution(unittest.TestCase):
         proc = self._run_job_script({"MOCK_FAIL_PREFLIGHT_HALO": "1"})
         self.assertNotEqual(proc.returncode, 0)
 
+    def test_runner_invocation_passes_skip_preflight(self):
+        """job_harmony_super.pbs must pass --skip-preflight to run_super_matrix.sh."""
+        with open(JOB_SCRIPT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("--skip-preflight", content, "job_harmony_super.pbs should pass --skip-preflight to run_super_matrix.sh")
+
     def test_successful_mock_pipeline_execution(self):
         """Job script runs through preflight, runner, and analyzer producing expected outputs."""
         self._create_cluster_binaries()
