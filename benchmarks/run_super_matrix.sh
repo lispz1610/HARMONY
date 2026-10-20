@@ -15,6 +15,7 @@ bench_n="${BENCH_N:-1000000}"
 bench_iterations="${BENCH_ITERATIONS:-100}"
 bench_interval="${BENCH_BALANCE_INTERVAL:-10}"
 bench_seeds="${BENCH_SEEDS:-42 123 456}"
+bench_timeout="${SAMPLE_TIMEOUT_SECONDS:-180}"
 dry_run="${DRY_RUN:-0}"
 mpi_launcher="${MPI_LAUNCHER:-}"
 
@@ -31,6 +32,7 @@ Options:
   --iterations <INT>       Number of iterations per benchmark run (default: 100)
   --balance-interval <INT> Interval between rebalance steps (default: 10)
   --seeds <LIST>           Seeds to evaluate, space or comma separated (default: "42 123 456")
+  --timeout <INT>          Timeout per sample in seconds (default: 180 or \$SAMPLE_TIMEOUT_SECONDS)
   --launcher <CMD>         MPI launcher command or override (default: prun or \$MPI_LAUNCHER)
   --dry-run                Validate configuration and prebuilt binaries, display plan, and exit without running
   -h, --help               Display this help message and exit
@@ -74,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             bench_seeds="$2"
             shift 2
             ;;
+        --timeout)
+            bench_timeout="$2"
+            shift 2
+            ;;
         --launcher)
             mpi_launcher="$2"
             shift 2
@@ -107,6 +113,11 @@ fi
 
 if ! [[ "$bench_interval" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --balance-interval must be a positive integer, got: '$bench_interval'" >&2
+    exit 1
+fi
+
+if ! [[ "$bench_timeout" =~ ^[1-9][0-9]*s?$ ]]; then
+    echo "Error: --timeout must be a positive integer or duration (e.g. 180 or 180s), got: '$bench_timeout'" >&2
     exit 1
 fi
 
@@ -200,6 +211,214 @@ else
     launcher_cmd=()
 fi
 
+# Configure sample timeout string
+if [[ "$bench_timeout" =~ ^[0-9]+$ ]]; then
+    sample_timeout_str="${bench_timeout}s"
+else
+    sample_timeout_str="$bench_timeout"
+fi
+
+# Hardware Telemetry helper
+record_telemetry() {
+    local block_name="$1"
+    local telem_file="${output_dir}/hardware_telemetry.log"
+    local now
+    now="$(date -u +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")"
+    echo "# [telemetry] block=${block_name} timestamp=${now}" >> "$telem_file"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if ! nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits >> "$telem_file" 2>/dev/null; then
+            echo "${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi query failed for block ${block_name})" >> "$telem_file"
+        fi
+    else
+        echo "${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi not available for block ${block_name})" >> "$telem_file"
+    fi
+}
+
+# Run Manifest helpers
+init_manifest() {
+    python3 - "$output_dir/run_manifest.json" "$bench_n" "$bench_iterations" "$bench_interval" "${seeds_array[*]}" <<'PY'
+import json
+import os
+import sys
+
+manifest_path = sys.argv[1]
+parameters = {
+    "n": int(sys.argv[2]),
+    "iterations": int(sys.argv[3]),
+    "balance_interval": int(sys.argv[4]),
+    "seeds": [int(s) for s in sys.argv[5].split() if s]
+}
+data = {
+    "parameters": parameters,
+    "runs": []
+}
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
+record_sample_manifest() {
+    local run_id="$1"
+    local stage="$2"
+    local rep="$3"
+    local bench="$4"
+    local algo="$5"
+    local seed="$6"
+    local step="$7"
+    local cmd_str="$8"
+    local csv_rel="$9"
+    local log_rel="${10}"
+    local exit_code="${11}"
+    local elapsed="${12}"
+    local status="${13}"
+
+    python3 - "$output_dir/run_manifest.json" \
+        "$run_id" "$stage" "$rep" "$bench" "$algo" "$seed" "$step" \
+        "$cmd_str" "$csv_rel" "$log_rel" "$exit_code" "$elapsed" "$status" <<'PY'
+import json
+import os
+import sys
+
+manifest_path = sys.argv[1]
+entry = {
+    "run_id": int(sys.argv[2]),
+    "stage": sys.argv[3],
+    "repetition": int(sys.argv[4]) if sys.argv[4] not in ("null", "None", "") else None,
+    "benchmark": sys.argv[5],
+    "algorithm": sys.argv[6],
+    "seed": int(sys.argv[7]),
+    "step": int(sys.argv[8]) if sys.argv[8] not in ("null", "None", "") else None,
+    "command": sys.argv[9],
+    "csv_file": sys.argv[10],
+    "log_file": sys.argv[11],
+    "exit_code": int(sys.argv[12]),
+    "elapsed_seconds": float(sys.argv[13]),
+    "status": sys.argv[14]
+}
+
+data = {"runs": []}
+if os.path.exists(manifest_path):
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {"runs": []}
+
+if "runs" not in data:
+    data["runs"] = []
+
+data["runs"].append(entry)
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
+get_rep_seeds() {
+    local rep="$1"
+    if [[ ${#seeds_array[@]} -eq 3 && "${seeds_array[0]}" == "42" && "${seeds_array[1]}" == "123" && "${seeds_array[2]}" == "456" ]]; then
+        case "$rep" in
+            1) echo "42 123 456" ;;
+            2) echo "123 456 42" ;;
+            3) echo "456 42 123" ;;
+            4) echo "42 456 123" ;;
+            5) echo "123 42 456" ;;
+        esac
+    elif [[ ${#seeds_array[@]} -eq 3 ]]; then
+        local s0="${seeds_array[0]}"
+        local s1="${seeds_array[1]}"
+        local s2="${seeds_array[2]}"
+        case "$rep" in
+            1) echo "$s0 $s1 $s2" ;;
+            2) echo "$s1 $s2 $s0" ;;
+            3) echo "$s2 $s0 $s1" ;;
+            4) echo "$s0 $s2 $s1" ;;
+            5) echo "$s1 $s0 $s2" ;;
+        esac
+    else
+        echo "${seeds_array[*]}"
+    fi
+}
+
+get_rep_algos() {
+    local rep="$1"
+    if (( rep % 2 == 1 )); then
+        echo "erad hwtopolb"
+    else
+        echo "hwtopolb erad"
+    fi
+}
+
+run_counter=0
+
+execute_sample() {
+    local stage="$1"
+    local rep="$2"
+    local bench="$3"
+    local algo="$4"
+    local seed="$5"
+    local step="$6"
+
+    run_counter=$((run_counter + 1))
+    local run_id="$run_counter"
+    local binary="$bin_dir/${bench}.out"
+
+    local csv_basename
+    local log_basename
+    if [[ "$stage" == "warmup" ]]; then
+        csv_basename="warmup_${bench}_${algo}_${seed}.csv"
+        log_basename="warmup_${bench}_${algo}_${seed}.log"
+    elif [[ "$stage" == "matrix" ]]; then
+        csv_basename="${bench}_${algo}_${seed}_rep${rep}.csv"
+        log_basename="${bench}_${algo}_${seed}_rep${rep}.log"
+    elif [[ "$stage" == "aba" ]]; then
+        csv_basename="${bench}_${algo}_${seed}_aba${step}.csv"
+        log_basename="${bench}_${algo}_${seed}_aba${step}.log"
+    else
+        csv_basename="${bench}_${algo}_${seed}.csv"
+        log_basename="${bench}_${algo}_${seed}.log"
+    fi
+
+    local csv_file="${output_dir}/${csv_basename}"
+    local log_file="${output_dir}/${log_basename}"
+
+    local cmd=("${launcher_cmd[@]}" "$binary" --n "$bench_n" --iterations "$bench_iterations" \
+        --balance-interval "$bench_interval" --balance-algo "$algo" \
+        --perturbation 0.10 --seed "$seed" --output-csv "$csv_file")
+
+    echo "[Sample $run_id] stage=$stage rep=$rep bench=$bench algo=$algo seed=$seed step=$step"
+
+    local start_time
+    local end_time
+    start_time=$(python3 -c 'import time; print(time.time())')
+
+    set +e
+    timeout "$sample_timeout_str" "${cmd[@]}" > "$log_file" 2>&1
+    local exit_code=$?
+    set -e
+
+    end_time=$(python3 -c 'import time; print(time.time())')
+    local elapsed
+    elapsed=$(python3 -c "print(round($end_time - $start_time, 4))")
+
+    local status="success"
+    if [[ $exit_code -eq 124 ]]; then
+        status="timeout"
+        echo "[WARNING] Sample $run_id timed out after $sample_timeout_str: $bench $algo seed $seed" >&2
+    elif [[ $exit_code -ne 0 ]]; then
+        status="failed"
+        echo "[WARNING] Sample $run_id failed with exit code $exit_code: $bench $algo seed $seed" >&2
+    fi
+
+    # Convenience symlinks for matrix rep 1
+    if [[ "$stage" == "matrix" && "$rep" == "1" ]]; then
+        ln -sf "$csv_basename" "${output_dir}/${bench}_${algo}_${seed}.csv" 2>/dev/null || true
+        ln -sf "$log_basename" "${output_dir}/${bench}_${algo}_${seed}.log" 2>/dev/null || true
+    fi
+
+    record_sample_manifest "$run_id" "$stage" "$rep" "$bench" "$algo" "$seed" "$step" \
+        "${cmd[*]}" "$csv_basename" "$log_basename" "$exit_code" "$elapsed" "$status"
+}
+
 # Stage 1: Preflight Verification
 echo "=== Stage 1: Preflight Verification ==="
 echo "Running topology probe: $bin_dir/topo_probe.out"
@@ -232,20 +451,47 @@ if ! "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
     exit 1
 fi
 
-# Stage 2: Matrix Execution
-echo "=== Stage 2: Matrix Execution ==="
+# Initialize Manifest
+init_manifest
+
+# Phase 1: Untimed Warm-up Phase
+echo "=== Phase 1: Untimed Warm-up Phase ==="
+record_telemetry "before_warmup"
+default_seed="${seeds_array[0]}"
 for bench in kneighbor leanmd; do
-    binary="$bin_dir/${bench}.out"
     for algo in erad hwtopolb; do
-        for seed in "${seeds_array[@]}"; do
-            prefix="${output_dir}/${bench}_${algo}_${seed}"
-            "${launcher_cmd[@]}" "$binary" --n "$bench_n" --iterations "$bench_iterations" \
-                --balance-interval "$bench_interval" --balance-algo "$algo" \
-                --perturbation 0.10 --seed "$seed" --output-csv "${prefix}.csv" \
-                > "${prefix}.log"
-        done
+        execute_sample "warmup" "null" "$bench" "$algo" "$default_seed" "null"
     done
 done
+record_telemetry "after_warmup"
+
+# Phase 2: Rotated Matrix Execution (5 repetitions)
+echo "=== Phase 2: Rotated Matrix Execution ==="
+for rep in 1 2 3 4 5; do
+    echo "--- Repetition $rep / 5 ---"
+    record_telemetry "before_rep_${rep}"
+    read -r -a rep_algos <<< "$(get_rep_algos "$rep")"
+    read -r -a rep_seeds <<< "$(get_rep_seeds "$rep")"
+
+    for bench in kneighbor leanmd; do
+        for algo in "${rep_algos[@]}"; do
+            for seed in "${rep_seeds[@]}"; do
+                execute_sample "matrix" "$rep" "$bench" "$algo" "$seed" "null"
+            done
+        done
+    done
+    record_telemetry "after_rep_${rep}"
+done
+
+# Phase 3: Dedicated A/B/A Test (Seed 123)
+echo "=== Phase 3: Dedicated A/B/A Test (Seed 123) ==="
+record_telemetry "before_aba"
+for bench in kneighbor leanmd; do
+    execute_sample "aba" "null" "$bench" "erad" "123" "1"
+    execute_sample "aba" "null" "$bench" "hwtopolb" "123" "2"
+    execute_sample "aba" "null" "$bench" "erad" "123" "3"
+done
+record_telemetry "after_aba"
 
 echo "=== Super Matrix execution completed successfully ==="
 exit 0
