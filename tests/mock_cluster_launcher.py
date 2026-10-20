@@ -95,6 +95,32 @@ def simulate_benchmark(binary_name, target_args):
         sys.stderr.write(f"ERROR: Simulated benchmark failure in {binary_name}\n")
         sys.exit(1)
 
+    fail_pattern = os.environ.get("MOCK_FAIL_IF_CONTAINS")
+    if fail_pattern and fail_pattern in " ".join(target_args):
+        sys.stderr.write(f"ERROR: Simulated failure for {binary_name} with pattern: {fail_pattern}\n")
+        sys.exit(1)
+
+    fail_once_file = os.environ.get("MOCK_FAIL_ONCE_FILE")
+    if fail_once_file and not os.path.exists(fail_once_file):
+        with open(fail_once_file, "w", encoding="utf-8") as f:
+            f.write("failed once\n")
+        sys.stderr.write(f"ERROR: One-time simulated failure in {binary_name}\n")
+        sys.exit(1)
+
+    sleep_pattern = os.environ.get("MOCK_SLEEP_IF_CONTAINS")
+    if sleep_pattern and sleep_pattern in " ".join(target_args):
+        import time
+        sleep_sec = float(os.environ.get("MOCK_SLEEP_SECONDS", "5"))
+        time.sleep(sleep_sec)
+
+    sleep_once_file = os.environ.get("MOCK_SLEEP_ONCE_FILE")
+    if sleep_once_file and not os.path.exists(sleep_once_file):
+        with open(sleep_once_file, "w", encoding="utf-8") as f:
+            f.write("slept once\n")
+        import time
+        sleep_sec = float(os.environ.get("MOCK_SLEEP_SECONDS", "5"))
+        time.sleep(sleep_sec)
+
     n = int(extract_named_arg(target_args, "--n", "1000000"))
     iterations = int(extract_named_arg(target_args, "--iterations", "100"))
     interval = int(extract_named_arg(target_args, "--balance-interval", "10"))

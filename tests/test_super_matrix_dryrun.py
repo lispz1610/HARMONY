@@ -285,6 +285,228 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         benchmark_csvs = [f for f in os.listdir(self.out_dir) if f.endswith(".csv")]
         self.assertEqual(len(benchmark_csvs), 0, "CSVs should not be created if preflight fails")
 
+    def test_warmup_matrix_and_aba_execution_schedule(self):
+        """Verify warmup (4), 5 repetitions (60), and ABA (6) execute in exact scheduled order."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script([
+            "--bin-dir", self.bin_dir,
+            "--output-dir", self.out_dir,
+            "--n", "64",
+            "--iterations", "2",
+            "--seeds", "42,123,456",
+            "--launcher", launcher_cmd,
+        ])
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        manifest_path = os.path.join(self.out_dir, "run_manifest.json")
+        self.assertTrue(os.path.isfile(manifest_path), "run_manifest.json was not created")
+
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+
+        runs = manifest_data.get("runs", manifest_data)
+        self.assertEqual(len(runs), 70, f"Expected 70 total runs (4 warmup + 60 matrix + 6 ABA), got {len(runs)}")
+
+        # 1. Warmup checks (4 runs: kneighbor erad/hwtopolb, leanmd erad/hwtopolb with default seed 42)
+        warmup_runs = [r for r in runs if r.get("stage") == "warmup"]
+        self.assertEqual(len(warmup_runs), 4)
+        expected_warmup = [
+            ("kneighbor", "erad", 42),
+            ("kneighbor", "hwtopolb", 42),
+            ("leanmd", "erad", 42),
+            ("leanmd", "hwtopolb", 42),
+        ]
+        for r, exp in zip(warmup_runs, expected_warmup):
+            self.assertEqual((r["benchmark"], r["algorithm"], r["seed"]), exp)
+            self.assertEqual(r["status"], "success")
+            self.assertEqual(r["exit_code"], 0)
+
+        # 2. Matrix checks (5 repetitions = 60 runs)
+        matrix_runs = [r for r in runs if r.get("stage") == "matrix"]
+        self.assertEqual(len(matrix_runs), 60)
+
+        expected_rep_seeds = {
+            1: [42, 123, 456],
+            2: [123, 456, 42],
+            3: [456, 42, 123],
+            4: [42, 456, 123],
+            5: [123, 42, 456],
+        }
+        expected_rep_algos = {
+            1: ["erad", "hwtopolb"],
+            2: ["hwtopolb", "erad"],
+            3: ["erad", "hwtopolb"],
+            4: ["hwtopolb", "erad"],
+            5: ["erad", "hwtopolb"],
+        }
+
+        for rep in range(1, 6):
+            rep_runs = [r for r in matrix_runs if r.get("repetition") == rep]
+            self.assertEqual(len(rep_runs), 12, f"Repetition {rep} should have 12 runs")
+
+            exp_seeds = expected_rep_seeds[rep]
+            exp_algos = expected_rep_algos[rep]
+
+            idx = 0
+            for bench in ["kneighbor", "leanmd"]:
+                for algo in exp_algos:
+                    for seed in exp_seeds:
+                        r = rep_runs[idx]
+                        self.assertEqual(
+                            (r["benchmark"], r["algorithm"], r["seed"]),
+                            (bench, algo, seed),
+                            f"Mismatch in Rep {rep} run {idx}: expected {(bench, algo, seed)}, got {(r['benchmark'], r['algorithm'], r['seed'])}"
+                        )
+                        self.assertEqual(r["status"], "success")
+                        idx += 1
+
+        # 3. Dedicated A/B/A checks for seed 123 (6 runs)
+        aba_runs = [r for r in runs if r.get("stage") == "aba"]
+        self.assertEqual(len(aba_runs), 6)
+        expected_aba = [
+            ("kneighbor", "erad", 123),
+            ("kneighbor", "hwtopolb", 123),
+            ("kneighbor", "erad", 123),
+            ("leanmd", "erad", 123),
+            ("leanmd", "hwtopolb", 123),
+            ("leanmd", "erad", 123),
+        ]
+        for r, exp in zip(aba_runs, expected_aba):
+            self.assertEqual((r["benchmark"], r["algorithm"], r["seed"]), exp)
+            self.assertEqual(r["status"], "success")
+
+    def test_hardware_telemetry_created(self):
+        """Verify hardware_telemetry.log is created with snapshots before/after blocks."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script([
+            "--bin-dir", self.bin_dir,
+            "--output-dir", self.out_dir,
+            "--n", "64",
+            "--iterations", "2",
+            "--seeds", "42",
+            "--launcher", launcher_cmd,
+        ])
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        telem_file = os.path.join(self.out_dir, "hardware_telemetry.log")
+        self.assertTrue(os.path.isfile(telem_file), "hardware_telemetry.log was not created")
+
+        with open(telem_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Without nvidia-smi installed, should contain placeholder entries
+        self.assertGreater(len(content.strip()), 0)
+        self.assertIn("warmup", content)
+        self.assertIn("rep", content)
+        self.assertIn("aba", content)
+
+    def test_hardware_telemetry_with_mock_nvidia_smi(self):
+        """Verify hardware_telemetry queries nvidia-smi with exact query flags when available."""
+        self._create_dummy_binaries()
+        mock_bin_dir = os.path.join(self.temp_dir, "mock_smi_dir")
+        os.makedirs(mock_bin_dir, exist_ok=True)
+        mock_smi = os.path.join(mock_bin_dir, "nvidia-smi")
+        with open(mock_smi, "w", encoding="utf-8") as f:
+            f.write(
+                '#!/bin/sh\n'
+                'echo "2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB, 38, 12, 1410, 1215, 78.42, [N/A]"\n'
+            )
+        st = os.stat(mock_smi)
+        os.chmod(mock_smi, st.st_mode | stat.S_IEXEC)
+
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+            ],
+            env={"PATH": f"{mock_bin_dir}:{os.environ.get('PATH', '')}"},
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        telem_file = os.path.join(self.out_dir, "hardware_telemetry.log")
+        with open(telem_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("NVIDIA A100-PCIE-40GB", content)
+        self.assertIn("78.42", content)
+
+    def test_fault_tolerance_sample_failure_continues_remaining_runs(self):
+        """When mock launcher fails on one run, runner logs failure and continues remaining runs."""
+        self._create_dummy_binaries()
+        fail_marker = os.path.join(self.temp_dir, "fail_once.marker")
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+            ],
+            env={"MOCK_FAIL_ONCE_FILE": fail_marker},
+        )
+        self.assertEqual(proc.returncode, 0, "Runner should not abort the whole job on single sample failure")
+
+        manifest_path = os.path.join(self.out_dir, "run_manifest.json")
+        self.assertTrue(os.path.isfile(manifest_path))
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        runs = manifest.get("runs", manifest)
+        # Should have executed all scheduled runs despite the single failure
+        # For 1 seed (42): 4 warmup + 20 matrix (2 bench * 2 algo * 1 seed * 5 rep) + 6 ABA = 30 runs
+        self.assertEqual(len(runs), 30)
+
+        failed_runs = [r for r in runs if r.get("status") == "failed"]
+        self.assertEqual(len(failed_runs), 1, "Exactly one run should be recorded as failed")
+        self.assertNotEqual(failed_runs[0]["exit_code"], 0)
+
+        success_runs = [r for r in runs if r.get("status") == "success"]
+        self.assertEqual(len(success_runs), 29)
+
+    def test_fault_tolerance_sample_timeout_continues_remaining_runs(self):
+        """When a sample times out, runner logs timeout in manifest and continues remaining runs."""
+        self._create_dummy_binaries()
+        sleep_marker = os.path.join(self.temp_dir, "sleep_once.marker")
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+            ],
+            env={
+                "SAMPLE_TIMEOUT_SECONDS": "1",
+                "MOCK_SLEEP_ONCE_FILE": sleep_marker,
+                "MOCK_SLEEP_SECONDS": "3",
+            },
+        )
+        self.assertEqual(proc.returncode, 0, "Runner should not abort on sample timeout")
+
+        manifest_path = os.path.join(self.out_dir, "run_manifest.json")
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        runs = manifest.get("runs", manifest)
+        self.assertEqual(len(runs), 30)
+        timed_out = [r for r in runs if r.get("status") == "timeout"]
+        self.assertEqual(len(timed_out), 1)
+        self.assertEqual(timed_out[0]["exit_code"], 124)
+
+        success_runs = [r for r in runs if r.get("status") == "success"]
+        self.assertEqual(len(success_runs), 29)
+
 
 if __name__ == "__main__":
     unittest.main()
