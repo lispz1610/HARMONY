@@ -20,6 +20,7 @@ HARMONY is a header-driven, high-performance computing (HPC) library for **topol
 5. [Directory Structure](#5-directory-structure)
 6. [Building and Running](#6-building-and-running)
 7. [Running on a PBS Cluster](#7-running-on-a-pbs-cluster)
+   - [Super Job Variance Investigation Workflow](#super-job-variance-investigation-workflow)
 8. [Test Results & Verification](#8-test-results--verification)
 9. [Static Analysis Baseline](#9-static-analysis-baseline)
 
@@ -495,6 +496,41 @@ probe as a separate topology measurement, not as an input to that comparison.
 The jobs fail early if a required frontend-built executable is missing. A
 cluster run is still needed to validate the installed OpenCL driver and GPU
 execution paths.
+
+### Super Job Variance Investigation Workflow
+
+To investigate and resolve multi-GPU execution variance and isolate the seed-123 performance discrepancy between ERAD and HWTOPOLB, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs an untimed warm-up, a 5-repetition rotated matrix, an isolated A/B/A test for seed 123, and hardware telemetry without modifying core C++ source code.
+
+Follow this 5-step workflow:
+
+1. **Pre-build on frontend**:
+   Compile all benchmarks and preflight binaries on the cluster login node (compiling on compute nodes is strictly forbidden):
+   ```bash
+   bash cluster_build.sh
+   ```
+2. **Submit super job**:
+   Submit the single-allocation 2-hour PBS batch script:
+   ```bash
+   qsub job_harmony_super.pbs
+   ```
+3. **Monitor job**:
+   Track the job state in the PBS queue:
+   ```bash
+   qstat -u $USER
+   ```
+   Or inspect live execution details using `qstat -f <JOB_ID>`.
+4. **Artifacts generated in `results/variance_run_<JOBID>/`**:
+   All execution artifacts are isolated inside a dedicated run directory under `results/variance_run_<JOBID>/`:
+   - `SUPER_JOB_REPORT.md`: Comprehensive Markdown report with Paired Speedup Ratios, Dispersion Analysis, and Diagnostics.
+   - `super_matrix_summary.csv`: Aggregated execution metrics and per-repetition timings.
+   - `super_matrix_paired_ratios.csv`: ERAD vs. HWTOPOLB speedup ratios and classification per seed.
+   - `hardware_telemetry.log`: Timestamped GPU temperatures, utilization, clocks, power draw, and throttle flags.
+   - `run_manifest.json`: Detailed machine-readable manifest tracking every benchmark execution sample.
+5. **Offline recovery command**:
+   Regenerate reports idempotently from raw CSVs and logs without re-executing any cluster workloads:
+   ```bash
+   python3 benchmarks/analyze_super_matrix.py --output-dir results/variance_run_<JOBID> --summarize-only
+   ```
 
 ---
 
