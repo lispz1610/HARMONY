@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -283,6 +284,41 @@ class TestSuperJobExecution(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         output = proc.stderr + proc.stdout
         self.assertIn("ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)", output)
+
+    def test_asymmetric_topology_distribution_fails_topology_check(self):
+        """2+0 per-rank device distribution must fail the TOPOLOGY check, before the halo test runs."""
+        self._create_cluster_binaries()
+        proc = self._run_job_script({"MOCK_ASYMMETRIC_TOPO": "1"})
+        output = proc.stderr + proc.stdout
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertIn("Preflight error: per-rank OpenCL GPU counts", output)
+        self.assertNotIn("Asynchronous halo test preflight failed", output)
+        self.assertNotIn("Executing Super Matrix Benchmark", output)
+
+    def test_symmetric_topology_distribution_passes_topology_check(self):
+        """1+1 per-rank distribution must pass the topology check."""
+        self._create_cluster_binaries()
+        proc = self._run_job_script()
+        self.assertNotIn("per-rank OpenCL GPU counts", proc.stderr + proc.stdout)
+
+    def test_preflight_budget_is_shared_across_steps(self):
+        """Topo probe and halo test share one preflight deadline instead of 60s each."""
+        self._create_cluster_binaries()
+        started = time.monotonic()
+        proc = self._run_job_script(
+            {"PREFLIGHT_BUDGET_SECONDS": "3", "MOCK_SLEEP_TOPO": "2", "MOCK_SLEEP_HALO": "2"}
+        )
+        elapsed = time.monotonic() - started
+        output = proc.stderr + proc.stdout
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertNotIn("Executing Super Matrix Benchmark", output)
+        self.assertLess(elapsed, 3.9, f"preflight overran the shared 3s budget ({elapsed:.1f}s)")
+
+    def test_preflight_budget_defaults_to_60_seconds_total(self):
+        with open(JOB_SCRIPT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("PREFLIGHT_BUDGET_SECONDS:-60", content)
+        self.assertNotIn("timeout 60s", content)
 
     def test_runner_invocation_passes_skip_preflight(self):
         """job_harmony_super.pbs must pass --skip-preflight to run_super_matrix.sh."""

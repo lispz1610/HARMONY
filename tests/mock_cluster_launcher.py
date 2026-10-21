@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 
@@ -56,6 +57,10 @@ def simulate_topo_probe(target_args):
         sys.stderr.write("ERROR: Simulated topo_probe failure\n")
         sys.exit(1)
 
+    sleep_s = float(os.environ.get("MOCK_SLEEP_TOPO", "0") or 0)
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
     out_json = extract_named_arg(target_args, "--output-json")
     if out_json:
         os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
@@ -74,6 +79,13 @@ def simulate_topo_probe(target_args):
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(topo_data, f, indent=2)
 
+    # MOCK_ASYMMETRIC_TOPO=1 models 2 devices on rank 0 and 0 on rank 1: the flat
+    # JSON arrays still hold two entries, only the per-rank stdout counts differ.
+    counts = "2,0" if os.environ.get("MOCK_ASYMMETRIC_TOPO") == "1" else "1,1"
+    sys.stdout.write("mode=measured\n")
+    sys.stdout.write("total_devices=2\n")
+    sys.stdout.write("mpi_ranks=2\n")
+    sys.stdout.write(f"rank_device_counts={counts}\n")
     sys.stdout.write("[topo_probe] Probed 2 ranks, 2 devices\n")
     sys.exit(0)
 
@@ -83,6 +95,10 @@ def simulate_test_async_halo(target_args):
     if os.environ.get("MOCK_FAIL_PREFLIGHT_HALO") == "1":
         sys.stderr.write("Preflight failed: Simulated halo communication failure\n")
         sys.exit(1)
+
+    halo_sleep_s = float(os.environ.get("MOCK_SLEEP_HALO", "0") or 0)
+    if halo_sleep_s > 0:
+        time.sleep(halo_sleep_s)
 
     if os.environ.get("MOCK_ASYMMETRIC_GPUS") == "1":
         sys.stdout.write("SKIP: asynchronous halo test needs at least one OpenCL GPU per MPI rank (found min=0, total=2)\n")

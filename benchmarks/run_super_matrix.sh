@@ -521,11 +521,25 @@ if [[ "$skip_preflight" -eq 1 ]]; then
     echo "=== Stage 1: Preflight Verification (SKIPPED via --skip-preflight) ==="
 else
     echo "=== Stage 1: Preflight Verification ==="
-    echo "Running topology probe (timeout 60s): $bin_dir/topo_probe.out"
-    timeout 60s "${launcher_cmd[@]}" "$bin_dir/topo_probe.out" --output-json "$output_dir/topo_metrics_cluster.json"
+    # The spec allows 60s in total for all preflight probes: one shared deadline.
+    preflight_budget="${PREFLIGHT_BUDGET_SECONDS:-60}"
+    preflight_deadline=$((SECONDS + preflight_budget))
+    preflight_remaining() {
+        local remaining=$((preflight_deadline - SECONDS))
+        if [[ $remaining -lt 1 ]]; then
+            echo "Preflight failed: budget of ${preflight_budget}s exhausted before $1" >&2
+            exit 1
+        fi
+        echo "$remaining"
+    }
+
+    topo_stdout="$output_dir/topo_probe.stdout"
+    remaining=$(preflight_remaining "topology probe")
+    echo "Running topology probe (shared preflight budget: ${remaining}s of ${preflight_budget}s left): $bin_dir/topo_probe.out"
+    timeout "${remaining}s" "${launcher_cmd[@]}" "$bin_dir/topo_probe.out" --output-json "$output_dir/topo_metrics_cluster.json" | tee "$topo_stdout"
 
     # Validate generated topology metrics
-    python3 - "$output_dir/topo_metrics_cluster.json" <<'PY'
+    python3 - "$output_dir/topo_metrics_cluster.json" "$topo_stdout" <<'PY'
 import json
 import sys
 
@@ -543,10 +557,31 @@ if metrics.get("synthetic", True):
 if len(metrics.get("pcie_latency_ns", [])) < 2:
     sys.stderr.write("Preflight failed: expected at least two measured OpenCL GPUs\n")
     sys.exit(1)
+
+# The topology JSON only holds flat per-device arrays, so per-rank GPU counts come from
+# the "rank_device_counts=" line that topo_probe prints on rank 0.
+counts = None
+with open(sys.argv[2], encoding="utf-8") as stdout_log:
+    for line in stdout_log:
+        if line.startswith("rank_device_counts="):
+            try:
+                counts = [int(v) for v in line.split("=", 1)[1].strip().split(",")]
+            except ValueError:
+                pass
+if counts is None:
+    sys.stderr.write("Preflight failed: topo_probe did not report rank_device_counts; rebuild it with cluster_build.sh\n")
+    sys.exit(1)
+if len(counts) < 2 or any(c < 1 for c in counts):
+    sys.stderr.write(f"Preflight failed: per-rank OpenCL GPU counts must be >= 1 on every rank (at least 2 ranks), got {counts}\n")
+    sys.exit(1)
+if sum(counts) != len(metrics["pcie_latency_ns"]):
+    sys.stderr.write(f"Preflight failed: per-rank GPU counts {counts} disagree with {len(metrics['pcie_latency_ns'])} measured devices\n")
+    sys.exit(1)
 PY
 
-    echo "Running asynchronous OpenCL halo test (timeout 60s): $bin_dir/test_async_halo_opencl.out"
-    if ! timeout 60s "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
+    remaining=$(preflight_remaining "asynchronous halo test")
+    echo "Running asynchronous OpenCL halo test (shared preflight budget: ${remaining}s of ${preflight_budget}s left): $bin_dir/test_async_halo_opencl.out"
+    if ! timeout "${remaining}s" "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
         echo "ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)" >&2
         exit 1
     fi

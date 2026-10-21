@@ -353,6 +353,11 @@ int main(int argc, char** argv) {
         std::cout << "mode=" << (metrics.synthetic ? "synthetic" : "measured") << std::endl;
         std::cout << "total_devices=" << total_devices << std::endl;
         std::cout << "mpi_ranks=" << size << std::endl;
+        std::cout << "rank_device_counts=";
+        for (int r = 0; r < size; ++r) {
+            std::cout << (r == 0 ? "" : ",") << all_dev_counts[static_cast<std::size_t>(r)];
+        }
+        std::cout << std::endl;
         for (int d = 0; d < total_devices; ++d) {
             std::cout << "pcie_latency_ns[" << d << "]="
                       << std::fixed << std::setprecision(3) << metrics.pcie_latency_ns[static_cast<std::size_t>(d)]

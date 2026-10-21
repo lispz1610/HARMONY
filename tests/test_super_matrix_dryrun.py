@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -315,6 +316,39 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         # Confirm no benchmark CSVs were created
         benchmark_csvs = [f for f in os.listdir(self.out_dir) if f.endswith(".csv")]
         self.assertEqual(len(benchmark_csvs), 0, "CSVs should not be created if preflight fails")
+
+    def test_asymmetric_topology_distribution_fails_topology_check(self):
+        """2+0 per-rank device distribution must fail the TOPOLOGY check, before the halo test runs."""
+        self._create_dummy_binaries()
+        proc = self._run_script(
+            ["--bin-dir", self.bin_dir, "--output-dir", self.out_dir, "--n", "32",
+             "--iterations", "2", "--seeds", "42", "--launcher", f"python3 {self.mock_launcher_path}"],
+            env={"MOCK_ASYMMETRIC_TOPO": "1"},
+        )
+        output = proc.stderr + proc.stdout
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertIn("Preflight failed: per-rank OpenCL GPU counts", output)
+        self.assertNotIn("Asynchronous halo test preflight failed", output)
+        benchmark_csvs = [f for f in os.listdir(self.out_dir) if f.endswith(".csv")]
+        self.assertEqual(benchmark_csvs, [])
+
+    def test_preflight_budget_is_shared_across_steps(self):
+        """Topo probe and halo test share one preflight deadline instead of 60s each."""
+        self._create_dummy_binaries()
+        started = time.monotonic()
+        proc = self._run_script(
+            ["--bin-dir", self.bin_dir, "--output-dir", self.out_dir, "--n", "32",
+             "--iterations", "2", "--seeds", "42", "--launcher", f"python3 {self.mock_launcher_path}"],
+            env={"PREFLIGHT_BUDGET_SECONDS": "3", "MOCK_SLEEP_TOPO": "2", "MOCK_SLEEP_HALO": "2"},
+        )
+        elapsed = time.monotonic() - started
+        self.assertNotEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertLess(elapsed, 3.9, f"preflight overran the shared 3s budget ({elapsed:.1f}s)")
+
+    def test_preflight_budget_defaults_to_60_seconds_total(self):
+        with open(self.script_path, "r", encoding="utf-8") as f:
+            script_text = f.read()
+        self.assertIn("PREFLIGHT_BUDGET_SECONDS:-60", script_text)
 
     def test_warmup_matrix_and_aba_execution_schedule(self):
         """Verify warmup (4), 5 repetitions (60), and ABA (6) execute in exact scheduled order."""
@@ -648,22 +682,14 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         manifest_path = os.path.join(self.out_dir, "run_manifest.json")
         self.assertTrue(os.path.isfile(manifest_path))
 
-    def test_preflight_wrapped_with_timeout_in_script(self):
-        """run_super_matrix.sh must wrap preflight probe and halo calls with 'timeout 60s'."""
+    def test_preflight_wrapped_with_shared_timeout_in_script(self):
+        """run_super_matrix.sh must wrap both preflight calls in `timeout` using the shared remaining budget."""
         with open(self.script_path, "r", encoding="utf-8") as f:
             script_text = f.read()
 
-        self.assertIn("timeout 60s", script_text)
-        self.assertTrue(
-            "timeout 60s \"${launcher_cmd[@]}\" \"$bin_dir/topo_probe.out\"" in script_text or
-            "timeout 60s" in script_text,
-            "Expected preflight topo probe wrapped with timeout 60s"
-        )
-        self.assertTrue(
-            "timeout 60s \"${launcher_cmd[@]}\" \"$bin_dir/test_async_halo_opencl.out\"" in script_text or
-            "timeout 60s" in script_text,
-            "Expected preflight halo test wrapped with timeout 60s"
-        )
+        self.assertIn('timeout "${remaining}s" "${launcher_cmd[@]}" "$bin_dir/topo_probe.out"', script_text)
+        self.assertIn('timeout "${remaining}s" "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"', script_text)
+        self.assertNotIn("timeout 60s", script_text)
 
     def test_multinode_telemetry_dryrun_e2e_analysis(self):
         """End-to-end integration: runner captures multi-node telemetry and analyzer produces json & report."""
