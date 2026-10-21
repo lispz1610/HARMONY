@@ -135,17 +135,63 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         """Parses hardware_telemetry.log into structured telemetry records."""
         telemetry_file = self.output_dir / "hardware_telemetry.log"
         telemetry_file.write_text(
-            "timestamp, name, temperature.gpu, utilization.gpu [%], utilization.memory [%], power.draw [W], clocks.current.sm [MHz]\n"
-            "2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 0 %, 0 %, 64.20 W, 1410 MHz\n"
-            "2026/10/20 22:00:05.000, NVIDIA A100 80GB PCIe, 42, 98 %, 35 %, 210.50 W, 1410 MHz\n",
+            "timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active\n"
+            "2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 0, 1410, 1215, 64.20, [N/A]\n"
+            "2026/10/20 22:00:05.000, NVIDIA A100 80GB PCIe, 42, 98, 1410, 1215, 210.50, [N/A]\n",
             encoding="utf-8"
         )
         records = asm.parse_hardware_telemetry(telemetry_file)
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0]["temperature_gpu"], 38)
         self.assertEqual(records[0]["utilization_gpu_pct"], 0)
+        self.assertEqual(records[0]["clocks_graphics_mhz"], 1410)
+        self.assertEqual(records[0]["clocks_memory_mhz"], 1215)
+        self.assertAlmostEqual(records[0]["power_draw_w"], 64.20)
         self.assertAlmostEqual(records[1]["power_draw_w"], 210.50)
         self.assertEqual(records[1]["utilization_gpu_pct"], 98)
+
+    def test_telemetry_parsing_creates_hardware_telemetry_json(self):
+        """Hardware telemetry parsing creates hardware_telemetry.json with distinct graphics/memory clocks and power."""
+        telemetry_file = self.output_dir / "hardware_telemetry.log"
+        telemetry_file.write_text(
+            "timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active\n"
+            "2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB, 45, 85, 1410, 1215, 250.5, 0x0000000000000000\n",
+            encoding="utf-8"
+        )
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 3.74,
+                "step_sum_s": 2.74,
+                "unaccounted_s": 1.00,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            }
+        ]
+        asm.generate_artifacts(self.output_dir, runs)
+        telemetry_json = self.output_dir / "hardware_telemetry.json"
+        self.assertTrue(telemetry_json.exists(), "hardware_telemetry.json was not created")
+        with open(telemetry_json, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 1)
+        entry = data[0]
+        self.assertEqual(entry["timestamp"], "2026/10/20 22:00:00.000")
+        self.assertEqual(entry["name"], "NVIDIA A100-PCIE-40GB")
+        self.assertEqual(entry["temperature_gpu"], 45)
+        self.assertEqual(entry["utilization_gpu_pct"], 85)
+        self.assertEqual(entry["clocks_graphics_mhz"], 1410)
+        self.assertEqual(entry["clocks_memory_mhz"], 1215)
+        self.assertAlmostEqual(entry["power_draw_w"], 250.5, places=4)
+        self.assertEqual(entry["throttle_reasons"], "0x0000000000000000")
+
+        report_md = (self.output_dir / "SUPER_JOB_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("Graphics Clock (MHz)", report_md)
+        self.assertIn("Memory Clock (MHz)", report_md)
+        self.assertIn("Power Draw (W)", report_md)
 
     def test_paired_analysis_and_statistics(self):
         """Computes ERAD ÷ HWTOPOLB speedup ratios, percentages, and repetition statistics."""
@@ -275,8 +321,8 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         # Write dummy telemetry log
         telemetry_file = self.output_dir / "hardware_telemetry.log"
         telemetry_file.write_text(
-            "timestamp, name, temperature.gpu, utilization.gpu [%], utilization.memory [%], power.draw [W], clocks.current.sm [MHz]\n"
-            "2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 0 %, 0 %, 64.20 W, 1410 MHz\n",
+            "timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active\n"
+            "2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 0, 1410, 1215, 64.20, [N/A]\n",
             encoding="utf-8"
         )
 

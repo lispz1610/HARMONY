@@ -285,7 +285,7 @@ def parse_hardware_telemetry(telemetry_path: Path):
             if any("timestamp" in p.lower() or "name" in p.lower() for p in parts):
                 continue
 
-            # Standard fields: timestamp, name, temp, util_gpu, util_mem, power, clock
+            # Standard fields: timestamp, name, temp, util_gpu, clocks_graphics, clocks_memory, power, throttle_reasons
             timestamp = parts[0]
             name = parts[1] if len(parts) > 1 else ""
 
@@ -299,23 +299,29 @@ def parse_hardware_telemetry(telemetry_path: Path):
 
             temp = clean_int(parts[2]) if len(parts) > 2 else 0
             util_gpu = clean_int(parts[3]) if len(parts) > 3 else 0
-            util_mem = clean_int(parts[4]) if len(parts) > 4 else 0
-            power = clean_num(parts[5]) if len(parts) > 5 else 0.0
-            clocks = clean_int(parts[6]) if len(parts) > 6 else 0
+            clocks_graphics = clean_int(parts[4]) if len(parts) > 4 else 0
+            clocks_memory = clean_int(parts[5]) if len(parts) > 5 else 0
+            power = clean_num(parts[6]) if len(parts) > 6 else 0.0
+            throttle = ", ".join(parts[7:]).strip() if len(parts) > 7 else ""
 
             records.append({
                 "timestamp": timestamp,
                 "name": name,
                 "temperature_gpu": temp,
                 "utilization_gpu_pct": util_gpu,
-                "utilization_memory_pct": util_mem,
+                "clocks_graphics_mhz": clocks_graphics,
+                "clocks_memory_mhz": clocks_memory,
                 "power_draw_w": power,
-                "clocks_current_sm_mhz": clocks,
+                "throttle_reasons": throttle,
             })
     except Exception:
         return []
 
     return records
+
+
+# Alias for compatibility if invoked as parse_telemetry
+parse_telemetry = parse_hardware_telemetry
 
 
 def identify_run_attributes(filename: str, log_data=None):
@@ -1056,16 +1062,19 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
         md.append("## 7. Hardware Telemetry & Environmental Stability\n")
         temps = [r["temperature_gpu"] for r in telemetry_records if r.get("temperature_gpu")]
         powers = [r["power_draw_w"] for r in telemetry_records if r.get("power_draw_w")]
-        clocks = [r["clocks_current_sm_mhz"] for r in telemetry_records if r.get("clocks_current_sm_mhz")]
+        gfx_clocks = [r["clocks_graphics_mhz"] for r in telemetry_records if r.get("clocks_graphics_mhz")]
+        mem_clocks = [r["clocks_memory_mhz"] for r in telemetry_records if r.get("clocks_memory_mhz")]
 
         md.append("| Metric | Min | Mean | Max |")
         md.append("|---|---:|---:|---:|")
         if temps:
             md.append(f"| GPU Temperature (°C) | {min(temps)} | {statistics.mean(temps):.1f} | {max(temps)} |")
         if powers:
-            md.append(f"| GPU Power Draw (W) | {min(powers):.1f} | {statistics.mean(powers):.1f} | {max(powers):.1f} |")
-        if clocks:
-            md.append(f"| SM Clock Frequency (MHz) | {min(clocks)} | {statistics.mean(clocks):.0f} | {max(clocks)} |")
+            md.append(f"| Power Draw (W) | {min(powers):.1f} | {statistics.mean(powers):.1f} | {max(powers):.1f} |")
+        if gfx_clocks:
+            md.append(f"| Graphics Clock (MHz) | {min(gfx_clocks)} | {statistics.mean(gfx_clocks):.0f} | {max(gfx_clocks)} |")
+        if mem_clocks:
+            md.append(f"| Memory Clock (MHz) | {min(mem_clocks)} | {statistics.mean(mem_clocks):.0f} | {max(mem_clocks)} |")
         md.append("")
 
     # Section 8: Evidence Gate & Formal Claims
