@@ -357,6 +357,7 @@ get_rep_algos() {
 }
 
 run_counter=0
+failed_samples=0
 
 execute_sample() {
     local stage="$1"
@@ -411,9 +412,11 @@ execute_sample() {
     local status="success"
     if [[ $exit_code -eq 124 ]]; then
         status="timeout"
+        failed_samples=$((failed_samples + 1))
         echo "[WARNING] Sample $run_id timed out after $sample_timeout_str: $bench $algo seed $seed" >&2
     elif [[ $exit_code -ne 0 ]]; then
         status="failed"
+        failed_samples=$((failed_samples + 1))
         echo "[WARNING] Sample $run_id failed with exit code $exit_code: $bench $algo seed $seed" >&2
     fi
 
@@ -498,6 +501,11 @@ for bench in kneighbor leanmd; do
     execute_sample "aba" "null" "$bench" "erad" "123" "3"
 done
 record_telemetry "after_aba"
+
+if [[ "$failed_samples" -gt 0 ]]; then
+    echo "ERROR: $failed_samples sample(s) failed or timed out during matrix execution" >&2
+    exit 1
+fi
 
 echo "=== Super Matrix execution completed successfully ==="
 exit 0
