@@ -17,6 +17,24 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     else
         echo "${host}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi query failed)"
     fi
+
+    # Check for co-located GPU compute workloads
+    apps_output="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)"
+    if [[ -n "$apps_output" ]]; then
+        apps_found=0
+        while IFS= read -r app_line; do
+            if [[ -n "$app_line" ]] && [[ "$app_line" != *"NVIDIA"* ]]; then
+                echo "# [compute-apps] host=${host} rank=${rank} ${app_line}"
+                apps_found=1
+            fi
+        done <<< "$apps_output"
+        if [[ $apps_found -eq 0 ]]; then
+            echo "# [compute-apps] host=${host} rank=${rank} shared_workload=none"
+        fi
+    else
+        echo "# [compute-apps] host=${host} rank=${rank} shared_workload=none"
+    fi
 else
     echo "${host}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi not available)"
+    echo "# [compute-apps] host=${host} rank=${rank} shared_workload=none"
 fi

@@ -247,7 +247,8 @@ record_telemetry() {
                 while IFS= read -r node || [[ -n "$node" ]]; do
                     node="$(echo "$node" | tr -d '[:space:]')"
                     [[ -z "$node" ]] && continue
-                    if ! echo "$probe_out" | grep -Fq "$node"; then
+                    local node_clean="${node%\[*\]}"
+                    if ! echo "$probe_out" | grep -Fq "$node_clean" && ! echo "$probe_out" | grep -Fq "$node"; then
                         all_found=0
                         break
                     fi
@@ -269,17 +270,35 @@ record_telemetry() {
         while IFS= read -r node || [[ -n "$node" ]]; do
             node="$(echo "$node" | tr -d '[:space:]')"
             [[ -z "$node" ]] && continue
+            local node_clean="${node%\[*\]}"
             if [[ $rank -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1; then
                 local smi_out=""
                 if smi_out=$(nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$smi_out" ]]; then
                     while IFS= read -r line; do
-                        [[ -n "$line" ]] && echo "${node}, ${rank}, ${line}" >> "$telem_file"
+                        [[ -n "$line" ]] && echo "${node_clean}, ${rank}, ${line}" >> "$telem_file"
                     done <<< "$smi_out"
+                    local apps_out=""
+                    apps_out=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
+                    if [[ -n "$apps_out" ]]; then
+                        local apps_found=0
+                        while IFS= read -r app_line; do
+                            if [[ -n "$app_line" ]] && [[ "$app_line" != *"NVIDIA"* ]]; then
+                                echo "# [compute-apps] host=${node_clean} rank=${rank} ${app_line}" >> "$telem_file"
+                                apps_found=1
+                            fi
+                        done <<< "$apps_out"
+                        if [[ $apps_found -eq 0 ]]; then
+                            echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
+                        fi
+                    else
+                        echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
+                    fi
                     probed=1
                 fi
             fi
             if [[ $rank -gt 0 || $probed -eq 0 ]]; then
-                echo "${node}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (telemetry queried via PBS_NODEFILE for block ${block_name})" >> "$telem_file"
+                echo "${node_clean}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (telemetry queried via PBS_NODEFILE for block ${block_name})" >> "$telem_file"
+                echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
                 probed=1
             fi
             rank=$((rank + 1))
@@ -296,11 +315,29 @@ record_telemetry() {
                 while IFS= read -r line; do
                     [[ -n "$line" ]] && echo "${host}, 0, ${line}" >> "$telem_file"
                 done <<< "$smi_out"
+                local apps_out=""
+                apps_out=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
+                if [[ -n "$apps_out" ]]; then
+                    local apps_found=0
+                    while IFS= read -r app_line; do
+                        if [[ -n "$app_line" ]] && [[ "$app_line" != *"NVIDIA"* ]]; then
+                            echo "# [compute-apps] host=${host} rank=0 ${app_line}" >> "$telem_file"
+                            apps_found=1
+                        fi
+                    done <<< "$apps_out"
+                    if [[ $apps_found -eq 0 ]]; then
+                        echo "# [compute-apps] host=${host} rank=0 shared_workload=none" >> "$telem_file"
+                    fi
+                else
+                    echo "# [compute-apps] host=${host} rank=0 shared_workload=none" >> "$telem_file"
+                fi
             else
                 echo "${host}, 0, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi query failed for block ${block_name})" >> "$telem_file"
+                echo "# [compute-apps] host=${host} rank=0 shared_workload=none" >> "$telem_file"
             fi
         else
             echo "${host}, 0, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi not available for block ${block_name})" >> "$telem_file"
+            echo "# [compute-apps] host=${host} rank=0 shared_workload=none" >> "$telem_file"
         fi
     fi
 }
@@ -387,24 +424,15 @@ PY
 
 get_rep_seeds() {
     local rep="$1"
-    if [[ ${#seeds_array[@]} -eq 3 && "${seeds_array[0]}" == "42" && "${seeds_array[1]}" == "123" && "${seeds_array[2]}" == "456" ]]; then
-        case "$rep" in
-            1) echo "42 123 456" ;;
-            2) echo "123 456 42" ;;
-            3) echo "456 42 123" ;;
-            4) echo "42 456 123" ;;
-            5) echo "123 42 456" ;;
-        esac
-    elif [[ ${#seeds_array[@]} -eq 3 ]]; then
+    if [[ ${#seeds_array[@]} -eq 3 ]]; then
         local s0="${seeds_array[0]}"
         local s1="${seeds_array[1]}"
         local s2="${seeds_array[2]}"
-        case "$rep" in
-            1) echo "$s0 $s1 $s2" ;;
-            2) echo "$s1 $s2 $s0" ;;
-            3) echo "$s2 $s0 $s1" ;;
-            4) echo "$s0 $s2 $s1" ;;
-            5) echo "$s1 $s0 $s2" ;;
+        local rot=$(( (rep - 1) % 3 ))
+        case "$rot" in
+            0) echo "$s0 $s1 $s2" ;;
+            1) echo "$s1 $s2 $s0" ;;
+            2) echo "$s2 $s0 $s1" ;;
         esac
     else
         echo "${seeds_array[*]}"

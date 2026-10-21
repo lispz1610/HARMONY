@@ -1103,7 +1103,7 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertAlmostEqual(parsed_b["total_time_s"], 0.45)
         self.assertAlmostEqual(parsed_b["loop_time_s"], 0.185)
 
-        # Case C: Legacy log without loop_time_s
+        # Case C: Historical log without loop_time_s
         log_c = (
             "[kneighbor] algo=erad mode=gpu_opencl total_time_s=3.74 num_rebalances=9 avg_rebalance_gain=6.34e-05\n"
         )

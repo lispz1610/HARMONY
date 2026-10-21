@@ -218,6 +218,35 @@ def simulate_telemetry(target_args):
                 sys.stdout.write(f"compute-1-0, 0, {lines[0]}\n")
                 line1 = lines[1] if len(lines) > 1 else lines[0]
                 sys.stdout.write(f"compute-1-1, 1, {line1}\n")
+
+                # Workload co-location query
+                try:
+                    apps_res = subprocess.run(
+                        [
+                            smi,
+                            "--query-compute-apps=pid,process_name,used_memory",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    # Filter out naive mock echoes containing GPU metadata
+                    apps_lines = [
+                        l.strip() for l in apps_res.stdout.splitlines()
+                        if l.strip() and "NVIDIA" not in l and not any(k in l for k in ("clocks", "temperature", "power"))
+                    ]
+                    if apps_lines:
+                        for app_l in apps_lines:
+                            sys.stdout.write(f"# [compute-apps] host=compute-1-0 rank=0 {app_l}\n")
+                            sys.stdout.write(f"# [compute-apps] host=compute-1-1 rank=1 {app_l}\n")
+                    else:
+                        sys.stdout.write("# [compute-apps] host=compute-1-0 rank=0 shared_workload=none\n")
+                        sys.stdout.write("# [compute-apps] host=compute-1-1 rank=1 shared_workload=none\n")
+                except Exception:
+                    sys.stdout.write("# [compute-apps] host=compute-1-0 rank=0 shared_workload=none\n")
+                    sys.stdout.write("# [compute-apps] host=compute-1-1 rank=1 shared_workload=none\n")
+
                 sys.exit(0)
         except Exception:
             pass
@@ -225,6 +254,8 @@ def simulate_telemetry(target_args):
     # Default mock telemetry across 2 ranks/hosts
     sys.stdout.write(f"compute-1-0, 0, {now}, NVIDIA A100-PCIE-40GB, 38, 12, 1410, 1215, 78.42, [N/A]\n")
     sys.stdout.write(f"compute-1-1, 1, {now}, NVIDIA A100-PCIE-40GB, 42, 18, 1410, 1215, 82.10, [N/A]\n")
+    sys.stdout.write("# [compute-apps] host=compute-1-0 rank=0 shared_workload=none\n")
+    sys.stdout.write("# [compute-apps] host=compute-1-1 rank=1 shared_workload=none\n")
     sys.exit(0)
 
 

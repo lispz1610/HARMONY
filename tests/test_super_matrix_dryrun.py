@@ -361,8 +361,8 @@ class TestSuperMatrixDryRun(unittest.TestCase):
             1: [42, 123, 456],
             2: [123, 456, 42],
             3: [456, 42, 123],
-            4: [42, 456, 123],
-            5: [123, 42, 456],
+            4: [42, 123, 456],
+            5: [123, 456, 42],
         }
         expected_rep_algos = {
             1: ["erad", "hwtopolb"],
@@ -521,6 +521,37 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         self.assertIn("compute-1-1", content)
         self.assertIn("compute-1-0, 0,", content)
         self.assertIn("compute-1-1, 1,", content)
+        self.assertIn("shared_workload=none", content)
+
+    def test_hardware_telemetry_vnode_suffix_matching(self):
+        """When PBS_NODEFILE contains bracketed vnode suffixes (e.g. compute-1-0[0]), matches stripped host."""
+        self._create_dummy_binaries()
+        nodefile = os.path.join(self.temp_dir, "pbs_vnodes")
+        with open(nodefile, "w", encoding="utf-8") as f:
+            f.write("compute-1-0[0]\ncompute-1-1[1]\n")
+
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+                "--skip-preflight",
+            ],
+            env={"PBS_NODEFILE": nodefile},
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        telem_file = os.path.join(self.out_dir, "hardware_telemetry.log")
+        with open(telem_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("compute-1-0", content)
+        self.assertIn("compute-1-1", content)
+        self.assertIn("shared_workload=none", content)
 
     def test_fault_tolerance_sample_failure_continues_remaining_runs(self):
         """When mock launcher fails on one run, runner logs failure and continues remaining runs."""

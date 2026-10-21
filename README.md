@@ -210,7 +210,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 ---
 
-## 4. File Inventory
+## 4. File Inventory (Modified and New Files)
 
 ### New Files
 
@@ -231,6 +231,16 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `benchmarks/compare_algos.sh` | Automation script: compile, run, and summarize ERAD vs. HWTOPOLB results |
 | `benchmarks/comparison_report.md` | 619-word analytical comparison report (R4) |
 | `job_hwtopolb.pbs` | PBS cluster job script: loads modules, runs `topo_probe`, executes benchmark comparison |
+| `job_harmony_super.pbs` | Single-allocation 2-hour PBS batch script with preflight checks, rotated matrix orchestration, post-processing, and strict exit code propagation |
+| `benchmarks/run_super_matrix.sh` | Orchestration driver script executing warm-up, rotated matrix (cyclic seed permutation), seed-123 A/B/A testing, timeout handling, and hardware telemetry capture |
+| `benchmarks/telemetry_probe.sh` | Multi-node hardware telemetry probe querying GPU temperature, utilization, clocks, power draw, throttling reasons, and workload co-location across all allocated cluster nodes |
+| `benchmarks/analyze_super_matrix.py` | Standalone Python stdlib post-processing analyzer generating `super_matrix_summary.csv`, `super_matrix_paired_ratios.csv`, `hardware_telemetry.json`, and `SUPER_JOB_REPORT.md` |
+| `docs/adr/0001-non-invasive-pbs-super-job.md` | Architecture Decision Record documenting the non-invasive PBS super job architecture and frozen core runtime |
+| `GLOSSARY.md` | Domain terminology glossary defining canonical project terms |
+| `tests/mock_cluster_launcher.py` | Mock MPI launcher simulating two-rank OpenCL benchmark outputs, device discovery, topology metrics, and multi-node telemetry without live GPUs |
+| `tests/test_super_job.py` | Unit and regression test suite for `job_harmony_super.pbs` syntax, PBS directives, trap handlers, and environment validation |
+| `tests/test_super_matrix_dryrun.py` | Integration test suite for `run_super_matrix.sh` CLI options, plan generation, fault tolerance, timeouts, and multi-node telemetry |
+| `tests/test_analyze_super_matrix.py` | Unit test suite for `analyze_super_matrix.py` log parsing, paired ratio calculations, statistical dispersion, telemetry aggregation, and report generation |
 
 ### Edited Files
 
@@ -241,6 +251,10 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `dcl/runtime.cpp` | Implemented public-API method bodies forwarding to `Impl` |
 | `dcl/runtime_impl.hpp` | Integrated NUMA cost gating into `maybe_rebalance_from_timings()` (R2); implemented `maybe_rebalance_hierarchical()` two-phase logic (R3); integrated contention adjustment and power cap into rebalancing pipeline (R5) |
 | `tests/test_hierarchical.cpp` | Fixed: `[HIER]` log assertions and PASS/summary messages gated on `rank == 0` only; `maybe_rebalance_hierarchical()` emits logs exclusively from rank 0 so rank 1 captured no output and aborted |
+| `benchmarks/kneighbor.cpp` | Non-invasively updated to isolate pure loop execution time (`loop_time_s`) from numerical stencil validation and reject non-finite stencil values (`std::isfinite`) (Tickets #23, #25) |
+| `benchmarks/leanmd.cpp` | Non-invasively updated to isolate pure loop execution time (`loop_time_s`) from numerical validation (Ticket #25) |
+| `tests/test_async_halo_opencl.cpp` | Updated to enforce minimum 1 verified OpenCL GPU per MPI rank in preflight check (Ticket #20) |
+| `README.md` | Added Super Job Variance Investigation Workflow and comprehensive file inventory |
 | `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md` |
 
 

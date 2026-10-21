@@ -126,7 +126,7 @@ def parse_log_file(log_path: Path):
 
     # Detect benchmark and metadata from summary line
     # e.g.: [kneighbor] algo=erad mode=gpu_opencl total_time_s=3.73996 loop_time_s=3.50000 num_rebalances=9 avg_rebalance_gain=6.34934e-05
-    # or legacy format without loop_time_s
+    # or historical format without loop_time_s
     summary_match = re.search(
         r"\[(\w+)\]\s+algo=(\w+)\s+mode=(\w+)\s+total_time_s=([0-9.eE+-]+)(?:\s+loop_time_s=([0-9.eE+-]+))?\s+num_rebalances=(\d+)\s+avg_rebalance_gain=([0-9.eE+-]+)",
         content,
@@ -274,7 +274,7 @@ def parse_csv_file(csv_path: Path):
 def parse_hardware_telemetry(telemetry_path: Path):
     """
     Parses hardware_telemetry.log into structured telemetry records.
-    Handles multi-node (host/rank tagged) and legacy nvidia-smi CSV formatting.
+    Handles multi-node (host/rank tagged) and historical nvidia-smi CSV formatting.
     """
     if not telemetry_path.exists():
         return []
@@ -303,10 +303,12 @@ def parse_hardware_telemetry(telemetry_path: Path):
             if len(parts) < 2:
                 continue
 
-            # Skip header lines if present
+            # Skip header or metadata lines if present
             if any(p.lower() in ("timestamp", "timestamp.gpu", "name", "utilization.gpu", "clocks.current.graphics") for p in parts):
                 continue
             if parts[0].lower() in ("host", "timestamp"):
+                continue
+            if any("shared_workload" in p.lower() or "compute-apps" in p.lower() for p in parts):
                 continue
 
             host = None
@@ -338,7 +340,7 @@ def parse_hardware_telemetry(telemetry_path: Path):
                 power = clean_num(parts[7])
                 throttle = ", ".join(parts[8:]).strip()
             else:
-                # Legacy 8-col format: timestamp, name, temp, util, gfx_clock, mem_clock, power, throttle
+                # Historical 8-col format: timestamp, name, temp, util, gfx_clock, mem_clock, power, throttle
                 timestamp = parts[0]
                 name = parts[1] if len(parts) > 1 else ""
                 temp = clean_int(parts[2]) if len(parts) > 2 else 0
