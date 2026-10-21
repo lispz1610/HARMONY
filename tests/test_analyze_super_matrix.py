@@ -907,6 +907,102 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertIn("Verdict: Environmental / Run-Order Artifact", report_text)
         self.assertIn("rotated matrix repetitions", report_text)
 
+    def test_no_fallback_to_other_stages_when_matrix_runs_fail(self):
+        """
+        When all matrix runs fail and only warmup or aba runs exist,
+        compute_matrix_statistics(runs, stage='matrix') must NOT fall back to including
+        warmup or aba runs in the statistics.
+        Verifies Ticket #26 acceptance criteria.
+        """
+        runs = [
+            # Failed/timed-out matrix runs
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": None,
+                "step_sum_s": None,
+                "unaccounted_s": None,
+                "rebalance_count": 0,
+                "status": "FAILED",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 2,
+                "stage": "matrix",
+                "wall_s": 3.5,
+                "step_sum_s": 2.5,
+                "unaccounted_s": 1.0,
+                "rebalance_count": 0,
+                "status": "TIMEOUT",
+            },
+            # Successful warmup runs
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": None,
+                "stage": "warmup",
+                "wall_s": 100.0,
+                "step_sum_s": 10.0,
+                "unaccounted_s": 90.0,
+                "rebalance_count": 0,
+                "status": "SUCCESS",
+            },
+            # Successful ABA runs
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "step": 1,
+                "stage": "aba",
+                "wall_s": 999.0,
+                "step_sum_s": 900.0,
+                "unaccounted_s": 99.0,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            },
+        ]
+
+        # compute_matrix_statistics must not fall back to other stages
+        stats = asm.compute_matrix_statistics(runs, stage="matrix")
+        self.assertEqual(len(stats), 0, "compute_matrix_statistics must not include non-matrix stages when matrix runs fail")
+
+        # Also test with compute_summary_statistics
+        summary_stats = asm.compute_summary_statistics(runs, stage="matrix")
+        self.assertEqual(len(summary_stats), 0, "compute_summary_statistics must not include non-matrix stages when matrix runs fail")
+
+        # Paired analysis for matrix stage must not include non-matrix stages
+        matrix_pairs = asm.compute_paired_analysis(runs, stage="matrix")
+        self.assertEqual(len(matrix_pairs), 0, "Paired analysis for matrix stage must not include non-matrix runs")
+
+        # Verify report indicates no successful matrix samples rather than substituting warmup/aba data
+        asm.generate_artifacts(self.output_dir, runs)
+        report_md = self.output_dir / "SUPER_JOB_REPORT.md"
+        self.assertTrue(report_md.exists())
+        report_text = report_md.read_text(encoding="utf-8")
+
+        self.assertIn("no successful matrix samples", report_text.lower())
+        # The 5-repetition rotated matrix summary table (before sub-breakdowns) must not contain substituted warmup/aba wall times
+        matrix_summary_table = report_text.split("## 2.")[1].split("###")[0]
+        self.assertNotIn("100.000000", matrix_summary_table)
+        self.assertNotIn("999.000000", matrix_summary_table)
+        self.assertIn("*(no successful matrix samples)*", matrix_summary_table)
+
+        # Also test with completely empty runs
+        empty_dir = Path(tempfile.mkdtemp(prefix="test_empty_"))
+        try:
+            asm.generate_artifacts(empty_dir, [])
+            empty_report = (empty_dir / "SUPER_JOB_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("no successful matrix samples", empty_report.lower())
+        finally:
+            shutil.rmtree(empty_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

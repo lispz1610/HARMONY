@@ -574,12 +574,13 @@ def discover_runs(output_dir: Path, expected_iterations=100):
     return runs
 
 
-def compute_paired_analysis(runs):
+def compute_paired_analysis(runs, stage=None):
     """
     Pairs ERAD and HWTOPOLB runs sharing the same (benchmark, repetition, seed, stage).
     For ABA runs, pairs step 1 (ERAD) vs step 2 (HWTOPOLB) and step 3 (ERAD) vs step 2 (HWTOPOLB),
     ensuring step 1 is not overwritten by step 3.
     Computes speedup ratio (ERAD ÷ HWTOPOLB) and speedup percentage.
+    If stage is specified (e.g. 'matrix'), strictly isolates pairs to that stage.
     """
     pairs = []
     grouped = {}
@@ -588,8 +589,10 @@ def compute_paired_analysis(runs):
     for r in runs:
         if r.get("status") != "SUCCESS" or r.get("wall_s") is None:
             continue
-        stage = r.get("stage", "matrix")
-        if stage == "aba":
+        r_stage = r.get("stage", "matrix")
+        if stage is not None and r_stage != stage:
+            continue
+        if r_stage == "aba":
             key = (r["benchmark"], r["seed"])
             step = r.get("step")
             if step is not None:
@@ -597,7 +600,7 @@ def compute_paired_analysis(runs):
             else:
                 aba_grouped.setdefault(key, {}).setdefault(r["algo"], []).append(r)
         else:
-            key = (r["benchmark"], r["seed"], r.get("repetition", 1), stage)
+            key = (r["benchmark"], r["seed"], r.get("repetition", 1), r_stage)
             grouped.setdefault(key, {})[r["algo"]] = r
 
     # Process standard paired matrix/warmup runs
@@ -730,24 +733,18 @@ def compute_aba_drift_analysis(runs):
     return drift_records
 
 
-def compute_summary_statistics(runs, stage="matrix"):
+def compute_matrix_statistics(runs, stage="matrix"):
     """
     Computes median, mean, min, max, and stddev across repetitions per (benchmark, algo, seed).
     Filters strictly by stage (default 'matrix') so untimed warm-ups and A/B/A runs
     do not contaminate the 5-repetition distribution.
-    If no runs match the specified stage, falls back defensively to all valid runs.
+    Never falls back to other stages when all runs in the specified stage fail or are absent.
     """
-    has_stage_runs = any(
-        r.get("stage") == stage
-        for r in runs
-        if r.get("status") == "SUCCESS" and r.get("wall_s") is not None
-    )
-
     grouped = {}
     for r in runs:
         if r.get("status") != "SUCCESS" or r.get("wall_s") is None:
             continue
-        if has_stage_runs and r.get("stage") != stage:
+        if stage is not None and r.get("stage") != stage:
             continue
         key = (r["benchmark"], r["algo"], r["seed"])
         grouped.setdefault(key, []).append(r)
@@ -780,7 +777,7 @@ def compute_summary_statistics(runs, stage="matrix"):
             "benchmark": bench,
             "algo": algo,
             "seed": seed,
-            "stage": stage if has_stage_runs else "all",
+            "stage": stage if stage is not None else "all",
             "repetition_count": rep_count,
             "median_wall_s": med_wall,
             "mean_wall_s": mean_wall,
@@ -798,15 +795,19 @@ def compute_summary_statistics(runs, stage="matrix"):
     return stats
 
 
+# Alias for backward compatibility
+compute_summary_statistics = compute_matrix_statistics
+
+
 def compute_stage_breakdowns(runs):
     """
     Provides separate summary statistics breakdowns for each stage:
     'matrix', 'warmup', and 'aba'.
     """
     return {
-        "matrix": compute_summary_statistics(runs, stage="matrix"),
-        "warmup": compute_summary_statistics(runs, stage="warmup"),
-        "aba": compute_summary_statistics(runs, stage="aba"),
+        "matrix": compute_matrix_statistics(runs, stage="matrix"),
+        "warmup": compute_matrix_statistics(runs, stage="warmup"),
+        "aba": compute_matrix_statistics(runs, stage="aba"),
     }
 
 
@@ -907,7 +908,7 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     and evidence gate compliant assessment sections.
     """
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    stats = compute_summary_statistics(runs, stage="matrix")
+    stats = compute_matrix_statistics(runs, stage="matrix")
     stage_breakdowns = compute_stage_breakdowns(runs)
     drift_records = compute_aba_drift_analysis(runs)
 
@@ -954,13 +955,18 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     md.append("Evaluates timing distribution strictly across unprofiled matrix repetitions. Untimed warm-up and A/B/A runs are isolated into separate breakdowns below.\n")
     md.append("| Benchmark | Algorithm | Seed | Repetitions | Median Wall (s) | Mean Wall (s) | StdDev (s) | Min (s) | Max (s) | Med. Unaccounted (s) |")
     md.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for s in stats:
-        md.append(
-            f"| {s['benchmark']} | {s['algo'].upper()} | {s['seed']} | {s['repetition_count']} | "
-            f"{s['median_wall_s']:.6f} | {s['mean_wall_s']:.6f} | {s['stddev_wall_s']:.6f} | "
-            f"{s['min_wall_s']:.6f} | {s['max_wall_s']:.6f} | {s['median_unaccounted_s']:.6f} |"
-        )
-    md.append("")
+    if not stats:
+        md.append("| *(no successful matrix samples)* | - | - | 0 | - | - | - | - | - | - |\n")
+        md.append("> [!WARNING]")
+        md.append("> No successful matrix samples recorded. All matrix stage runs failed or were missing.\n")
+    else:
+        for s in stats:
+            md.append(
+                f"| {s['benchmark']} | {s['algo'].upper()} | {s['seed']} | {s['repetition_count']} | "
+                f"{s['median_wall_s']:.6f} | {s['mean_wall_s']:.6f} | {s['stddev_wall_s']:.6f} | "
+                f"{s['min_wall_s']:.6f} | {s['max_wall_s']:.6f} | {s['median_unaccounted_s']:.6f} |"
+            )
+        md.append("")
 
     # Breakdown for Untimed Warm-up
     warmup_stats = stage_breakdowns.get("warmup", [])
@@ -994,13 +1000,16 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     md.append("| Benchmark | Algorithm | Seed | Stage | Med. T_compute (s) | Med. T_comm (s) | Med. T_balance (s) | Total Boundary Shifts |")
     md.append("|---|---|---:|---|---:|---:|---:|---:|")
     all_summary_stats = stats if not warmup_stats and not aba_stats else (stats + warmup_stats + aba_stats)
-    for s in all_summary_stats:
-        md.append(
-            f"| {s['benchmark']} | {s['algo'].upper()} | {s['seed']} | {s.get('stage', 'matrix')} | "
-            f"{s.get('median_compute_s', 0.0):.6f} | {s.get('median_comm_s', 0.0):.6f} | "
-            f"{s.get('median_balance_s', 0.0):.6f} | {s.get('total_boundary_shifts', 0)} |"
-        )
-    md.append("")
+    if not all_summary_stats:
+        md.append("| *(no successful samples)* | - | - | - | - | - | - | - |\n")
+    else:
+        for s in all_summary_stats:
+            md.append(
+                f"| {s['benchmark']} | {s['algo'].upper()} | {s['seed']} | {s.get('stage', 'matrix')} | "
+                f"{s.get('median_compute_s', 0.0):.6f} | {s.get('median_comm_s', 0.0):.6f} | "
+                f"{s.get('median_balance_s', 0.0):.6f} | {s.get('total_boundary_shifts', 0)} |"
+            )
+        md.append("")
 
     # Section 4: Paired ERAD vs HWTOPOLB Comparison against Historical Preliminary Results
     md.append("## 4. Paired Comparison and Speedup Analysis (ERAD ÷ HWTOPOLB)\n")
@@ -1010,31 +1019,34 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
 
     seed_123_ratios = []
 
-    for p in paired:
-        hist = HISTORICAL_PRELIMINARY.get((p["benchmark"], p["seed"]), {})
-        hist_ratio = f"{hist.get('ratio', 0.0):.2f}×" if hist else "N/A"
-        hist_spd = f"{hist.get('speedup_pct', 0.0):.2f}%" if hist else "N/A"
+    if not paired:
+        md.append("| *(no valid pairs)* | - | - | - | - | - | - | - | - | - | - | - |\n")
+    else:
+        for p in paired:
+            hist = HISTORICAL_PRELIMINARY.get((p["benchmark"], p["seed"]), {})
+            hist_ratio = f"{hist.get('ratio', 0.0):.2f}×" if hist else "N/A"
+            hist_spd = f"{hist.get('speedup_pct', 0.0):.2f}%" if hist else "N/A"
 
-        obs_ratio = f"{p['ratio']:.2f}×" if p["ratio"] is not None else "N/A"
-        obs_spd = f"{p['speedup_pct']:.2f}%" if p["speedup_pct"] is not None else "N/A"
+            obs_ratio = f"{p['ratio']:.2f}×" if p["ratio"] is not None else "N/A"
+            obs_spd = f"{p['speedup_pct']:.2f}%" if p["speedup_pct"] is not None else "N/A"
 
-        if p["seed"] == 123 and p.get("stage") == "matrix" and p.get("ratio") is not None:
-            seed_123_ratios.append(p["ratio"])
+            if p["seed"] == 123 and p.get("stage") == "matrix" and p.get("ratio") is not None:
+                seed_123_ratios.append(p["ratio"])
 
-        step_display = str(p["step"]) if p.get("step") is not None else "-"
-        rep_display = str(p["repetition"]) if p.get("repetition") is not None else "-"
+            step_display = str(p["step"]) if p.get("step") is not None else "-"
+            rep_display = str(p["repetition"]) if p.get("repetition") is not None else "-"
 
-        if p["ratio"] is not None and p["ratio"] > 1.0:
-            status_flag = "HWTOPOLB Faster"
-        else:
-            status_flag = "ERAD Faster / Parity"
+            if p["ratio"] is not None and p["ratio"] > 1.0:
+                status_flag = "HWTOPOLB Faster"
+            else:
+                status_flag = "ERAD Faster / Parity"
 
-        md.append(
-            f"| {p['benchmark']} | {p['seed']} | {rep_display} | {p['stage']} | {step_display} | "
-            f"{p['erad_wall_s']:.4f} | {p['hwtopolb_wall_s']:.4f} | {obs_ratio} | {obs_spd} | "
-            f"{hist_ratio} | {hist_spd} | {status_flag} |"
-        )
-    md.append("")
+            md.append(
+                f"| {p['benchmark']} | {p['seed']} | {rep_display} | {p['stage']} | {step_display} | "
+                f"{p['erad_wall_s']:.4f} | {p['hwtopolb_wall_s']:.4f} | {obs_ratio} | {obs_spd} | "
+                f"{hist_ratio} | {hist_spd} | {status_flag} |"
+            )
+        md.append("")
 
     # Section 5: Dedicated A/B/A Thermal Drift Analysis
     if drift_records:
