@@ -293,6 +293,29 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         benchmark_csvs = [f for f in os.listdir(self.out_dir) if f.endswith(".csv")]
         self.assertEqual(len(benchmark_csvs), 0, "CSVs should not be created if preflight fails")
 
+    def test_asymmetric_gpu_allocation_fails_preflight(self):
+        """Asymmetric GPU configuration (e.g., 2 GPUs on rank 0, 0 GPUs on rank 1) must fail preflight."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "32",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+            ],
+            env={"MOCK_ASYMMETRIC_GPUS": "1"},
+        )
+        self.assertNotEqual(proc.returncode, 0, "Expected non-zero exit code on asymmetric GPU allocation")
+        output = proc.stderr + proc.stdout
+        self.assertIn("ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)", output)
+
+        # Confirm no benchmark CSVs were created
+        benchmark_csvs = [f for f in os.listdir(self.out_dir) if f.endswith(".csv")]
+        self.assertEqual(len(benchmark_csvs), 0, "CSVs should not be created if preflight fails")
+
     def test_warmup_matrix_and_aba_execution_schedule(self):
         """Verify warmup (4), 5 repetitions (60), and ABA (6) execute in exact scheduled order."""
         self._create_dummy_binaries()

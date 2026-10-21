@@ -233,6 +233,14 @@ class TestSuperJobExecution(unittest.TestCase):
         proc = self._run_job_script({"MOCK_FAIL_PREFLIGHT_HALO": "1"})
         self.assertNotEqual(proc.returncode, 0)
 
+    def test_asymmetric_gpu_allocation_fails_preflight(self):
+        """Job script must abort if preflight encounters asymmetric GPU allocation."""
+        self._create_cluster_binaries()
+        proc = self._run_job_script({"MOCK_ASYMMETRIC_GPUS": "1"})
+        self.assertNotEqual(proc.returncode, 0)
+        output = proc.stderr + proc.stdout
+        self.assertIn("ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)", output)
+
     def test_runner_invocation_passes_skip_preflight(self):
         """job_harmony_super.pbs must pass --skip-preflight to run_super_matrix.sh."""
         with open(JOB_SCRIPT_PATH, "r", encoding="utf-8") as f:

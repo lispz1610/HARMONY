@@ -455,7 +455,7 @@ PY
 
     echo "Running asynchronous OpenCL halo test (timeout 60s): $bin_dir/test_async_halo_opencl.out"
     if ! timeout 60s "${launcher_cmd[@]}" "$bin_dir/test_async_halo_opencl.out"; then
-        echo "Preflight failed: test_async_halo_opencl.out returned non-zero status" >&2
+        echo "ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)" >&2
         exit 1
     fi
 fi
