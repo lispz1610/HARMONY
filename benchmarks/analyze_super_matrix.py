@@ -392,13 +392,22 @@ def identify_run_attributes(filename: str, log_data=None):
     return benchmark, algo, seed, repetition, stage, step
 
 
-def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=None):
+def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=None, manifest_run=None):
     """
     Combines log and CSV analysis into a unified run record.
     Reconciles wall time against sum of step times to compute unaccounted time.
     Aggregates interval metrics (T_compute, T_comm, T_balance) and boundary shifts.
     Defensively validates status (SUCCESS, PARTIAL, FAILED, CPU_FALLBACK, etc.).
+    Respects manifest failure status (FAILED, TIMEOUT) overriding CSV/log success.
     """
+    if manifest_run is None and metadata is not None:
+        if isinstance(metadata, dict) and "manifest_run" in metadata and isinstance(metadata["manifest_run"], dict):
+            manifest_run = metadata["manifest_run"]
+        else:
+            manifest_run = metadata
+    if metadata is None and manifest_run is not None:
+        metadata = manifest_run
+
     log_data = parse_log_file(log_path) if log_path and log_path.exists() else None
     csv_data = parse_csv_file(csv_path) if csv_path and csv_path.exists() else None
 
@@ -460,6 +469,19 @@ def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=
     elif csv_data and any(m != "gpu_opencl" for m in csv_data["execution_modes"] if m):
         status = "CPU_FALLBACK"
 
+    # Manifest status override
+    if manifest_run and isinstance(manifest_run, dict):
+        m_status = str(manifest_run.get("status") or "").lower()
+        exit_code = manifest_run.get("exit_code")
+        try:
+            exit_code_num = int(exit_code) if exit_code is not None else None
+        except (ValueError, TypeError):
+            exit_code_num = exit_code
+
+        is_failed_code = (exit_code_num is not None and exit_code_num != 0)
+        if m_status in ("failed", "timeout") or is_failed_code:
+            status = "TIMEOUT" if (m_status == "timeout" or exit_code_num == 124) else "FAILED"
+
     return {
         "benchmark": bench,
         "algo": algo,
@@ -511,7 +533,7 @@ def discover_runs(output_dir: Path, expected_iterations=100):
             for item in raw_runs:
                 log_p = output_dir / item.get("log_file", "") if item.get("log_file") else None
                 csv_p = output_dir / item.get("csv_file", "") if item.get("csv_file") else None
-                run = parse_run(log_p, csv_p, expected_iterations, metadata=item)
+                run = parse_run(log_p, csv_p, expected_iterations, metadata=item, manifest_run=item)
                 runs.append(run)
                 if log_p and log_p.exists():
                     processed_logs.add(log_p.resolve())

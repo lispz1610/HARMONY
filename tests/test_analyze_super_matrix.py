@@ -729,6 +729,80 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertAlmostEqual(run["T_balance_s"], 0.001)
         self.assertEqual(run["boundary_shifts"], 100000)
 
+    def test_manifest_failure_overrides_csv_success_and_excludes_from_paired(self):
+        """
+        Manifest failure or timeout status overrides CSV/log success and excludes run from pairing.
+        Verifies Ticket #22 behavior.
+        """
+        erad_log = self.output_dir / "kneighbor_erad_42.log"
+        erad_csv = self.output_dir / "kneighbor_erad_42.csv"
+        hw_log = self.output_dir / "kneighbor_hwtopolb_42.log"
+        hw_csv = self.output_dir / "kneighbor_hwtopolb_42.csv"
+
+        erad_log.write_text(
+            "[kneighbor] algo=erad mode=gpu_opencl total_time_s=1.5 num_rebalances=0 avg_rebalance_gain=0\n",
+            encoding="utf-8",
+        )
+        erad_csv.write_text(
+            "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n0,0.01,compute,0,0,gpu_opencl\n",
+            encoding="utf-8",
+        )
+        hw_log.write_text(
+            "[kneighbor] algo=hwtopolb mode=gpu_opencl total_time_s=0.5 num_rebalances=0 avg_rebalance_gain=0\n",
+            encoding="utf-8",
+        )
+        hw_csv.write_text(
+            "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n0,0.01,compute,0,0,gpu_opencl\n",
+            encoding="utf-8",
+        )
+
+        # Baseline: with valid files and without manifest failure, status is SUCCESS
+        run_hw = asm.parse_run(hw_log, hw_csv, expected_iterations=1)
+        self.assertEqual(run_hw["status"], "SUCCESS")
+
+        # Scenario 1: manifest_run specifies status: "failed", exit_code: 1
+        manifest_failed = {"status": "failed", "exit_code": 1}
+        run_erad_failed = asm.parse_run(
+            erad_log, erad_csv, expected_iterations=1, manifest_run=manifest_failed
+        )
+        self.assertEqual(run_erad_failed["status"], "FAILED")
+
+        # Scenario 2: manifest_run specifies status: "timeout", exit_code: 124
+        manifest_timeout = {"status": "timeout", "exit_code": 124}
+        run_erad_timeout = asm.parse_run(
+            erad_log, erad_csv, expected_iterations=1, manifest_run=manifest_timeout
+        )
+        self.assertEqual(run_erad_timeout["status"], "TIMEOUT")
+
+        # Scenario 3: manifest_run specifies exit_code != 0 (e.g. exit_code=2)
+        manifest_exit2 = {"exit_code": 2, "status": "success"}
+        run_erad_exit2 = asm.parse_run(
+            erad_log, erad_csv, expected_iterations=1, manifest_run=manifest_exit2
+        )
+        self.assertEqual(run_erad_exit2["status"], "FAILED")
+
+        # Scenario 4: passed via metadata parameter (backward compatibility)
+        run_erad_meta = asm.parse_run(
+            erad_log, erad_csv, expected_iterations=1, metadata=manifest_failed
+        )
+        self.assertEqual(run_erad_meta["status"], "FAILED")
+
+        # Verify paired analysis excludes failed or timed-out runs
+        pairs_failed = asm.compute_paired_analysis([run_erad_failed, run_hw])
+        self.assertEqual(len(pairs_failed), 0, "Failed run must not be paired")
+
+        pairs_timeout = asm.compute_paired_analysis([run_erad_timeout, run_hw])
+        self.assertEqual(len(pairs_timeout), 0, "Timed-out run must not be paired")
+
+        # Verify that normal SUCCESS runs pair as expected
+        run_erad_success = asm.parse_run(
+            erad_log, erad_csv, expected_iterations=1, manifest_run={"status": "success", "exit_code": 0}
+        )
+        self.assertEqual(run_erad_success["status"], "SUCCESS")
+        pairs_success = asm.compute_paired_analysis([run_erad_success, run_hw])
+        self.assertEqual(len(pairs_success), 1, "Success runs should be paired")
+
+
 
 if __name__ == "__main__":
     unittest.main()
