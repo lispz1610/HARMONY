@@ -114,11 +114,19 @@ runner_exit_code=$?
 set -e
 
 echo "=== Post-Processing and Generating Report ==="
+set +e
 python3 "$PBS_O_WORKDIR/benchmarks/analyze_super_matrix.py" \
-    --output-dir "$output_dir" || true
+    --output-dir "$output_dir"
+analyzer_exit_code=$?
+set -e
 
-if [[ $runner_exit_code -ne 0 ]]; then
-    echo "Error: Super Matrix execution reported sample failure(s) (exit code: $runner_exit_code)" >&2
+if [[ $runner_exit_code -ne 0 || $analyzer_exit_code -ne 0 ]]; then
+    if [[ $runner_exit_code -ne 0 ]]; then
+        echo "Error: Super Matrix execution reported sample failure(s) (exit code: $runner_exit_code)" >&2
+    fi
+    if [[ $analyzer_exit_code -ne 0 ]]; then
+        echo "Error: Super Matrix post-processing analyzer failed (exit code: $analyzer_exit_code)" >&2
+    fi
     exit 1
 fi
 
