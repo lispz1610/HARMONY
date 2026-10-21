@@ -1018,7 +1018,7 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
         obs_ratio = f"{p['ratio']:.2f}×" if p["ratio"] is not None else "N/A"
         obs_spd = f"{p['speedup_pct']:.2f}%" if p["speedup_pct"] is not None else "N/A"
 
-        if p["seed"] == 123:
+        if p["seed"] == 123 and p.get("stage") == "matrix" and p.get("ratio") is not None:
             seed_123_ratios.append(p["ratio"])
 
         step_display = str(p["step"]) if p.get("step") is not None else "-"
@@ -1060,9 +1060,10 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     else:
         avg_s123_ratio = statistics.mean(seed_123_ratios)
         med_s123_ratio = statistics.median(seed_123_ratios)
-        md.append(f"- **Evaluated Seed 123 Paired Runs:** {len(seed_123_ratios)}")
+        md.append(f"- **Evaluated Seed 123 Rotated Matrix Pairs:** {len(seed_123_ratios)}")
         md.append(f"- **Median Observed Ratio:** {med_s123_ratio:.2f}× (Historical preliminary was 0.94×)")
-        md.append(f"- **Mean Observed Ratio:** {avg_s123_ratio:.2f}×\n")
+        md.append(f"- **Mean Observed Ratio:** {avg_s123_ratio:.2f}×")
+        md.append("- Note: This diagnostic verdict strictly reflects the rotated matrix repetitions, while warmup and A/B/A are reported in their dedicated sections.\n")
 
         if med_s123_ratio > 2.0:
             md.append("> [!IMPORTANT]")

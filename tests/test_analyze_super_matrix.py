@@ -802,6 +802,110 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         pairs_success = asm.compute_paired_analysis([run_erad_success, run_hw])
         self.assertEqual(len(pairs_success), 1, "Success runs should be paired")
 
+    def test_seed_123_verdict_filters_matrix_stage_exclusively(self):
+        """
+        Diagnostic verdict for Seed 123 in Section 6 must strictly evaluate pairs from
+        the rotated matrix stage ('matrix'), excluding warmup and dedicated ABA stages.
+        Verifies Ticket #24 behavior.
+        """
+        runs = [
+            # Warmup runs for seed 123 (ratio: 0.5x, ERAD faster)
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 123,
+                "repetition": 1,
+                "stage": "warmup",
+                "step": None,
+                "wall_s": 0.5,
+                "step_sum_s": 0.4,
+                "unaccounted_s": 0.1,
+                "rebalance_count": 0,
+                "status": "SUCCESS",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 123,
+                "repetition": 1,
+                "stage": "warmup",
+                "step": None,
+                "wall_s": 1.0,
+                "step_sum_s": 0.8,
+                "unaccounted_s": 0.2,
+                "rebalance_count": 0,
+                "status": "SUCCESS",
+            },
+            # Dedicated A/B/A step for seed 123 (ratio: 0.7x, ERAD faster)
+            # Step 1: ERAD
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 123,
+                "repetition": 1,
+                "stage": "aba",
+                "step": 1,
+                "wall_s": 0.7,
+                "step_sum_s": 0.5,
+                "unaccounted_s": 0.2,
+                "rebalance_count": 0,
+                "status": "SUCCESS",
+            },
+            # Step 2: HWTOPOLB
+            {
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 123,
+                "repetition": 2,
+                "stage": "aba",
+                "step": 2,
+                "wall_s": 1.0,
+                "step_sum_s": 0.8,
+                "unaccounted_s": 0.2,
+                "rebalance_count": 0,
+                "status": "SUCCESS",
+            },
+        ]
+
+        # 5 Rotated matrix repetitions for seed 123 (ratios >= 10.0x, HWTOPOLB faster)
+        for rep in range(1, 6):
+            runs.append({
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 123,
+                "repetition": rep,
+                "stage": "matrix",
+                "step": None,
+                "wall_s": 10.0,
+                "step_sum_s": 8.0,
+                "unaccounted_s": 2.0,
+                "rebalance_count": 5,
+                "status": "SUCCESS",
+            })
+            runs.append({
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 123,
+                "repetition": rep,
+                "stage": "matrix",
+                "step": None,
+                "wall_s": 1.0,
+                "step_sum_s": 0.8,
+                "unaccounted_s": 0.2,
+                "rebalance_count": 5,
+                "status": "SUCCESS",
+            })
+
+        asm.generate_artifacts(self.output_dir, runs)
+        report_md = self.output_dir / "SUPER_JOB_REPORT.md"
+        self.assertTrue(report_md.exists(), "SUPER_JOB_REPORT.md should be created")
+        report_text = report_md.read_text(encoding="utf-8")
+
+        # Verify that only the 5 rotated matrix pairs are evaluated for seed 123 verdict
+        self.assertIn("- **Evaluated Seed 123 Rotated Matrix Pairs:** 5", report_text)
+        self.assertNotIn("- **Evaluated Seed 123 Paired Runs:**", report_text)
+        self.assertIn("Verdict: Environmental / Run-Order Artifact", report_text)
+        self.assertIn("rotated matrix repetitions", report_text)
 
 
 if __name__ == "__main__":
