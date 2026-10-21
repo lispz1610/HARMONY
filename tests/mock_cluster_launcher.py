@@ -79,6 +79,10 @@ def simulate_test_async_halo(target_args):
         sys.stderr.write("Preflight failed: Simulated halo communication failure\n")
         sys.exit(1)
 
+    if os.environ.get("MOCK_ASYMMETRIC_GPUS") == "1":
+        sys.stdout.write("SKIP: asynchronous halo test needs at least one OpenCL GPU per MPI rank (found min=0, total=2)\n")
+        sys.exit(77)
+
     sys.stdout.write("[device] rank=0 global_index=0 name=NVIDIA A100 80GB PCIe\n")
     sys.stdout.write("[device] rank=1 global_index=1 name=NVIDIA A100 80GB PCIe\n")
     sys.stdout.write("[DCL][balance-metrics] iteration=1\n")

@@ -97,7 +97,10 @@ if len(metrics.get("mpi_latency_ns", [])) != 4:
 PY
 
 echo "Running asynchronous OpenCL halo test (timeout 60s)..."
-timeout 60s prun "$bin_dir/test_async_halo_opencl.out"
+if ! timeout 60s prun "$bin_dir/test_async_halo_opencl.out"; then
+    echo "ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)" >&2
+    exit 1
+fi
 
 # 5. Execution pipeline
 echo "=== Executing Super Matrix Benchmark ==="
