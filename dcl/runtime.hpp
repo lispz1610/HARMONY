@@ -75,10 +75,6 @@ public:
     void gather(FieldHandle field, void* host_dst, std::size_t bytes);
     void synchronize(bool force_finish = false);
 
-    // Controls detailed per-iteration metric output. Timing collection and MPI
-    // reductions still run in both modes. Enabled by default for compatibility.
-    void set_verbose_metrics(bool enabled) noexcept;
-
     void set_topo_metrics(const TopoMetrics& metrics);
     const std::optional<TopoMetrics>& topo_metrics() const noexcept;
     void set_simulated_devices_count(int count) noexcept;

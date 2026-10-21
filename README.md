@@ -16,12 +16,13 @@ HARMONY is a header-driven, high-performance computing (HPC) library for **topol
    - [R3 — Hierarchical Balancing Strategy](#r3--hierarchical-balancing-strategy)
    - [R4 — ERAD vs. HWTOPOLB Algorithm Comparison](#r4--erad-vs-hwtopolb-algorithm-comparison)
    - [R5 — Resource Contention & Power Consumption Model](#r5--resource-contention--power-consumption-model)
-4. [File Inventory](#4-file-inventory)
+4. [File Inventory (Modified and New Files)](#4-file-inventory-modified-and-new-files)
 5. [Directory Structure](#5-directory-structure)
 6. [Building and Running](#6-building-and-running)
 7. [Running on a PBS Cluster](#7-running-on-a-pbs-cluster)
-8. [Test Results & Verification](#8-test-results--verification)
-9. [Static Analysis Baseline](#9-static-analysis-baseline)
+   - [Super Job Variance Investigation Workflow](#super-job-variance-investigation-workflow)
+8. [Current Validation](#8-current-validation)
+9. [Static Analysis](#9-static-analysis)
 
 ---
 
@@ -209,7 +210,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 ---
 
-## 4. File Inventory
+## 4. File Inventory (Modified and New Files)
 
 ### New Files
 
@@ -230,8 +231,20 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `benchmarks/compare_algos.sh` | Automation script: compile, run, and summarize ERAD vs. HWTOPOLB results |
 | `benchmarks/comparison_report.md` | 619-word analytical comparison report (R4) |
 | `job_hwtopolb.pbs` | PBS cluster job script: loads modules, runs `topo_probe`, executes benchmark comparison |
+| `job_harmony_super.pbs` | Single-allocation 2-hour PBS batch script with preflight checks, rotated matrix execution, post-processing, and strict exit code propagation |
+| `benchmarks/run_super_matrix.sh` | Super Job driver executing warm-up, rotated matrix (cyclic seed permutation), seed-123 A/B/A testing, timeout handling, and hardware telemetry capture |
+| `benchmarks/telemetry_probe.sh` | Multi-node hardware telemetry probe querying GPU temperature, utilization, clocks, power draw, throttling reasons, and workload co-location across all allocated cluster nodes |
+| `benchmarks/analyze_super_matrix.py` | Standalone Python stdlib post-processing analyzer generating `super_matrix_summary.csv`, `super_matrix_paired.csv`, `hardware_telemetry.json`, and `SUPER_JOB_REPORT.md` |
+| `docs/adr/0001-non-invasive-pbs-super-job.md` | Architecture Decision Record documenting the non-invasive PBS super job architecture and frozen core runtime |
+| `GLOSSARY.md` | Domain terminology glossary defining canonical project terms |
+| `tests/mock_cluster_launcher.py` | Mock MPI launcher simulating two-rank OpenCL benchmark outputs, device discovery, topology metrics, and multi-node telemetry without live GPUs |
+| `tests/test_super_job.py` | Unit and regression test suite for `job_harmony_super.pbs` syntax, PBS directives, trap handlers, and environment validation |
+| `tests/test_super_matrix_dryrun.py` | Integration test suite for `run_super_matrix.sh` CLI options, plan generation, fault tolerance, timeouts, and multi-node telemetry |
+| `tests/test_analyze_super_matrix.py` | Unit test suite for `analyze_super_matrix.py` log parsing, paired ratio calculations, statistical dispersion, telemetry aggregation, and report generation |
 
 ### Edited Files
+
+*(Super Job variance investigation: minimally modified benchmark drivers/tests; `dcl/` untouched)*
 
 | File | Changes |
 |:---|:---|
@@ -240,7 +253,11 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `dcl/runtime.cpp` | Implemented public-API method bodies forwarding to `Impl` |
 | `dcl/runtime_impl.hpp` | Integrated NUMA cost gating into `maybe_rebalance_from_timings()` (R2); implemented `maybe_rebalance_hierarchical()` two-phase logic (R3); integrated contention adjustment and power cap into rebalancing pipeline (R5) |
 | `tests/test_hierarchical.cpp` | Fixed: `[HIER]` log assertions and PASS/summary messages gated on `rank == 0` only; `maybe_rebalance_hierarchical()` emits logs exclusively from rank 0 so rank 1 captured no output and aborted |
-| `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md` |
+| `benchmarks/kneighbor.cpp` | Non-invasively updated to isolate pure loop execution time (`loop_time_s`) from numerical stencil validation and reject non-finite stencil values (`std::isfinite`) (Tickets #23, #25) |
+| `benchmarks/leanmd.cpp` | Non-invasively updated to isolate pure loop execution time (`loop_time_s`) from numerical validation (Ticket #25) |
+| `tests/test_async_halo_opencl.cpp` | Updated to enforce minimum 1 verified OpenCL GPU per MPI rank in preflight check (Ticket #20) |
+| `README.md` | Added Super Job Variance Investigation Workflow and comprehensive file inventory |
+| `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md`, `__pycache__/`, `*.py[cod]` |
 
 
 ### Removed Files
@@ -394,93 +411,6 @@ mpic++ -std=c++20 -Wall -Wextra -O2 \
   -o leanmd.out
 ```
 
-Both benchmark drivers accept `--quiet-runtime-metrics` for timed samples.
-It suppresses detailed per-iteration runtime metric output and the optional
-`DCL_METRICS_FILE` CSV, while leaving device event collection, MPI reductions,
-and balancing inputs active. The default remains verbose for existing callers.
-Compare the modes only under the same allocation and workload; the diagnostic
-overhead is separate from any algorithm speedup claim.
-
-For admitted two-rank GPU timing, pass `--require-two-rank-gpu` and
-`--device-inventory-json PATH` to either benchmark. The command exits before
-creating the step CSV unless there are exactly two ranks, exactly one OpenCL
-GPU per rank, and distinct verifiable physical identities. The inventory is
-one JSON file with `schema_version: 1` and rank-ordered `ranks` records. Each
-record includes the MPI host and rank, GPU count, local and global device
-indices, GPU and OpenCL platform names, platform and device versions, driver
-version, and an `identity_kind` / `identity` pair. Identity is either a device
-UUID or a PCI address qualified by the host. A missing identity is recorded as
-`unavailable` and rejected in strict mode. Save and compare this inventory for
-both conditions in each adjacent pair; a model name or runtime index alone
-does not identify a physical GPU.
-
-The summary retains `total_time_s` for historical consumers and adds
-`loop_time_s`, `validation_time_s`, and `validation=PASS`. The primary
-`loop_time_s` starts before iteration zero and ends immediately after the last
-iteration's benchmark MPI reductions. Final gather and scalar reference check
-run afterward; their rank-local intervals are reduced separately to produce
-`validation_time_s`. The full `total_time_s` retains its existing broader
-scope. A failed numerical check aborts without a PASS summary. K-neighbor uses
-an absolute tolerance of `1e-5`; LeanMD uses `1e-4 + 1e-4 * abs(reference)`.
-Both reject nonfinite results and references.
-
-Run the focused command-interface test after building both binaries:
-
-```bash
-python3 tests/test_benchmark_sample_contract.py ./kneighbor.out ./leanmd.out
-```
-
-This local test covers CPU simulation output and collective sample rejection.
-It does not validate an OpenCL kernel or a physical GPU mapping. The latter
-requires a PBS two-rank job on the cluster, with one GPU exposed to each rank;
-inspect the JSON inventory and require `validation=PASS` in both logs before
-admitting either timing sample.
-
-The public runtime control is `set_verbose_metrics(bool)`. The focused
-simulation test can be built and run with:
-
-```bash
-mpic++ -std=c++20 -Wall -Wextra -O2 \
-  tests/test_runtime_metrics.cpp -lOpenCL -DCL_TARGET_OPENCL_VERSION=300 \
-  -o tests/test_runtime_metrics.out
-mpirun -n 1 ./tests/test_runtime_metrics.out
-mpirun -n 2 ./tests/test_runtime_metrics.out
-```
-
-For a local simulated overhead probe, pass `--measure`; its results must not
-be interpreted as GPU performance. See the runtime metric mode diagnostic in
-`docs/` for the measured local condition and limits.
-
-For the controlled two-GPU variance experiment, use the resumable frontend
-coordinator instead of submitting each PBS stage by hand:
-
-```bash
-python3 benchmarks/controlled_pbs.py --experiment-id variance-20261014-a
-```
-
-The command queues the pilot, diagnostic smoke, full matrix, and a CPU-only
-finalizer with PBS `afterok` dependencies, then exits. The pilot job runs its
-analyzer before releasing the smoke job; the smoke job validates both rank
-traces before releasing the full matrix. The finalizer collects PBS records
-and writes the report. Rerun the same command and ID after an interrupted
-submission without duplicating jobs. See
-`docs/controlled-gpu-variance-run.md` for failure recovery and optional
-seed-123 A/B/A runs. Real GPU/PBS results remain necessary.
-
-To check HARMONY separately on the older `compute-0-7`, `compute-0-8`, and
-`compute-0-2` machines, queue three independent one-rank jobs with one command:
-
-```bash
-python3 benchmarks/queue_single_node.py --experiment-id legacy-20261014-a
-```
-
-This keeps the two-node A100 variance workflow above intact. Each job requests
-one CPU/GPU chunk on its named host, probes a real OpenCL GPU, runs the short
-main program, and checks both benchmark workloads and balancing algorithms
-against their numerical references. Results are separated under
-`Results/single-node-EXPERIMENT_ID/`. See
-`docs/single-node-gpu-checks.md` for admission rules and recovery.
-
 Or use the automation script (sets `MPI_LAUNCHER` if needed):
 
 ```bash
@@ -582,6 +512,42 @@ probe as a separate topology measurement, not as an input to that comparison.
 The jobs fail early if a required frontend-built executable is missing. A
 cluster run is still needed to validate the installed OpenCL driver and GPU
 execution paths.
+
+### Super Job Variance Investigation Workflow
+
+To investigate and resolve multi-GPU execution variance and isolate the seed-123 performance discrepancy between ERAD and HWTOPOLB, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs an untimed warm-up, a 5-repetition rotated matrix, an isolated A/B/A test for seed 123, and hardware telemetry with minimally modified benchmark drivers/tests; `dcl/` untouched.
+
+Follow this 5-step workflow:
+
+1. **Pre-build on frontend**:
+   Compile all benchmarks and preflight binaries on the cluster login node (compiling on compute nodes is strictly forbidden):
+   ```bash
+   bash cluster_build.sh
+   ```
+2. **Submit super job**:
+   Submit the single-allocation 2-hour PBS batch script:
+   ```bash
+   qsub job_harmony_super.pbs
+   ```
+3. **Monitor job**:
+   Track the job state in the PBS queue:
+   ```bash
+   qstat -u $USER
+   ```
+   Or inspect live execution details using `qstat -f <JOB_ID>`.
+4. **Artifacts generated in `results/variance_run_<JOBID>/`**:
+   All execution artifacts are isolated inside a dedicated run directory under `results/variance_run_<JOBID>/`:
+   - `SUPER_JOB_REPORT.md`: Comprehensive Markdown report with Paired Speedup Ratios, Dispersion Analysis, and Diagnostics.
+   - `super_matrix_summary.csv`: Aggregated execution metrics and per-repetition timings.
+   - `super_matrix_paired.csv`: ERAD vs. HWTOPOLB speedup ratios and classification per seed.
+   - `hardware_telemetry.log`: Timestamped GPU temperatures, utilization, clocks, power draw, and throttle flags.
+   - `hardware_telemetry.json`: Structured per-node and per-rank telemetry aggregated from `hardware_telemetry.log` by the analyzer.
+   - `run_manifest.json`: Detailed machine-readable manifest tracking every benchmark execution sample.
+5. **Offline recovery command**:
+   Regenerate reports idempotently from raw CSVs and logs without re-executing any cluster workloads:
+   ```bash
+   python3 benchmarks/analyze_super_matrix.py --output-dir results/variance_run_<JOBID> --summarize-only
+   ```
 
 ---
 
