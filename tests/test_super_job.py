@@ -11,6 +11,7 @@ Verifies:
   - Output directory isolation and pipeline execution
 """
 
+import csv
 import math
 import os
 import re
@@ -104,6 +105,35 @@ class TestSuperJobScriptDirectivesAndSyntax(unittest.TestCase):
             "job_harmony_super.pbs must not mask analyzer failure with '|| true'",
         )
         self.assertIn("analyzer_exit_code", content)
+
+    def test_configurable_iterations_propagation(self):
+        """job_harmony_super.pbs defines bench_iterations from BENCH_ITERATIONS and passes --iterations to runner and analyzer."""
+        with open(JOB_SCRIPT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Must define bench_iterations with fallback to 100
+        self.assertTrue(
+            re.search(r'bench_iterations="\$\{BENCH_ITERATIONS:-100\}"', content),
+            'Expected bench_iterations="${BENCH_ITERATIONS:-100}" in job_harmony_super.pbs',
+        )
+
+        # Must pass --iterations "$bench_iterations" to run_super_matrix.sh
+        runner_match = re.search(r'run_super_matrix\.sh.*?(?:(?:\n\s*--[^\n]+)+)', content)
+        self.assertIsNotNone(runner_match, "Could not find run_super_matrix.sh invocation")
+        self.assertIn(
+            '--iterations "$bench_iterations"',
+            runner_match.group(0),
+            'Expected job_harmony_super.pbs to pass --iterations "$bench_iterations" to run_super_matrix.sh',
+        )
+
+        # Must pass --iterations "$bench_iterations" to analyze_super_matrix.py
+        analyzer_match = re.search(r'analyze_super_matrix\.py.*?(?:(?:\n\s*--[^\n]+)+)', content)
+        self.assertIsNotNone(analyzer_match, "Could not find analyze_super_matrix.py invocation")
+        self.assertIn(
+            '--iterations "$bench_iterations"',
+            analyzer_match.group(0),
+            'Expected job_harmony_super.pbs to pass --iterations "$bench_iterations" to analyze_super_matrix.py',
+        )
 
     def test_readme_documents_super_job_workflow(self):
         """README.md must document the complete 5-step Super Job workflow."""
@@ -298,6 +328,25 @@ class TestSuperJobExecution(unittest.TestCase):
             os.path.isfile(topo_json),
             f"Expected {topo_json} to exist",
         )
+
+        # Verify runs under BENCH_ITERATIONS=5 are SUCCESS and included in paired analysis
+        summary_csv = os.path.join(expected_output_dir, "super_matrix_summary.csv")
+        self.assertTrue(os.path.isfile(summary_csv), f"Expected {summary_csv} to exist")
+        with open(summary_csv, newline="", encoding="utf-8") as f:
+            s_rows = list(csv.DictReader(f))
+        self.assertGreater(len(s_rows), 0, "Expected summary rows")
+        for r in s_rows:
+            self.assertEqual(
+                r["status"],
+                "SUCCESS",
+                f"Expected run {r.get('algo')} to be SUCCESS under iterations=5, got: {r['status']}",
+            )
+
+        paired_csv = os.path.join(expected_output_dir, "super_matrix_paired.csv")
+        self.assertTrue(os.path.isfile(paired_csv), f"Expected {paired_csv} to exist")
+        with open(paired_csv, newline="", encoding="utf-8") as f:
+            p_rows = list(csv.DictReader(f))
+        self.assertGreater(len(p_rows), 0, "Expected paired analysis rows under iterations=5")
 
     def test_sample_failure_propagates_exit_code_and_runs_postprocessing(self):
         """When a matrix sample fails, PBS job exits 1 but runs post-processing to generate report."""

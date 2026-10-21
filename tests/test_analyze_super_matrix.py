@@ -1276,6 +1276,84 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertAlmostEqual(float(prows[0]["erad_loop_s"]), 3.0)
         self.assertAlmostEqual(float(prows[0]["ratio"]), 3.0 / 0.2)  # Prioritizes loop_s!
 
+    def test_configurable_iterations_from_manifest_and_metadata(self):
+        """Manifest parameters.iterations=5 prevents runs with 5 steps from being marked PARTIAL even when expected_iterations=100."""
+        manifest_data = {
+            "parameters": {
+                "n": 1000,
+                "iterations": 5,
+                "balance_interval": 2,
+                "seeds": [42],
+            },
+            "runs": [
+                {
+                    "run_id": 1,
+                    "stage": "matrix",
+                    "repetition": 1,
+                    "benchmark": "kneighbor",
+                    "algorithm": "erad",
+                    "seed": 42,
+                    "step": None,
+                    "csv_file": "run_erad.csv",
+                    "log_file": "run_erad.log",
+                    "exit_code": 0,
+                    "elapsed_seconds": 0.5,
+                    "status": "success",
+                },
+                {
+                    "run_id": 2,
+                    "stage": "matrix",
+                    "repetition": 1,
+                    "benchmark": "kneighbor",
+                    "algorithm": "hwtopolb",
+                    "seed": 42,
+                    "step": None,
+                    "csv_file": "run_hwtopolb.csv",
+                    "log_file": "run_hwtopolb.log",
+                    "exit_code": 0,
+                    "elapsed_seconds": 0.4,
+                    "status": "success",
+                },
+            ],
+        }
+        (self.output_dir / "run_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+        csv_header = "iteration,step_time_s,action,rebalanced,rebalance_gain,execution_mode\n"
+        csv_rows = "".join(f"{i},0.01,compute,0,0,gpu_opencl\n" for i in range(5))
+        (self.output_dir / "run_erad.csv").write_text(csv_header + csv_rows, encoding="utf-8")
+        (self.output_dir / "run_hwtopolb.csv").write_text(csv_header + csv_rows, encoding="utf-8")
+
+        (self.output_dir / "run_erad.log").write_text(
+            "[kneighbor] algo=erad mode=gpu_opencl total_time_s=0.5 loop_time_s=0.45 num_rebalances=0 avg_rebalance_gain=0\n",
+            encoding="utf-8",
+        )
+        (self.output_dir / "run_hwtopolb.log").write_text(
+            "[kneighbor] algo=hwtopolb mode=gpu_opencl total_time_s=0.4 loop_time_s=0.35 num_rebalances=0 avg_rebalance_gain=0\n",
+            encoding="utf-8",
+        )
+
+        run_direct = asm.parse_run(
+            self.output_dir / "run_erad.log",
+            self.output_dir / "run_erad.csv",
+            expected_iterations=100,
+            metadata={"parameters": {"iterations": 5}, "benchmark": "kneighbor", "algo": "erad"},
+        )
+        self.assertEqual(run_direct["status"], "SUCCESS", "parse_run should use iterations from metadata/parameters")
+
+        runs = asm.discover_runs(self.output_dir, expected_iterations=100)
+        self.assertEqual(len(runs), 2)
+        for r in runs:
+            self.assertEqual(
+                r["status"],
+                "SUCCESS",
+                f"Run {r['algo']} with 5 steps should be SUCCESS when manifest has iterations=5, got: {r['status']}",
+            )
+
+        pairs = asm.compute_paired_analysis(runs)
+        self.assertEqual(len(pairs), 1)
+        self.assertAlmostEqual(pairs[0]["ratio"], 0.45 / 0.35)
+
+
 
 if __name__ == "__main__":
     unittest.main()

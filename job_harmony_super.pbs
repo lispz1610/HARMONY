@@ -103,11 +103,14 @@ if ! timeout 60s prun "$bin_dir/test_async_halo_opencl.out"; then
 fi
 
 # 5. Execution pipeline
+bench_iterations="${BENCH_ITERATIONS:-100}"
+
 echo "=== Executing Super Matrix Benchmark ==="
 set +e
 bash "$PBS_O_WORKDIR/benchmarks/run_super_matrix.sh" \
     --bin-dir "$bin_dir" \
     --output-dir "$output_dir" \
+    --iterations "$bench_iterations" \
     --launcher prun \
     --skip-preflight
 runner_exit_code=$?
@@ -116,7 +119,8 @@ set -e
 echo "=== Post-Processing and Generating Report ==="
 set +e
 python3 "$PBS_O_WORKDIR/benchmarks/analyze_super_matrix.py" \
-    --output-dir "$output_dir"
+    --output-dir "$output_dir" \
+    --iterations "$bench_iterations"
 analyzer_exit_code=$?
 set -e
 

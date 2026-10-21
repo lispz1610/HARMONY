@@ -456,6 +456,25 @@ def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=
     if metadata is None and manifest_run is not None:
         metadata = manifest_run
 
+    # Resolve expected iterations from metadata or manifest_run when present
+    for src in (manifest_run, metadata):
+        if isinstance(src, dict):
+            raw_iters = None
+            if isinstance(src.get("parameters"), dict):
+                raw_iters = src["parameters"].get("iterations")
+            if raw_iters is None:
+                raw_iters = src.get("iterations")
+            if raw_iters is None:
+                raw_iters = src.get("expected_iterations")
+            if raw_iters is not None:
+                try:
+                    val = int(raw_iters)
+                    if val > 0:
+                        expected_iterations = val
+                        break
+                except (ValueError, TypeError):
+                    pass
+
     log_data = parse_log_file(log_path) if log_path and log_path.exists() else None
     csv_data = parse_csv_file(csv_path) if csv_path and csv_path.exists() else None
 
@@ -585,16 +604,39 @@ def discover_runs(output_dir: Path, expected_iterations=100):
 
     processed_logs = set()
     processed_csvs = set()
+    effective_expected_iterations = expected_iterations
 
     if manifest_path and manifest_path.exists():
         try:
             with open(manifest_path, encoding="utf-8") as f:
                 manifest_data = json.load(f)
+            if isinstance(manifest_data, dict):
+                manifest_params = manifest_data.get("parameters") or {}
+                if isinstance(manifest_params, dict):
+                    raw_iters = manifest_params.get("iterations")
+                    if raw_iters is not None:
+                        try:
+                            val = int(raw_iters)
+                            if val > 0:
+                                effective_expected_iterations = val
+                        except (ValueError, TypeError):
+                            pass
+
             raw_runs = manifest_data.get("runs", manifest_data if isinstance(manifest_data, list) else [])
             for item in raw_runs:
                 log_p = output_dir / item.get("log_file", "") if item.get("log_file") else None
                 csv_p = output_dir / item.get("csv_file", "") if item.get("csv_file") else None
-                run = parse_run(log_p, csv_p, expected_iterations, metadata=item, manifest_run=item)
+                run_expected_iters = effective_expected_iterations
+                if isinstance(item, dict):
+                    per_run_iters = item.get("iterations", item.get("expected_iterations"))
+                    if per_run_iters is not None:
+                        try:
+                            val = int(per_run_iters)
+                            if val > 0:
+                                run_expected_iters = val
+                        except (ValueError, TypeError):
+                            pass
+                run = parse_run(log_p, csv_p, run_expected_iters, metadata=item, manifest_run=item)
                 runs.append(run)
                 if log_p and log_p.exists():
                     processed_logs.add(log_p.resolve())
@@ -613,7 +655,7 @@ def discover_runs(output_dir: Path, expected_iterations=100):
 
         base = log_p.stem
         csv_p = output_dir / f"{base}.csv"
-        run = parse_run(log_p, csv_p if csv_p.exists() else None, expected_iterations)
+        run = parse_run(log_p, csv_p if csv_p.exists() else None, effective_expected_iterations)
         runs.append(run)
         processed_logs.add(log_p.resolve())
         if csv_p.exists():
@@ -628,7 +670,7 @@ def discover_runs(output_dir: Path, expected_iterations=100):
             continue
         base = csv_p.stem
         log_p = output_dir / f"{base}.log"
-        run = parse_run(log_p if log_p.exists() else None, csv_p, expected_iterations)
+        run = parse_run(log_p if log_p.exists() else None, csv_p, effective_expected_iterations)
         runs.append(run)
         processed_csvs.add(csv_p.resolve())
 
@@ -667,7 +709,15 @@ def compute_paired_analysis(runs, stage=None):
             grouped.setdefault(key, {})[r["algo"]] = r
 
     # Process standard paired matrix/warmup runs
-    for (bench, seed, rep, stage_name), algos in sorted(grouped.items()):
+    for (bench, seed, rep, stage_name), algos in sorted(
+        grouped.items(),
+        key=lambda item: (
+            str(item[0][0]),
+            int(item[0][1]) if item[0][1] is not None else -1,
+            int(item[0][2]) if item[0][2] is not None else -1,
+            str(item[0][3]),
+        ),
+    ):
         if "erad" in algos and "hwtopolb" in algos:
             e_run = algos["erad"]
             h_run = algos["hwtopolb"]
@@ -698,7 +748,10 @@ def compute_paired_analysis(runs, stage=None):
             })
 
     # Process ABA runs without overwriting step 1 with step 3
-    for (bench, seed), steps in sorted(aba_grouped.items()):
+    for (bench, seed), steps in sorted(
+        aba_grouped.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1]) if item[0][1] is not None else -1),
+    ):
         step1 = steps.get(1)
         step2 = steps.get(2)
         step3 = steps.get(3)
@@ -787,7 +840,10 @@ def compute_aba_drift_analysis(runs):
             grouped.setdefault(key, {})[step] = r
 
     drift_records = []
-    for (bench, seed), steps in sorted(grouped.items()):
+    for (bench, seed), steps in sorted(
+        grouped.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1]) if item[0][1] is not None else -1),
+    ):
         step1 = steps.get(1)
         step2 = steps.get(2)
         step3 = steps.get(3)
@@ -855,7 +911,14 @@ def compute_matrix_statistics(runs, stage="matrix"):
         grouped.setdefault(key, []).append(r)
 
     stats = []
-    for (bench, algo, seed), group in sorted(grouped.items()):
+    for (bench, algo, seed), group in sorted(
+        grouped.items(),
+        key=lambda item: (
+            str(item[0][0]),
+            str(item[0][1]),
+            int(item[0][2]) if item[0][2] is not None else -1,
+        ),
+    ):
         primary_times = [
             r["loop_s"] if r.get("loop_s") is not None else (r["loop_time_s"] if r.get("loop_time_s") is not None else r["wall_s"])
             for r in group
