@@ -16,13 +16,13 @@ HARMONY is a header-driven, high-performance computing (HPC) library for **topol
    - [R3 — Hierarchical Balancing Strategy](#r3--hierarchical-balancing-strategy)
    - [R4 — ERAD vs. HWTOPOLB Algorithm Comparison](#r4--erad-vs-hwtopolb-algorithm-comparison)
    - [R5 — Resource Contention & Power Consumption Model](#r5--resource-contention--power-consumption-model)
-4. [File Inventory](#4-file-inventory)
+4. [File Inventory (Modified and New Files)](#4-file-inventory-modified-and-new-files)
 5. [Directory Structure](#5-directory-structure)
 6. [Building and Running](#6-building-and-running)
 7. [Running on a PBS Cluster](#7-running-on-a-pbs-cluster)
    - [Super Job Variance Investigation Workflow](#super-job-variance-investigation-workflow)
-8. [Test Results & Verification](#8-test-results--verification)
-9. [Static Analysis Baseline](#9-static-analysis-baseline)
+8. [Current Validation](#8-current-validation)
+9. [Static Analysis](#9-static-analysis)
 
 ---
 
@@ -231,10 +231,10 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `benchmarks/compare_algos.sh` | Automation script: compile, run, and summarize ERAD vs. HWTOPOLB results |
 | `benchmarks/comparison_report.md` | 619-word analytical comparison report (R4) |
 | `job_hwtopolb.pbs` | PBS cluster job script: loads modules, runs `topo_probe`, executes benchmark comparison |
-| `job_harmony_super.pbs` | Single-allocation 2-hour PBS batch script with preflight checks, rotated matrix orchestration, post-processing, and strict exit code propagation |
-| `benchmarks/run_super_matrix.sh` | Orchestration driver script executing warm-up, rotated matrix (cyclic seed permutation), seed-123 A/B/A testing, timeout handling, and hardware telemetry capture |
+| `job_harmony_super.pbs` | Single-allocation 2-hour PBS batch script with preflight checks, rotated matrix execution, post-processing, and strict exit code propagation |
+| `benchmarks/run_super_matrix.sh` | Super Job driver executing warm-up, rotated matrix (cyclic seed permutation), seed-123 A/B/A testing, timeout handling, and hardware telemetry capture |
 | `benchmarks/telemetry_probe.sh` | Multi-node hardware telemetry probe querying GPU temperature, utilization, clocks, power draw, throttling reasons, and workload co-location across all allocated cluster nodes |
-| `benchmarks/analyze_super_matrix.py` | Standalone Python stdlib post-processing analyzer generating `super_matrix_summary.csv`, `super_matrix_paired_ratios.csv`, `hardware_telemetry.json`, and `SUPER_JOB_REPORT.md` |
+| `benchmarks/analyze_super_matrix.py` | Standalone Python stdlib post-processing analyzer generating `super_matrix_summary.csv`, `super_matrix_paired.csv`, `hardware_telemetry.json`, and `SUPER_JOB_REPORT.md` |
 | `docs/adr/0001-non-invasive-pbs-super-job.md` | Architecture Decision Record documenting the non-invasive PBS super job architecture and frozen core runtime |
 | `GLOSSARY.md` | Domain terminology glossary defining canonical project terms |
 | `tests/mock_cluster_launcher.py` | Mock MPI launcher simulating two-rank OpenCL benchmark outputs, device discovery, topology metrics, and multi-node telemetry without live GPUs |
@@ -255,7 +255,7 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 | `benchmarks/leanmd.cpp` | Non-invasively updated to isolate pure loop execution time (`loop_time_s`) from numerical validation (Ticket #25) |
 | `tests/test_async_halo_opencl.cpp` | Updated to enforce minimum 1 verified OpenCL GPU per MPI rank in preflight check (Ticket #20) |
 | `README.md` | Added Super Job Variance Investigation Workflow and comprehensive file inventory |
-| `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md` |
+| `.gitignore` | Expanded to exclude `*.out` binaries, `Results/`, benchmark CSVs (`benchmarks/*.csv`), topology JSON outputs (`topo_metrics_*.json`, `test_probe.json`), PBS log files (`*.pbs.o*`, `*.pbs.e*`), `.agents/`, `ORIGINAL_REQUEST.md`, `__pycache__/`, `*.py[cod]` |
 
 
 ### Removed Files
@@ -537,8 +537,9 @@ Follow this 5-step workflow:
    All execution artifacts are isolated inside a dedicated run directory under `results/variance_run_<JOBID>/`:
    - `SUPER_JOB_REPORT.md`: Comprehensive Markdown report with Paired Speedup Ratios, Dispersion Analysis, and Diagnostics.
    - `super_matrix_summary.csv`: Aggregated execution metrics and per-repetition timings.
-   - `super_matrix_paired_ratios.csv`: ERAD vs. HWTOPOLB speedup ratios and classification per seed.
+   - `super_matrix_paired.csv`: ERAD vs. HWTOPOLB speedup ratios and classification per seed.
    - `hardware_telemetry.log`: Timestamped GPU temperatures, utilization, clocks, power draw, and throttle flags.
+   - `hardware_telemetry.json`: Structured per-node and per-rank telemetry aggregated from `hardware_telemetry.log` by the analyzer.
    - `run_manifest.json`: Detailed machine-readable manifest tracking every benchmark execution sample.
 5. **Offline recovery command**:
    Regenerate reports idempotently from raw CSVs and logs without re-executing any cluster workloads:
