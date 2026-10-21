@@ -244,6 +244,8 @@ After this release, HARMONY is a **topology-informed, power-aware, hierarchicall
 
 ### Edited Files
 
+*(Super Job variance investigation: minimally modified benchmark drivers/tests; `dcl/` untouched)*
+
 | File | Changes |
 |:---|:---|
 | `dcl/types.hpp` | Added `struct TopoMetrics` (R1); added `numa_distance`, `device_numa_node` fields (R2); added `memory_contention_factor`, `thermal_tdp_watts`, `current_power_watts` fields (R5); added `BalanceMode::hierarchical` (R3); added `numa_cost_gain_ratio_threshold`, `use_contention_adjustment`, `use_power_cap`, `power_budget_watts` to `AutoBalancePolicy` (R2, R5) |
@@ -513,7 +515,7 @@ execution paths.
 
 ### Super Job Variance Investigation Workflow
 
-To investigate and resolve multi-GPU execution variance and isolate the seed-123 performance discrepancy between ERAD and HWTOPOLB, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs an untimed warm-up, a 5-repetition rotated matrix, an isolated A/B/A test for seed 123, and hardware telemetry without modifying core C++ source code.
+To investigate and resolve multi-GPU execution variance and isolate the seed-123 performance discrepancy between ERAD and HWTOPOLB, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs an untimed warm-up, a 5-repetition rotated matrix, an isolated A/B/A test for seed 123, and hardware telemetry with minimally modified benchmark drivers/tests; `dcl/` untouched.
 
 Follow this 5-step workflow:
 

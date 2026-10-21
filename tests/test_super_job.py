@@ -26,6 +26,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 JOB_SCRIPT_PATH = os.path.join(ROOT_DIR, "job_harmony_super.pbs")
 MOCK_LAUNCHER_PATH = os.path.join(ROOT_DIR, "tests", "mock_cluster_launcher.py")
 KNEIGHBOR_CPP_PATH = os.path.join(ROOT_DIR, "benchmarks", "kneighbor.cpp")
+LEANMD_CPP_PATH = os.path.join(ROOT_DIR, "benchmarks", "leanmd.cpp")
 
 
 class TestSuperJobScriptDirectivesAndSyntax(unittest.TestCase):
@@ -566,6 +567,132 @@ int main() {{
                 run_proc.returncode,
                 0,
                 f"C++ verification check failed to reject non-finite values (exit code {run_proc.returncode})",
+            )
+
+
+class TestLeanMDNumericalVerification(unittest.TestCase):
+    """Verifies that benchmarks/leanmd.cpp rejects non-finite outputs (NaN and Inf)."""
+
+    def test_leanmd_source_checks_isfinite(self):
+        """leanmd.cpp must check std::isfinite on actual and reference values."""
+        self.assertTrue(
+            os.path.isfile(LEANMD_CPP_PATH),
+            f"Expected {LEANMD_CPP_PATH} to exist",
+        )
+        with open(LEANMD_CPP_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn(
+            "!std::isfinite(force_out[i])",
+            content,
+            "leanmd.cpp must check isfinite on force_out[i]",
+        )
+        self.assertIn(
+            "!std::isfinite(expected)",
+            content,
+            "leanmd.cpp must check isfinite on expected reference",
+        )
+
+    def test_leanmd_verification_rejects_nan_and_inf(self):
+        """Numerical verification logic must reject NaN, Inf, and large deltas, while accepting finite matches."""
+        def check_mismatch(actual: float, expected: float) -> bool:
+            return (
+                not math.isfinite(actual)
+                or not math.isfinite(expected)
+                or abs(actual - expected) > (1e-4 + 1e-4 * abs(expected))
+            )
+
+        # Finite matches should not trigger mismatch
+        self.assertFalse(check_mismatch(1.0, 1.0))
+        self.assertFalse(check_mismatch(0.0, 0.0))
+        self.assertFalse(check_mismatch(1.00001, 1.0))
+
+        # Finite mismatches should trigger mismatch
+        self.assertTrue(check_mismatch(1.0, 1.01))
+        self.assertTrue(check_mismatch(1.0, 0.0))
+
+        # NaN values must trigger mismatch
+        self.assertTrue(check_mismatch(float("nan"), 1.0))
+        self.assertTrue(check_mismatch(1.0, float("nan")))
+        self.assertTrue(check_mismatch(float("nan"), float("nan")))
+
+        # Inf values must trigger mismatch
+        self.assertTrue(check_mismatch(float("inf"), 1.0))
+        self.assertTrue(check_mismatch(1.0, float("inf")))
+        self.assertTrue(check_mismatch(float("inf"), float("inf")))
+        self.assertTrue(check_mismatch(float("-inf"), float("-inf")))
+        self.assertTrue(check_mismatch(float("-inf"), 1.0))
+
+    def test_cpp_leanmd_verification_compilation_and_rejection(self):
+        """Compile and execute a test harness exercising leanmd.cpp's verification check with C++ IEEE-754 semantics."""
+        with open(LEANMD_CPP_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        match = re.search(r"if \((!std::isfinite\(force_out\[i\]\).+?)\) \{", content, re.DOTALL)
+        self.assertIsNotNone(match, "Could not find force verification check in leanmd.cpp")
+        cond_str = match.group(1).strip()
+
+        cpp_src = f"""#include <cmath>
+#include <iostream>
+#include <limits>
+#include <vector>
+
+bool verify_sample(float actual, float expected) {{
+    float force_out[1] = {{ actual }};
+    std::size_t i = 0;
+    if ({cond_str}) {{
+        return false; // rejected / mismatch detected
+    }}
+    return true; // accepted
+}}
+
+int main() {{
+    const float nan_val = std::numeric_limits<float>::quiet_NaN();
+    const float inf_val = std::numeric_limits<float>::infinity();
+
+    // Valid matches must pass
+    if (!verify_sample(1.0f, 1.0f)) return 10;
+    if (!verify_sample(0.5f, 0.5f)) return 11;
+
+    // Numerical differences must fail
+    if (verify_sample(1.0f, 2.0f)) return 20;
+
+    // Non-finite values MUST fail (return false from verify_sample)
+    if (verify_sample(nan_val, 1.0f)) return 30;
+    if (verify_sample(1.0f, nan_val)) return 31;
+    if (verify_sample(nan_val, nan_val)) return 32;
+    if (verify_sample(inf_val, 1.0f)) return 33;
+    if (verify_sample(1.0f, inf_val)) return 34;
+    if (verify_sample(inf_val, inf_val)) return 35;
+    if (verify_sample(-inf_val, 1.0f)) return 36;
+    if (verify_sample(-inf_val, -inf_val)) return 37;
+
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_file = os.path.join(tmpdir, "test_check_leanmd.cpp")
+            bin_file = os.path.join(tmpdir, "test_check_leanmd.out")
+            with open(src_file, "w", encoding="utf-8") as f:
+                f.write(cpp_src)
+
+            compile_proc = subprocess.run(
+                ["g++", "-std=c++20", "-O2", src_file, "-o", bin_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(
+                compile_proc.returncode,
+                0,
+                f"Compilation failed for LeanMD C++ verification test:\n{compile_proc.stderr}",
+            )
+
+            run_proc = subprocess.run([bin_file], capture_output=True, text=True)
+            self.assertEqual(
+                run_proc.returncode,
+                0,
+                f"LeanMD C++ verification check failed to reject non-finite values (exit code {run_proc.returncode})",
             )
 
 

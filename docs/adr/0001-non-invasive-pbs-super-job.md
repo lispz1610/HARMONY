@@ -22,3 +22,12 @@ accepted
 - Iteration-level phase and partition trajectory data are parsed directly from existing `[DCL][balance-metrics]` log entries rather than invasive runtime trace hooks.
 - Build procedures (`cluster_build.sh`) continue compiling frontend binaries cleanly without recompilation on compute nodes.
 - The entire evaluation completes deterministically on the exact same physical node and GPU state within a single 2-hour PBS reservation.
+
+## Amendment (2026-10-21)
+
+While the core runtime library under `dcl/` remains 100% frozen and untouched, minimal modifications were authorized and applied strictly to benchmark drivers and preflight tests:
+- `tests/test_async_halo_opencl.cpp` (Ticket #20): Enforce a minimum of 1 verified OpenCL GPU per MPI rank in preflight validation.
+- `benchmarks/kneighbor.cpp` (Tickets #23, #25): Add finite numerical checks (`!std::isfinite(val)`) to reject non-finite/NaN/Inf stencil outputs (Ticket #23), and isolate pure loop execution time (`loop_time_s`) from verification inflation (Ticket #25).
+- `benchmarks/leanmd.cpp` (Tickets #23, #25): Add finite numerical checks to reject non-finite force outputs (Ticket #23), and isolate pure loop execution time (`loop_time_s`) from verification inflation (Ticket #25).
+
+No files under `dcl/` were modified.

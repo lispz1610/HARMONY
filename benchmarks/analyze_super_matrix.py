@@ -28,6 +28,12 @@ HISTORICAL_PRELIMINARY = {
     ("leanmd", 456): {"erad_s": 4.221200, "hwtopolb_s": 0.361940, "ratio": 11.66, "speedup_pct": 91.43},
 }
 
+# Named heuristic classification thresholds for seed-123 descriptive summary.
+# These thresholds are descriptive heuristics only, NOT causal findings or verified boundaries.
+# Observations and classifications are strictly limited to the measured 2-GPU configuration.
+HEURISTIC_SEED_123_SPEEDUP_THRESHOLD = 2.0
+HEURISTIC_SEED_123_PARITY_THRESHOLD = 1.05
+
 
 def parse_balance_metrics(log_text: str):
     """
@@ -1317,25 +1323,63 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     else:
         avg_s123_ratio = statistics.mean(seed_123_ratios)
         med_s123_ratio = statistics.median(seed_123_ratios)
-        md.append(f"- **Evaluated Seed 123 Rotated Matrix Pairs:** {len(seed_123_ratios)}")
+        min_s123_ratio = min(seed_123_ratios)
+        max_s123_ratio = max(seed_123_ratios)
+        hwtopolb_favored = sum(1 for r in seed_123_ratios if r > 1.0)
+        erad_favored = sum(1 for r in seed_123_ratios if r <= 1.0)
+        total_s123_reps = len(seed_123_ratios)
+
+        md.append(f"- **Evaluated Seed 123 Rotated Matrix Pairs:** {total_s123_reps}")
         md.append(f"- **Median Observed Ratio:** {med_s123_ratio:.2f}× (Historical preliminary was 0.94×)")
         md.append(f"- **Mean Observed Ratio:** {avg_s123_ratio:.2f}×")
+        md.append(f"- **Observed Ratio Range (Min / Max):** {min_s123_ratio:.2f}× / {max_s123_ratio:.2f}×")
+        md.append(f"- **Repetitions Favoring HWTOPOLB (Ratio > 1.0):** {hwtopolb_favored} of {total_s123_reps}")
+        md.append(f"- **Repetitions Favoring ERAD or Parity (Ratio <= 1.0):** {erad_favored} of {total_s123_reps}")
         md.append("- Note: This diagnostic verdict strictly reflects the rotated matrix repetitions, while warmup and A/B/A are reported in their dedicated sections.\n")
 
-        if med_s123_ratio > 2.0:
-            md.append("> [!IMPORTANT]")
-            md.append("> **Verdict: Environmental / Run-Order Artifact.**")
-            md.append("> Across the rotated repetitions and unprofiled matrix runs, seed 123 achieved substantial speedups comparable to seeds 42 and 456.")
-            md.append("> The historical 0.94× slowdown observed in the single unrotated preliminary execution did NOT persist. It was an artifact of un-warmed initial GPU hardware state, initial compilation caches, or first-run allocation placement, rather than a defect in the HWTOPOLB load balancing algorithm.\n")
-        elif med_s123_ratio < 1.05:
-            md.append("> [!IMPORTANT]")
-            md.append("> **Verdict: Algorithmic Perturbation Interaction.**")
-            md.append("> The seed 123 slowdown persisted across rotations and repetitions. Even after untimed warm-up and rotated execution order, HWTOPOLB remains parity or slower than ERAD under seed 123.")
-            md.append("> This confirms an algorithmic effect: the specific ±10% perturbation trajectory produced by seed 123 drives partitions into boundary oscillation or suboptimal rank distribution.\n")
+        # Context 1: A/B/A Drift Context
+        s123_drift = [d for d in drift_records if d.get("seed") == 123] if drift_records else []
+        if s123_drift:
+            drift_summaries = []
+            for d in s123_drift:
+                b_name = d.get("benchmark", "unknown")
+                d_pct = d.get("drift_pct", 0.0)
+                d_delta = d.get("drift_delta_s", 0.0)
+                drift_summaries.append(f"{b_name}: {d_delta:+.4f}s ({d_pct:+.2f}%)")
+            md.append(f"- **A/B/A Thermal Drift Context (ERAD Step 1 vs Step 3):** {'; '.join(drift_summaries)}")
+        else:
+            md.append("- **A/B/A Thermal Drift Context:** No dedicated A/B/A drift samples for seed 123.")
+
+        # Context 2: Per-Node Telemetry Spread Context
+        avail_telem = [r for r in telemetry_records if r.get("available", True)] if telemetry_records else []
+        if avail_telem:
+            temps = [r["temperature_gpu"] for r in avail_telem if r.get("temperature_gpu", 0) > 0]
+            gclocks = [r["clocks_graphics_mhz"] for r in avail_telem if r.get("clocks_graphics_mhz", 0) > 0]
+            temp_context = f"temp min={min(temps)}°C max={max(temps)}°C spread={max(temps)-min(temps)}°C" if temps else "temp N/A"
+            clock_context = f"graphics clock min={min(gclocks)}MHz max={max(gclocks)}MHz spread={max(gclocks)-min(gclocks)}MHz" if gclocks else "clock N/A"
+            md.append(f"- **Hardware Telemetry Context:** {temp_context}, {clock_context}")
+        else:
+            md.append("- **Hardware Telemetry Context:** No live telemetry available across nodes.")
+
+        md.append("")
+
+        if med_s123_ratio >= HEURISTIC_SEED_123_SPEEDUP_THRESHOLD:
+            md.append("> [!NOTE]")
+            md.append(f"> **Verdict: Observed HWTOPOLB Advantage Across Rotated Matrix Repetitions (Heuristic Threshold ≥ {HEURISTIC_SEED_123_SPEEDUP_THRESHOLD:.2f}×).**")
+            md.append(f"> Across {total_s123_reps} rotated matrix repetitions for seed 123, HWTOPOLB was faster in {hwtopolb_favored} repetitions (ratio range {min_s123_ratio:.2f}× to {max_s123_ratio:.2f}×, median {med_s123_ratio:.2f}×).")
+            md.append(f"> The historical preliminary 0.94× ratio was not reproduced in these rotated matrix runs.")
+        elif med_s123_ratio < HEURISTIC_SEED_123_PARITY_THRESHOLD:
+            md.append("> [!NOTE]")
+            md.append(f"> **Verdict: Observed Parity or ERAD Advantage Across Rotated Matrix Repetitions (Heuristic Threshold < {HEURISTIC_SEED_123_PARITY_THRESHOLD:.2f}×).**")
+            md.append(f"> Across {total_s123_reps} rotated matrix repetitions for seed 123, ERAD was faster or at parity in {erad_favored} repetitions (ratio range {min_s123_ratio:.2f}× to {max_s123_ratio:.2f}×, median {med_s123_ratio:.2f}×).")
+            md.append(f"> Parity or slower performance for HWTOPOLB was observed across the rotated matrix runs.")
         else:
             md.append("> [!NOTE]")
-            md.append("> **Verdict: Mixed / Moderate Sensitivity.**")
-            md.append("> Seed 123 shows performance variation across repetitions. While exhibiting moderate speedup, it remains sensitive to rotational order or scheduling variation.\n")
+            md.append(f"> **Verdict: Observed Mixed Performance Across Rotated Matrix Repetitions (Heuristic Band {HEURISTIC_SEED_123_PARITY_THRESHOLD:.2f}× – {HEURISTIC_SEED_123_SPEEDUP_THRESHOLD:.2f}×).**")
+            md.append(f"> Seed 123 showed variation across repetitions ({hwtopolb_favored} favored HWTOPOLB, {erad_favored} favored ERAD/parity; ratio range {min_s123_ratio:.2f}× to {max_s123_ratio:.2f}×, median {med_s123_ratio:.2f}×).")
+
+        md.append(">")
+        md.append(f"> *Descriptive Scope:* This classification applies heuristic thresholds (HEURISTIC_SEED_123_SPEEDUP_THRESHOLD = {HEURISTIC_SEED_123_SPEEDUP_THRESHOLD}, HEURISTIC_SEED_123_PARITY_THRESHOLD = {HEURISTIC_SEED_123_PARITY_THRESHOLD}) to summarize observed matrix repetitions. It does not establish a causal conclusion and is strictly limited to this two-GPU hardware configuration.\n")
 
     # Section 7: Telemetry Summary
     if telemetry_records:

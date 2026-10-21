@@ -578,6 +578,16 @@ class TestSuperMatrixDryRun(unittest.TestCase):
     def test_hardware_telemetry_pbs_nodefile(self):
         """When launcher is not set but PBS_NODEFILE is provided, records telemetry for each node in file."""
         self._create_dummy_binaries()
+        mock_bin_dir = os.path.join(self.temp_dir, "mock_smi_dir")
+        os.makedirs(mock_bin_dir, exist_ok=True)
+        mock_smi = os.path.join(mock_bin_dir, "nvidia-smi")
+        with open(mock_smi, "w", encoding="utf-8") as f:
+            f.write(
+                '#!/bin/sh\n'
+                'echo "2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB, 38, 12, 1410, 1215, 78.42, [N/A]"\n'
+            )
+        os.chmod(mock_smi, os.stat(mock_smi).st_mode | stat.S_IEXEC)
+
         nodefile = os.path.join(self.temp_dir, "pbs_nodes")
         with open(nodefile, "w", encoding="utf-8") as f:
             f.write("compute-1-0\ncompute-1-1\n")
@@ -592,7 +602,7 @@ class TestSuperMatrixDryRun(unittest.TestCase):
                 "--seeds", "42",
                 "--skip-preflight",
             ],
-            env={"PBS_NODEFILE": nodefile, "MPI_LAUNCHER": ""},
+            env={"PBS_NODEFILE": nodefile, "MPI_LAUNCHER": "", "PATH": f"{mock_bin_dir}:{os.environ.get('PATH', '')}"},
         )
         self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
 
@@ -603,7 +613,8 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         self.assertIn("compute-1-0", content)
         self.assertIn("compute-1-1", content)
         self.assertIn("compute-1-0, 0,", content)
-        self.assertIn("compute-1-1, 1,", content)
+        self.assertIn("# [telemetry-unavailable] host=compute-1-1 rank=1", content)
+        self.assertNotIn("compute-1-1, 1,", content)
         self.assertIn("shared_workload=none", content)
 
     def test_hardware_telemetry_vnode_suffix_matching(self):
@@ -667,6 +678,41 @@ class TestSuperMatrixDryRun(unittest.TestCase):
 
         failed_runs = [r for r in runs if r.get("status") == "failed"]
         self.assertEqual(len(failed_runs), 1, "Exactly one run should be recorded as failed")
+        self.assertNotEqual(failed_runs[0]["exit_code"], 0)
+
+        success_runs = [r for r in runs if r.get("status") == "success"]
+        self.assertEqual(len(success_runs), 29)
+
+    def test_warmup_sample_failure_does_not_fail_runner(self):
+        """When a warmup sample fails, runner records it in manifest, reports warning, and exits 0 if matrix passes."""
+        self._create_dummy_binaries()
+        fail_warmup_marker = os.path.join(self.temp_dir, "fail_warmup_once.marker")
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--launcher", launcher_cmd,
+            ],
+            env={"MOCK_FAIL_WARMUP_ONCE_FILE": fail_warmup_marker},
+        )
+        self.assertEqual(proc.returncode, 0, f"Runner should exit 0 on warmup failure when matrix runs succeed: {proc.stderr}")
+        self.assertIn("warm-up sample(s) failed or timed out", proc.stderr)
+
+        manifest_path = os.path.join(self.out_dir, "run_manifest.json")
+        self.assertTrue(os.path.isfile(manifest_path))
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        runs = manifest.get("runs", manifest)
+        self.assertEqual(len(runs), 30)
+
+        failed_runs = [r for r in runs if r.get("status") == "failed"]
+        self.assertEqual(len(failed_runs), 1, "Exactly one run should be recorded as failed")
+        self.assertEqual(failed_runs[0]["stage"], "warmup")
         self.assertNotEqual(failed_runs[0]["exit_code"], 0)
 
         success_runs = [r for r in runs if r.get("status") == "success"]

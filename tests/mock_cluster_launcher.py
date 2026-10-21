@@ -125,12 +125,20 @@ def simulate_benchmark(binary_name, target_args):
         sys.stderr.write(f"ERROR: Simulated failure for {binary_name} with pattern: {fail_pattern}\n")
         sys.exit(1)
 
+    fail_warmup_file = os.environ.get("MOCK_FAIL_WARMUP_ONCE_FILE")
+    if fail_warmup_file and not os.path.exists(fail_warmup_file) and "warmup_" in " ".join(target_args):
+        with open(fail_warmup_file, "w", encoding="utf-8") as f:
+            f.write("failed warmup once\n")
+        sys.stderr.write(f"ERROR: One-time simulated warmup failure in {binary_name}\n")
+        sys.exit(1)
+
     fail_once_file = os.environ.get("MOCK_FAIL_ONCE_FILE")
     if fail_once_file and not os.path.exists(fail_once_file):
-        with open(fail_once_file, "w", encoding="utf-8") as f:
-            f.write("failed once\n")
-        sys.stderr.write(f"ERROR: One-time simulated failure in {binary_name}\n")
-        sys.exit(1)
+        if "warmup_" not in " ".join(target_args):
+            with open(fail_once_file, "w", encoding="utf-8") as f:
+                f.write("failed once\n")
+            sys.stderr.write(f"ERROR: One-time simulated failure in {binary_name}\n")
+            sys.exit(1)
 
     sleep_pattern = os.environ.get("MOCK_SLEEP_IF_CONTAINS")
     if sleep_pattern and sleep_pattern in " ".join(target_args):
@@ -140,11 +148,12 @@ def simulate_benchmark(binary_name, target_args):
 
     sleep_once_file = os.environ.get("MOCK_SLEEP_ONCE_FILE")
     if sleep_once_file and not os.path.exists(sleep_once_file):
-        with open(sleep_once_file, "w", encoding="utf-8") as f:
-            f.write("slept once\n")
-        import time
-        sleep_sec = float(os.environ.get("MOCK_SLEEP_SECONDS", "5"))
-        time.sleep(sleep_sec)
+        if "warmup_" not in " ".join(target_args):
+            with open(sleep_once_file, "w", encoding="utf-8") as f:
+                f.write("slept once\n")
+            import time
+            sleep_sec = float(os.environ.get("MOCK_SLEEP_SECONDS", "5"))
+            time.sleep(sleep_sec)
 
     n = int(extract_named_arg(target_args, "--n", "1000000"))
     iterations = int(extract_named_arg(target_args, "--iterations", "100"))
@@ -202,7 +211,6 @@ def simulate_benchmark(binary_name, target_args):
     wall_time = 3.73996 if is_kneighbor else 0.438039
     loop_time = 3.50000 if is_kneighbor else 0.400000
     rebalances = (iterations - 1) // interval if interval > 0 else 0
-    sys.stdout.write(f"loop_time_s: {loop_time:.6f}\n")
     sys.stdout.write(
         f"[{bench_name}] algo={algo} mode=gpu_opencl total_time_s={wall_time} "
         f"loop_time_s={loop_time:.6f} num_rebalances={rebalances} avg_rebalance_gain=6.34934e-05\n"

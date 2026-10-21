@@ -1006,8 +1006,9 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         # Verify that only the 5 rotated matrix pairs are evaluated for seed 123 verdict
         self.assertIn("- **Evaluated Seed 123 Rotated Matrix Pairs:** 5", report_text)
         self.assertNotIn("- **Evaluated Seed 123 Paired Runs:**", report_text)
-        self.assertIn("Verdict: Environmental / Run-Order Artifact", report_text)
+        self.assertIn("Verdict: Observed HWTOPOLB Advantage Across Rotated Matrix Repetitions", report_text)
         self.assertIn("rotated matrix repetitions", report_text)
+        self.assertIn("Descriptive Scope:", report_text)
 
     def test_no_fallback_to_other_stages_when_matrix_runs_fail(self):
         """
@@ -1107,10 +1108,9 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
 
     def test_parse_log_with_loop_time_s(self):
         """Verifies parsing of loop_time_s from summary line and standalone line (#25)."""
-        # Case A: Summary line with both total_time_s and loop_time_s
+        # Case A: Summary line with both total_time_s and loop_time_s (without duplicate standalone line)
         log_a = (
             "[device] rank=0 global_index=0 name=NVIDIA A100 80GB PCIe\n"
-            "loop_time_s: 3.250000\n"
             "[kneighbor] algo=erad mode=gpu_opencl total_time_s=4.120000 loop_time_s=3.250000 num_rebalances=9 avg_rebalance_gain=6.34934e-05\n"
         )
         log_path_a = self.output_dir / "test_a.log"

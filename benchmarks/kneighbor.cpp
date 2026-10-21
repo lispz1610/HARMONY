@@ -275,6 +275,15 @@ int main(int argc, char** argv) {
         if (!opencl_available) runtime.set_simulated_times(device_times);
     }
 
+    // Post-loop verification and timing:
+    // Collective safety guarantees:
+    // 1. `iterations > 0` is verified at startup (lines 75-80); every rank executes the loop and reaches this point.
+    // 2. All ranks participate in the exact same sequence of MPI collective operations in identical order:
+    //    a) MPI_Allreduce for maximum loop execution time across ranks (loop_time_s).
+    //    b) runtime.gather() for computed field output if opencl_available (all ranks call gather).
+    //    c) MPI_Allreduce to reduce local verification mismatch flags across all ranks (any_mismatch).
+    //    d) MPI_Allreduce for total benchmark duration across ranks (total_duration_s).
+    // 3. No rank exits early or diverges from the collective sequence prior to MPI_Finalize().
     const auto loop_end = std::chrono::steady_clock::now();
     const double local_loop_s = std::chrono::duration<double>(loop_end - total_bench_start).count();
     double loop_time_s = 0.0;
@@ -347,7 +356,6 @@ int main(int argc, char** argv) {
         csv.close();
 
         const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
-        std::cout << "loop_time_s: " << loop_time_s << "\n";
         std::cout << "[kneighbor] algo=" << balance_algo
                   << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
                   << " total_time_s=" << total_duration_s

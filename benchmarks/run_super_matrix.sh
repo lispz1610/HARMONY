@@ -458,6 +458,7 @@ get_rep_algos() {
 
 run_counter=0
 failed_samples=0
+warmup_failed_samples=0
 
 execute_sample() {
     local stage="$1"
@@ -512,12 +513,22 @@ execute_sample() {
     local status="success"
     if [[ $exit_code -eq 124 ]]; then
         status="timeout"
-        failed_samples=$((failed_samples + 1))
-        echo "[WARNING] Sample $run_id timed out after $sample_timeout_str: $bench $algo seed $seed" >&2
+        if [[ "$stage" == "warmup" ]]; then
+            warmup_failed_samples=$((warmup_failed_samples + 1))
+            echo "[WARNING] Warm-up sample $run_id timed out after $sample_timeout_str: $bench $algo seed $seed (warmup failure recorded in manifest; does not count toward runner exit code)" >&2
+        else
+            failed_samples=$((failed_samples + 1))
+            echo "[WARNING] Sample $run_id timed out after $sample_timeout_str: $bench $algo seed $seed" >&2
+        fi
     elif [[ $exit_code -ne 0 ]]; then
         status="failed"
-        failed_samples=$((failed_samples + 1))
-        echo "[WARNING] Sample $run_id failed with exit code $exit_code: $bench $algo seed $seed" >&2
+        if [[ "$stage" == "warmup" ]]; then
+            warmup_failed_samples=$((warmup_failed_samples + 1))
+            echo "[WARNING] Warm-up sample $run_id failed with exit code $exit_code: $bench $algo seed $seed (warmup failure recorded in manifest; does not count toward runner exit code)" >&2
+        else
+            failed_samples=$((failed_samples + 1))
+            echo "[WARNING] Sample $run_id failed with exit code $exit_code: $bench $algo seed $seed" >&2
+        fi
     fi
 
     record_sample_manifest "$run_id" "$stage" "$rep" "$bench" "$algo" "$seed" "$step" \
@@ -636,6 +647,10 @@ for bench in kneighbor leanmd; do
     execute_sample "aba" "null" "$bench" "erad" "123" "3"
 done
 record_telemetry "after_aba"
+
+if [[ "$warmup_failed_samples" -gt 0 ]]; then
+    echo "[WARNING] $warmup_failed_samples warm-up sample(s) failed or timed out (recorded in manifest; does not count toward runner exit code)" >&2
+fi
 
 if [[ "$failed_samples" -gt 0 ]]; then
     echo "ERROR: $failed_samples sample(s) failed or timed out during matrix execution" >&2
