@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     float cpu_val = sum / static_cast<float>(valid_neighbors);
-                    if (std::abs(out_data[i] - cpu_val) > 1e-5f) {
+                    if (!std::isfinite(out_data[i]) || !std::isfinite(cpu_val) || std::abs(out_data[i] - cpu_val) > 1e-5f) {
                         std::cerr << "Stencil verification failed at index " << i
                                   << ": actual=" << out_data[i]
                                   << " reference=" << cpu_val << "\n";
