@@ -461,7 +461,8 @@ class TestSuperMatrixDryRun(unittest.TestCase):
             ],
             env={"MOCK_FAIL_ONCE_FILE": fail_marker},
         )
-        self.assertEqual(proc.returncode, 0, "Runner should not abort the whole job on single sample failure")
+        self.assertEqual(proc.returncode, 1, "Runner should exit with code 1 on sample failure")
+        self.assertIn("1 sample(s) failed or timed out during matrix execution", proc.stderr)
 
         manifest_path = os.path.join(self.out_dir, "run_manifest.json")
         self.assertTrue(os.path.isfile(manifest_path))
@@ -495,12 +496,13 @@ class TestSuperMatrixDryRun(unittest.TestCase):
                 "--launcher", launcher_cmd,
             ],
             env={
-                "SAMPLE_TIMEOUT_SECONDS": "1",
+                "SAMPLE_TIMEOUT_SECONDS": "2",
                 "MOCK_SLEEP_ONCE_FILE": sleep_marker,
-                "MOCK_SLEEP_SECONDS": "3",
+                "MOCK_SLEEP_SECONDS": "4",
             },
         )
-        self.assertEqual(proc.returncode, 0, "Runner should not abort on sample timeout")
+        self.assertEqual(proc.returncode, 1, "Runner should exit with code 1 on sample timeout")
+        self.assertIn("1 sample(s) failed or timed out during matrix execution", proc.stderr)
 
         manifest_path = os.path.join(self.out_dir, "run_manifest.json")
         with open(manifest_path, "r", encoding="utf-8") as f:

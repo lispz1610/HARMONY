@@ -101,15 +101,23 @@ timeout 60s prun "$bin_dir/test_async_halo_opencl.out"
 
 # 5. Execution pipeline
 echo "=== Executing Super Matrix Benchmark ==="
+set +e
 bash "$PBS_O_WORKDIR/benchmarks/run_super_matrix.sh" \
     --bin-dir "$bin_dir" \
     --output-dir "$output_dir" \
     --launcher prun \
     --skip-preflight
+runner_exit_code=$?
+set -e
 
 echo "=== Post-Processing and Generating Report ==="
 python3 "$PBS_O_WORKDIR/benchmarks/analyze_super_matrix.py" \
-    --output-dir "$output_dir"
+    --output-dir "$output_dir" || true
+
+if [[ $runner_exit_code -ne 0 ]]; then
+    echo "Error: Super Matrix execution reported sample failure(s) (exit code: $runner_exit_code)" >&2
+    exit 1
+fi
 
 # 6. Idempotent and clean termination
 echo "=== Super Job completed successfully ==="
