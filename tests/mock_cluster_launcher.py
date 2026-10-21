@@ -179,10 +179,12 @@ def simulate_benchmark(binary_name, target_args):
 
     # Total wall time simulation
     wall_time = 3.73996 if is_kneighbor else 0.438039
+    loop_time = 3.50000 if is_kneighbor else 0.400000
     rebalances = (iterations - 1) // interval if interval > 0 else 0
+    sys.stdout.write(f"loop_time_s: {loop_time:.6f}\n")
     sys.stdout.write(
         f"[{bench_name}] algo={algo} mode=gpu_opencl total_time_s={wall_time} "
-        f"num_rebalances={rebalances} avg_rebalance_gain=6.34934e-05\n"
+        f"loop_time_s={loop_time:.6f} num_rebalances={rebalances} avg_rebalance_gain=6.34934e-05\n"
     )
     sys.exit(0)
 

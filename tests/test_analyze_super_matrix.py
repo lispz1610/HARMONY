@@ -1003,6 +1003,208 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         finally:
             shutil.rmtree(empty_dir, ignore_errors=True)
 
+    def test_parse_log_with_loop_time_s(self):
+        """Verifies parsing of loop_time_s from summary line and standalone line (#25)."""
+        # Case A: Summary line with both total_time_s and loop_time_s
+        log_a = (
+            "[device] rank=0 global_index=0 name=NVIDIA A100 80GB PCIe\n"
+            "loop_time_s: 3.250000\n"
+            "[kneighbor] algo=erad mode=gpu_opencl total_time_s=4.120000 loop_time_s=3.250000 num_rebalances=9 avg_rebalance_gain=6.34934e-05\n"
+        )
+        log_path_a = self.output_dir / "test_a.log"
+        log_path_a.write_text(log_a, encoding="utf-8")
+        parsed_a = asm.parse_log_file(log_path_a)
+        self.assertIsNotNone(parsed_a)
+        self.assertAlmostEqual(parsed_a["total_time_s"], 4.12)
+        self.assertAlmostEqual(parsed_a["loop_time_s"], 3.25)
+        self.assertEqual(parsed_a["algo"], "erad")
+        self.assertEqual(parsed_a["benchmark"], "kneighbor")
+
+        # Case B: Standalone loop_time_s line only, backward-compatible summary line
+        log_b = (
+            "loop_time_s: 0.185000\n"
+            "[leanmd] algo=hwtopolb mode=gpu_opencl total_time_s=0.450000 num_rebalances=5 avg_rebalance_gain=0.0001\n"
+        )
+        log_path_b = self.output_dir / "test_b.log"
+        log_path_b.write_text(log_b, encoding="utf-8")
+        parsed_b = asm.parse_log_file(log_path_b)
+        self.assertIsNotNone(parsed_b)
+        self.assertAlmostEqual(parsed_b["total_time_s"], 0.45)
+        self.assertAlmostEqual(parsed_b["loop_time_s"], 0.185)
+
+        # Case C: Legacy log without loop_time_s
+        log_c = (
+            "[kneighbor] algo=erad mode=gpu_opencl total_time_s=3.74 num_rebalances=9 avg_rebalance_gain=6.34e-05\n"
+        )
+        log_path_c = self.output_dir / "test_c.log"
+        log_path_c.write_text(log_c, encoding="utf-8")
+        parsed_c = asm.parse_log_file(log_path_c)
+        self.assertIsNotNone(parsed_c)
+        self.assertAlmostEqual(parsed_c["total_time_s"], 3.74)
+        self.assertIsNone(parsed_c.get("loop_time_s"))
+
+    def test_paired_analysis_prioritizes_loop_time_s_avoiding_inflation(self):
+        """Paired analysis uses loop_time_s instead of total_time_s when present, avoiding verification inflation (#25)."""
+        # ERAD: loop = 2.0s, total = 12.0s (10s verification inflation)
+        # HWTOPOLB: loop = 0.2s, total = 10.2s (10s verification inflation)
+        # With total_time_s, ratio = 12.0 / 10.2 = ~1.176 (distorted)
+        # With loop_time_s, ratio = 2.0 / 0.2 = 10.0 (true speedup)
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 12.0,
+                "loop_s": 2.0,
+                "step_sum_s": 1.9,
+                "unaccounted_s": 10.1,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 10.2,
+                "loop_s": 0.2,
+                "step_sum_s": 0.18,
+                "unaccounted_s": 10.02,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            },
+        ]
+        paired = asm.compute_paired_analysis(runs)
+        self.assertEqual(len(paired), 1)
+        p = paired[0]
+        self.assertAlmostEqual(p["ratio"], 10.0, places=2)
+        self.assertAlmostEqual(p["speedup_pct"], 90.0, places=2)
+        self.assertAlmostEqual(p["erad_wall_s"], 12.0)
+        self.assertAlmostEqual(p["hwtopolb_wall_s"], 10.2)
+        self.assertAlmostEqual(p["erad_loop_s"], 2.0)
+        self.assertAlmostEqual(p["hwtopolb_loop_s"], 0.2)
+
+    def test_paired_analysis_backward_compatibility_missing_loop_s(self):
+        """Paired analysis cleanly falls back to wall_s when loop_s is missing (#25)."""
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 3.74,
+                "step_sum_s": 2.74,
+                "status": "SUCCESS",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 0.22,
+                "step_sum_s": 0.16,
+                "status": "SUCCESS",
+            },
+        ]
+        paired = asm.compute_paired_analysis(runs)
+        self.assertEqual(len(paired), 1)
+        p = paired[0]
+        self.assertAlmostEqual(p["ratio"], 3.74 / 0.22, places=2)
+        self.assertAlmostEqual(p["speedup_pct"], ((3.74 - 0.22) / 3.74) * 100.0, places=2)
+        self.assertIsNone(p.get("erad_loop_s"))
+        self.assertIsNone(p.get("hwtopolb_loop_s"))
+
+    def test_summary_statistics_prioritizes_loop_time_s(self):
+        """Summary statistics calculates distribution over loop_time_s when present (#25)."""
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 12.0,
+                "loop_s": 2.0,
+                "status": "SUCCESS",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 2,
+                "stage": "matrix",
+                "wall_s": 14.0,
+                "loop_s": 2.2,
+                "status": "SUCCESS",
+            },
+        ]
+        stats = asm.compute_matrix_statistics(runs, stage="matrix")
+        self.assertEqual(len(stats), 1)
+        s = stats[0]
+        self.assertAlmostEqual(s["median_s"], 2.1)
+        self.assertAlmostEqual(s["median_loop_s"], 2.1)
+        self.assertAlmostEqual(s["median_wall_s"], 13.0)
+
+    def test_artifact_generation_both_fields(self):
+        """Artifact generation outputs both wall_s and loop_s in CSVs and markdown (#25)."""
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 4.0,
+                "loop_s": 3.0,
+                "step_sum_s": 2.8,
+                "unaccounted_s": 1.2,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            },
+            {
+                "benchmark": "kneighbor",
+                "algo": "hwtopolb",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 0.5,
+                "loop_s": 0.2,
+                "step_sum_s": 0.18,
+                "unaccounted_s": 0.32,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            },
+        ]
+        asm.generate_artifacts(self.output_dir, runs)
+
+        # Check super_matrix_summary.csv has loop_s column
+        summary_csv = self.output_dir / "super_matrix_summary.csv"
+        self.assertTrue(summary_csv.exists())
+        with open(summary_csv, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertIn("wall_s", rows[0])
+        self.assertIn("loop_s", rows[0])
+        self.assertAlmostEqual(float(rows[0]["wall_s"]), 4.0)
+        self.assertAlmostEqual(float(rows[0]["loop_s"]), 3.0)
+
+        # Check super_matrix_paired.csv has both wall and loop columns
+        paired_csv = self.output_dir / "super_matrix_paired.csv"
+        self.assertTrue(paired_csv.exists())
+        with open(paired_csv, newline="", encoding="utf-8") as f:
+            prows = list(csv.DictReader(f))
+        self.assertIn("erad_wall_s", prows[0])
+        self.assertIn("hwtopolb_wall_s", prows[0])
+        self.assertIn("erad_loop_s", prows[0])
+        self.assertIn("hwtopolb_loop_s", prows[0])
+        self.assertAlmostEqual(float(prows[0]["erad_wall_s"]), 4.0)
+        self.assertAlmostEqual(float(prows[0]["erad_loop_s"]), 3.0)
+        self.assertAlmostEqual(float(prows[0]["ratio"]), 3.0 / 0.2)  # Prioritizes loop_s!
+
 
 if __name__ == "__main__":
     unittest.main()

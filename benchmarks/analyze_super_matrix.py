@@ -125,9 +125,10 @@ def parse_log_file(log_path: Path):
         return None
 
     # Detect benchmark and metadata from summary line
-    # e.g.: [kneighbor] algo=erad mode=gpu_opencl total_time_s=3.73996 num_rebalances=9 avg_rebalance_gain=6.34934e-05
+    # e.g.: [kneighbor] algo=erad mode=gpu_opencl total_time_s=3.73996 loop_time_s=3.50000 num_rebalances=9 avg_rebalance_gain=6.34934e-05
+    # or legacy format without loop_time_s
     summary_match = re.search(
-        r"\[(\w+)\]\s+algo=(\w+)\s+mode=(\w+)\s+total_time_s=([0-9.eE+-]+)\s+num_rebalances=(\d+)\s+avg_rebalance_gain=([0-9.eE+-]+)",
+        r"\[(\w+)\]\s+algo=(\w+)\s+mode=(\w+)\s+total_time_s=([0-9.eE+-]+)(?:\s+loop_time_s=([0-9.eE+-]+))?\s+num_rebalances=(\d+)\s+avg_rebalance_gain=([0-9.eE+-]+)",
         content,
     )
 
@@ -135,6 +136,7 @@ def parse_log_file(log_path: Path):
     algo = None
     mode = None
     total_time_s = None
+    loop_time_s = None
     num_rebalances = None
     avg_rebalance_gain = None
 
@@ -143,8 +145,10 @@ def parse_log_file(log_path: Path):
         algo = summary_match.group(2).lower()
         mode = summary_match.group(3)
         total_time_s = float(summary_match.group(4))
-        num_rebalances = int(summary_match.group(5))
-        avg_rebalance_gain = float(summary_match.group(6))
+        if summary_match.group(5) is not None:
+            loop_time_s = float(summary_match.group(5))
+        num_rebalances = int(summary_match.group(6))
+        avg_rebalance_gain = float(summary_match.group(7))
     else:
         # Fallback regex searches
         total_time_match = re.search(r"total_time_s=([0-9.eE+-]+)", content)
@@ -171,6 +175,12 @@ def parse_log_file(log_path: Path):
         if gain_match:
             avg_rebalance_gain = float(gain_match.group(1))
 
+    # Also search for loop_time_s if not already extracted from summary line
+    if loop_time_s is None:
+        loop_time_match = re.search(r"loop_time_s[:=]\s*([0-9.eE+-]+)", content)
+        if loop_time_match:
+            loop_time_s = float(loop_time_match.group(1))
+
     # Parse devices
     devices = []
     for dev_match in re.finditer(
@@ -195,6 +205,7 @@ def parse_log_file(log_path: Path):
         "algo": algo,
         "mode": mode,
         "total_time_s": total_time_s,
+        "loop_time_s": loop_time_s,
         "num_rebalances": num_rebalances,
         "avg_rebalance_gain": avg_rebalance_gain,
         "devices": devices,
@@ -425,6 +436,17 @@ def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=
             step = metadata.get("step")
 
     wall_s = log_data["total_time_s"] if log_data and log_data.get("total_time_s") is not None else None
+    loop_s = log_data["loop_time_s"] if log_data and log_data.get("loop_time_s") is not None else None
+
+    if metadata:
+        if metadata.get("wall_s") is not None:
+            wall_s = metadata.get("wall_s")
+        if metadata.get("loop_s") is not None:
+            loop_s = metadata.get("loop_s")
+        elif metadata.get("loop_time_s") is not None:
+            loop_s = metadata.get("loop_time_s")
+
+    primary_s = loop_s if loop_s is not None else wall_s
     step_sum_s = csv_data["step_sum_s"] if csv_data else None
     unaccounted_s = (wall_s - step_sum_s) if (wall_s is not None and step_sum_s is not None) else None
     rebalance_count = csv_data["rebalance_count"] if csv_data else (log_data.get("num_rebalances") if log_data else 0)
@@ -460,7 +482,7 @@ def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=
         status = "MISSING_ALL"
     elif log_data is None:
         status = "MISSING_LOG"
-    elif wall_s is None:
+    elif wall_s is None and loop_s is None:
         status = "FAILED"
     elif csv_data is None:
         status = "MISSING_CSV"
@@ -490,6 +512,8 @@ def parse_run(log_path: Path, csv_path: Path, expected_iterations=100, metadata=
         "step": step,
         "stage": stage,
         "wall_s": wall_s,
+        "loop_s": loop_s,
+        "primary_s": primary_s,
         "step_sum_s": step_sum_s,
         "unaccounted_s": unaccounted_s,
         "rebalance_count": rebalance_count,
@@ -580,6 +604,7 @@ def compute_paired_analysis(runs, stage=None):
     For ABA runs, pairs step 1 (ERAD) vs step 2 (HWTOPOLB) and step 3 (ERAD) vs step 2 (HWTOPOLB),
     ensuring step 1 is not overwritten by step 3.
     Computes speedup ratio (ERAD ÷ HWTOPOLB) and speedup percentage.
+    Prioritizes loop_s (loop_time_s) over wall_s (total_time_s), falling back to wall_s when absent.
     If stage is specified (e.g. 'matrix'), strictly isolates pairs to that stage.
     """
     pairs = []
@@ -587,7 +612,8 @@ def compute_paired_analysis(runs, stage=None):
     aba_grouped = {}
 
     for r in runs:
-        if r.get("status") != "SUCCESS" or r.get("wall_s") is None:
+        timing = r.get("loop_s") if r.get("loop_s") is not None else (r.get("loop_time_s") if r.get("loop_time_s") is not None else r.get("wall_s"))
+        if r.get("status") != "SUCCESS" or timing is None:
             continue
         r_stage = r.get("stage", "matrix")
         if stage is not None and r_stage != stage:
@@ -604,21 +630,32 @@ def compute_paired_analysis(runs, stage=None):
             grouped.setdefault(key, {})[r["algo"]] = r
 
     # Process standard paired matrix/warmup runs
-    for (bench, seed, rep, stage), algos in sorted(grouped.items()):
+    for (bench, seed, rep, stage_name), algos in sorted(grouped.items()):
         if "erad" in algos and "hwtopolb" in algos:
-            erad_wall = algos["erad"]["wall_s"]
-            hw_wall = algos["hwtopolb"]["wall_s"]
-            ratio = erad_wall / hw_wall if hw_wall > 0 else None
-            speedup_pct = (((erad_wall - hw_wall) / erad_wall) * 100.0) if erad_wall > 0 else None
+            e_run = algos["erad"]
+            h_run = algos["hwtopolb"]
+
+            erad_wall = e_run.get("wall_s") if e_run.get("wall_s") is not None else e_run.get("total_time_s")
+            hw_wall = h_run.get("wall_s") if h_run.get("wall_s") is not None else h_run.get("total_time_s")
+            erad_loop = e_run.get("loop_s") if e_run.get("loop_s") is not None else e_run.get("loop_time_s")
+            hw_loop = h_run.get("loop_s") if h_run.get("loop_s") is not None else h_run.get("loop_time_s")
+
+            erad_t = erad_loop if erad_loop is not None else erad_wall
+            hw_t = hw_loop if hw_loop is not None else hw_wall
+
+            ratio = (erad_t / hw_t) if (hw_t is not None and hw_t > 0 and erad_t is not None) else None
+            speedup_pct = (((erad_t - hw_t) / erad_t) * 100.0) if (erad_t is not None and erad_t > 0 and hw_t is not None) else None
 
             pairs.append({
                 "benchmark": bench,
                 "seed": seed,
                 "repetition": rep,
-                "stage": stage,
+                "stage": stage_name,
                 "step": None,
                 "erad_wall_s": erad_wall,
                 "hwtopolb_wall_s": hw_wall,
+                "erad_loop_s": erad_loop,
+                "hwtopolb_loop_s": hw_loop,
                 "ratio": ratio,
                 "speedup_pct": speedup_pct,
             })
@@ -630,10 +667,16 @@ def compute_paired_analysis(runs, stage=None):
         step3 = steps.get(3)
 
         if step1 and step2:
-            e1_wall = step1["wall_s"]
-            hw_wall = step2["wall_s"]
-            r1 = e1_wall / hw_wall if hw_wall > 0 else None
-            s1 = (((e1_wall - hw_wall) / e1_wall) * 100.0) if e1_wall > 0 else None
+            e1_wall = step1.get("wall_s") if step1.get("wall_s") is not None else step1.get("total_time_s")
+            hw_wall = step2.get("wall_s") if step2.get("wall_s") is not None else step2.get("total_time_s")
+            e1_loop = step1.get("loop_s") if step1.get("loop_s") is not None else step1.get("loop_time_s")
+            hw_loop = step2.get("loop_s") if step2.get("loop_s") is not None else step2.get("loop_time_s")
+
+            e1_t = e1_loop if e1_loop is not None else e1_wall
+            hw_t = hw_loop if hw_loop is not None else hw_wall
+
+            r1 = (e1_t / hw_t) if (hw_t is not None and hw_t > 0 and e1_t is not None) else None
+            s1 = (((e1_t - hw_t) / e1_t) * 100.0) if (e1_t is not None and e1_t > 0 and hw_t is not None) else None
             pairs.append({
                 "benchmark": bench,
                 "seed": seed,
@@ -642,15 +685,23 @@ def compute_paired_analysis(runs, stage=None):
                 "step": 1,
                 "erad_wall_s": e1_wall,
                 "hwtopolb_wall_s": hw_wall,
+                "erad_loop_s": e1_loop,
+                "hwtopolb_loop_s": hw_loop,
                 "ratio": r1,
                 "speedup_pct": s1,
             })
 
         if step3 and step2:
-            e3_wall = step3["wall_s"]
-            hw_wall = step2["wall_s"]
-            r3 = e3_wall / hw_wall if hw_wall > 0 else None
-            s3 = (((e3_wall - hw_wall) / e3_wall) * 100.0) if e3_wall > 0 else None
+            e3_wall = step3.get("wall_s") if step3.get("wall_s") is not None else step3.get("total_time_s")
+            hw_wall = step2.get("wall_s") if step2.get("wall_s") is not None else step2.get("total_time_s")
+            e3_loop = step3.get("loop_s") if step3.get("loop_s") is not None else step3.get("loop_time_s")
+            hw_loop = step2.get("loop_s") if step2.get("loop_s") is not None else step2.get("loop_time_s")
+
+            e3_t = e3_loop if e3_loop is not None else e3_wall
+            hw_t = hw_loop if hw_loop is not None else hw_wall
+
+            r3 = (e3_t / hw_t) if (hw_t is not None and hw_t > 0 and e3_t is not None) else None
+            s3 = (((e3_t - hw_t) / e3_t) * 100.0) if (e3_t is not None and e3_t > 0 and hw_t is not None) else None
             pairs.append({
                 "benchmark": bench,
                 "seed": seed,
@@ -659,6 +710,8 @@ def compute_paired_analysis(runs, stage=None):
                 "step": 3,
                 "erad_wall_s": e3_wall,
                 "hwtopolb_wall_s": hw_wall,
+                "erad_loop_s": e3_loop,
+                "hwtopolb_loop_s": hw_loop,
                 "ratio": r3,
                 "speedup_pct": s3,
             })
@@ -671,10 +724,20 @@ def compute_aba_drift_analysis(runs):
     Computes dedicated A/B/A drift metrics:
     - Compares ERAD step 1 vs ERAD step 3 (hardware thermal/clock drift).
     - Compares HWTOPOLB step 2 against the bracketed ERAD steps (mean of step 1 and step 3).
+    Prioritizes loop_s over wall_s when present.
     """
+    def _extract_t(r):
+        if r.get("loop_s") is not None:
+            return r["loop_s"]
+        if r.get("loop_time_s") is not None:
+            return r["loop_time_s"]
+        if r.get("wall_s") is not None:
+            return r["wall_s"]
+        return r.get("total_time_s")
+
     aba_runs = [
         r for r in runs
-        if r.get("stage") == "aba" and r.get("status") == "SUCCESS" and r.get("wall_s") is not None
+        if r.get("stage") == "aba" and r.get("status") == "SUCCESS" and _extract_t(r) is not None
     ]
     if not aba_runs:
         return []
@@ -695,9 +758,12 @@ def compute_aba_drift_analysis(runs):
         if not (step1 and step2 and step3):
             continue
 
-        t1 = step1["wall_s"]
-        t2 = step2["wall_s"]
-        t3 = step3["wall_s"]
+        t1 = _extract_t(step1)
+        t2 = _extract_t(step2)
+        t3 = _extract_t(step3)
+
+        if t1 is None or t2 is None or t3 is None:
+            continue
 
         drift_delta_s = t3 - t1
         drift_pct = ((t3 - t1) / t1) * 100.0 if t1 > 0 else 0.0
@@ -736,13 +802,15 @@ def compute_aba_drift_analysis(runs):
 def compute_matrix_statistics(runs, stage="matrix"):
     """
     Computes median, mean, min, max, and stddev across repetitions per (benchmark, algo, seed).
+    Uses loop_s (or loop_time_s) as primary metric when present, falling back to wall_s.
     Filters strictly by stage (default 'matrix') so untimed warm-ups and A/B/A runs
     do not contaminate the 5-repetition distribution.
     Never falls back to other stages when all runs in the specified stage fail or are absent.
     """
     grouped = {}
     for r in runs:
-        if r.get("status") != "SUCCESS" or r.get("wall_s") is None:
+        timing = r.get("loop_s") if r.get("loop_s") is not None else (r.get("loop_time_s") if r.get("loop_time_s") is not None else r.get("wall_s"))
+        if r.get("status") != "SUCCESS" or timing is None:
             continue
         if stage is not None and r.get("stage") != stage:
             continue
@@ -751,7 +819,20 @@ def compute_matrix_statistics(runs, stage="matrix"):
 
     stats = []
     for (bench, algo, seed), group in sorted(grouped.items()):
-        wall_times = [r["wall_s"] for r in group]
+        primary_times = [
+            r["loop_s"] if r.get("loop_s") is not None else (r["loop_time_s"] if r.get("loop_time_s") is not None else r["wall_s"])
+            for r in group
+        ]
+        wall_times = [
+            r["wall_s"] if r.get("wall_s") is not None else r.get("total_time_s")
+            for r in group
+            if r.get("wall_s") is not None or r.get("total_time_s") is not None
+        ]
+        loop_times = [
+            r["loop_s"] if r.get("loop_s") is not None else r.get("loop_time_s")
+            for r in group
+            if r.get("loop_s") is not None or r.get("loop_time_s") is not None
+        ]
         unaccounted_times = [r["unaccounted_s"] for r in group if r.get("unaccounted_s") is not None]
         rebal_counts = [r["rebalance_count"] for r in group if r.get("rebalance_count") is not None]
         t_compute_times = [r.get("T_compute_s", 0.0) for r in group]
@@ -759,12 +840,24 @@ def compute_matrix_statistics(runs, stage="matrix"):
         t_bal_times = [r.get("T_balance_s", 0.0) for r in group]
         shifts = [r.get("boundary_shifts", 0) for r in group]
 
-        rep_count = len(wall_times)
-        med_wall = statistics.median(wall_times)
-        mean_wall = statistics.mean(wall_times)
-        min_wall = min(wall_times)
-        max_wall = max(wall_times)
-        stdev_wall = statistics.stdev(wall_times) if rep_count >= 2 else 0.0
+        rep_count = len(primary_times)
+        med_primary = statistics.median(primary_times) if primary_times else 0.0
+        mean_primary = statistics.mean(primary_times) if primary_times else 0.0
+        min_primary = min(primary_times) if primary_times else 0.0
+        max_primary = max(primary_times) if primary_times else 0.0
+        stdev_primary = statistics.stdev(primary_times) if rep_count >= 2 else 0.0
+
+        med_wall = statistics.median(wall_times) if wall_times else med_primary
+        mean_wall = statistics.mean(wall_times) if wall_times else mean_primary
+        min_wall = min(wall_times) if wall_times else min_primary
+        max_wall = max(wall_times) if wall_times else max_primary
+        stdev_wall = statistics.stdev(wall_times) if len(wall_times) >= 2 else 0.0
+
+        med_loop = statistics.median(loop_times) if loop_times else None
+        mean_loop = statistics.mean(loop_times) if loop_times else None
+        min_loop = min(loop_times) if loop_times else None
+        max_loop = max(loop_times) if loop_times else None
+        stdev_loop = statistics.stdev(loop_times) if len(loop_times) >= 2 else (0.0 if loop_times else None)
 
         med_unaccounted = statistics.median(unaccounted_times) if unaccounted_times else 0.0
         mean_rebalances = statistics.mean(rebal_counts) if rebal_counts else 0.0
@@ -779,11 +872,21 @@ def compute_matrix_statistics(runs, stage="matrix"):
             "seed": seed,
             "stage": stage if stage is not None else "all",
             "repetition_count": rep_count,
+            "median_s": med_primary,
+            "mean_s": mean_primary,
+            "min_s": min_primary,
+            "max_s": max_primary,
+            "stddev_s": stdev_primary,
             "median_wall_s": med_wall,
             "mean_wall_s": mean_wall,
             "min_wall_s": min_wall,
             "max_wall_s": max_wall,
             "stddev_wall_s": stdev_wall,
+            "median_loop_s": med_loop,
+            "mean_loop_s": mean_loop,
+            "min_loop_s": min_loop,
+            "max_loop_s": max_loop,
+            "stddev_loop_s": stdev_loop,
             "median_unaccounted_s": med_unaccounted,
             "mean_rebalance_count": mean_rebalances,
             "median_compute_s": med_compute,
@@ -829,6 +932,7 @@ def generate_artifacts(output_dir: Path, runs, telemetry_records=None):
             "seed",
             "stage",
             "wall_s",
+            "loop_s",
             "step_sum_s",
             "unaccounted_s",
             "rebalance_count",
@@ -845,9 +949,10 @@ def generate_artifacts(output_dir: Path, runs, telemetry_records=None):
                 r.get("repetition", ""),
                 r["seed"],
                 r.get("stage", ""),
-                f"{r['wall_s']:.6f}" if r["wall_s"] is not None else "",
-                f"{r['step_sum_s']:.6f}" if r["step_sum_s"] is not None else "",
-                f"{r['unaccounted_s']:.6f}" if r["unaccounted_s"] is not None else "",
+                f"{r['wall_s']:.6f}" if r.get("wall_s") is not None else "",
+                f"{r['loop_s']:.6f}" if r.get("loop_s") is not None else "",
+                f"{r['step_sum_s']:.6f}" if r.get("step_sum_s") is not None else "",
+                f"{r['unaccounted_s']:.6f}" if r.get("unaccounted_s") is not None else "",
                 r.get("rebalance_count", 0),
                 f"{r.get('T_compute_s', 0.0):.6f}",
                 f"{r.get('T_comm_s', 0.0):.6f}",
@@ -869,6 +974,8 @@ def generate_artifacts(output_dir: Path, runs, telemetry_records=None):
             "step",
             "erad_wall_s",
             "hwtopolb_wall_s",
+            "erad_loop_s",
+            "hwtopolb_loop_s",
             "ratio",
             "speedup_pct",
         ])
@@ -879,8 +986,10 @@ def generate_artifacts(output_dir: Path, runs, telemetry_records=None):
                 p.get("repetition", ""),
                 p["stage"],
                 p.get("step") if p.get("step") is not None else "",
-                f"{p['erad_wall_s']:.6f}",
-                f"{p['hwtopolb_wall_s']:.6f}",
+                f"{p['erad_wall_s']:.6f}" if p.get("erad_wall_s") is not None else "",
+                f"{p['hwtopolb_wall_s']:.6f}" if p.get("hwtopolb_wall_s") is not None else "",
+                f"{p['erad_loop_s']:.6f}" if p.get("erad_loop_s") is not None else "",
+                f"{p['hwtopolb_loop_s']:.6f}" if p.get("hwtopolb_loop_s") is not None else "",
                 f"{p['ratio']:.4f}" if p["ratio"] is not None else "",
                 f"{p['speedup_pct']:.2f}" if p["speedup_pct"] is not None else "",
             ])
@@ -953,18 +1062,20 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     # Section 2: Summary of Medians and Dispersion across Repetitions (Isolated strictly to Matrix Stage)
     md.append("## 2. Workload Timing Summary & Dispersion (5-Repetition Rotated Matrix)\n")
     md.append("Evaluates timing distribution strictly across unprofiled matrix repetitions. Untimed warm-up and A/B/A runs are isolated into separate breakdowns below.\n")
-    md.append("| Benchmark | Algorithm | Seed | Repetitions | Median Wall (s) | Mean Wall (s) | StdDev (s) | Min (s) | Max (s) | Med. Unaccounted (s) |")
-    md.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    md.append("| Benchmark | Algorithm | Seed | Repetitions | Median Loop (s) | Median Wall (s) | Mean Loop (s) | Mean Wall (s) | StdDev (s) | Min (s) | Max (s) | Med. Unaccounted (s) |")
+    md.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     if not stats:
-        md.append("| *(no successful matrix samples)* | - | - | 0 | - | - | - | - | - | - |\n")
+        md.append("| *(no successful matrix samples)* | - | - | 0 | - | - | - | - | - | - | - | - |\n")
         md.append("> [!WARNING]")
         md.append("> No successful matrix samples recorded. All matrix stage runs failed or were missing.\n")
     else:
         for s in stats:
+            med_loop_str = f"{s['median_loop_s']:.6f}" if s.get("median_loop_s") is not None else "N/A"
+            mean_loop_str = f"{s['mean_loop_s']:.6f}" if s.get("mean_loop_s") is not None else "N/A"
             md.append(
                 f"| {s['benchmark']} | {s['algo'].upper()} | {s['seed']} | {s['repetition_count']} | "
-                f"{s['median_wall_s']:.6f} | {s['mean_wall_s']:.6f} | {s['stddev_wall_s']:.6f} | "
-                f"{s['min_wall_s']:.6f} | {s['max_wall_s']:.6f} | {s['median_unaccounted_s']:.6f} |"
+                f"{med_loop_str} | {s['median_wall_s']:.6f} | {mean_loop_str} | {s['mean_wall_s']:.6f} | {s['stddev_s']:.6f} | "
+                f"{s['min_s']:.6f} | {s['max_s']:.6f} | {s['median_unaccounted_s']:.6f} |"
             )
         md.append("")
 
@@ -1014,13 +1125,13 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     # Section 4: Paired ERAD vs HWTOPOLB Comparison against Historical Preliminary Results
     md.append("## 4. Paired Comparison and Speedup Analysis (ERAD ÷ HWTOPOLB)\n")
     md.append("Compares measured ratio with historical preliminary cluster run (`docs/relatorio-resultados-preliminares-cluster.md`).\n")
-    md.append("| Benchmark | Seed | Repetition | Stage | Step | ERAD Wall (s) | HWTOPOLB Wall (s) | Observed Ratio | Observed Speedup | Hist. Ratio | Hist. Speedup | Status |")
-    md.append("|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
+    md.append("| Benchmark | Seed | Repetition | Stage | Step | ERAD Wall (s) | HWTOPOLB Wall (s) | ERAD Loop (s) | HWTOPOLB Loop (s) | Observed Ratio | Observed Speedup | Hist. Ratio | Hist. Speedup | Status |")
+    md.append("|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
     seed_123_ratios = []
 
     if not paired:
-        md.append("| *(no valid pairs)* | - | - | - | - | - | - | - | - | - | - | - |\n")
+        md.append("| *(no valid pairs)* | - | - | - | - | - | - | - | - | - | - | - | - | - |\n")
     else:
         for p in paired:
             hist = HISTORICAL_PRELIMINARY.get((p["benchmark"], p["seed"]), {})
@@ -1041,9 +1152,14 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
             else:
                 status_flag = "ERAD Faster / Parity"
 
+            erad_wall_str = f"{p['erad_wall_s']:.4f}" if p.get('erad_wall_s') is not None else "N/A"
+            hw_wall_str = f"{p['hwtopolb_wall_s']:.4f}" if p.get('hwtopolb_wall_s') is not None else "N/A"
+            erad_loop_str = f"{p['erad_loop_s']:.4f}" if p.get('erad_loop_s') is not None else "N/A"
+            hw_loop_str = f"{p['hwtopolb_loop_s']:.4f}" if p.get('hwtopolb_loop_s') is not None else "N/A"
+
             md.append(
                 f"| {p['benchmark']} | {p['seed']} | {rep_display} | {p['stage']} | {step_display} | "
-                f"{p['erad_wall_s']:.4f} | {p['hwtopolb_wall_s']:.4f} | {obs_ratio} | {obs_spd} | "
+                f"{erad_wall_str} | {hw_wall_str} | {erad_loop_str} | {hw_loop_str} | {obs_ratio} | {obs_spd} | "
                 f"{hist_ratio} | {hist_spd} | {status_flag} |"
             )
         md.append("")

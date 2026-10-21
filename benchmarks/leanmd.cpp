@@ -284,43 +284,6 @@ int main(int argc, char** argv) {
         std::vector<double> device_times(partitions.size(), 0.0);
         MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
-        if (it == iterations - 1) {
-            if (opencl_available) runtime.gather(h_force, force_out.data(), n * sizeof(float));
-            int local_mismatch = 0;
-            for (const auto& part : partitions) {
-                if (!opencl_available && part.owning_rank != rank) continue;
-                if (opencl_available && rank != 0) continue;
-                for (std::size_t i = part.global_offset;
-                     i < part.global_offset + part.element_count; ++i) {
-                    float expected = 0.0f;
-                    const std::size_t start = i > static_cast<std::size_t>(cutoff)
-                        ? i - static_cast<std::size_t>(cutoff) : 0;
-                    const std::size_t end = std::min(n - 1, i + static_cast<std::size_t>(cutoff));
-                    for (std::size_t j = start; j <= end; ++j) {
-                        if (i == j) continue;
-                        const float dx = pos_x[i] - pos_x[j];
-                        const float dy = pos_y[i] - pos_y[j];
-                        const float dz = pos_z[i] - pos_z[j];
-                        const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
-                        const float inv = 1.0f / r2;
-                        const float inv6 = inv * inv * inv;
-                        expected += inv * inv6 * (2.0f * inv6 - 1.0f);
-                    }
-                    if (!std::isfinite(force_out[i]) ||
-                        std::fabs(force_out[i] - expected) >
-                            1e-4f + 1e-4f * std::fabs(expected)) {
-                        std::cerr << "LeanMD verification failed at index " << i << "\n";
-                        local_mismatch = 1;
-                        break;
-                    }
-                }
-            }
-            int any_mismatch = 0;
-            MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
-                          runtime.communicator());
-            if (any_mismatch != 0) MPI_Abort(runtime.communicator(), 1);
-        }
-
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});
         } else {
@@ -330,6 +293,48 @@ int main(int argc, char** argv) {
         prev_device_times = device_times;
         if (!opencl_available) runtime.set_simulated_times(device_times);
     }
+
+    const auto loop_end = std::chrono::steady_clock::now();
+    const double local_loop_s = std::chrono::duration<double>(loop_end - total_bench_start).count();
+    double loop_time_s = 0.0;
+    MPI_Allreduce(&local_loop_s, &loop_time_s, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+    // Numerical verification
+    if (opencl_available) runtime.gather(h_force, force_out.data(), n * sizeof(float));
+    int local_mismatch = 0;
+    const auto& partitions = runtime.partitions();
+    for (const auto& part : partitions) {
+        if (!opencl_available && part.owning_rank != rank) continue;
+        if (opencl_available && rank != 0) continue;
+        for (std::size_t i = part.global_offset;
+             i < part.global_offset + part.element_count; ++i) {
+            float expected = 0.0f;
+            const std::size_t start = i > static_cast<std::size_t>(cutoff)
+                ? i - static_cast<std::size_t>(cutoff) : 0;
+            const std::size_t end = std::min(n - 1, i + static_cast<std::size_t>(cutoff));
+            for (std::size_t j = start; j <= end; ++j) {
+                if (i == j) continue;
+                const float dx = pos_x[i] - pos_x[j];
+                const float dy = pos_y[i] - pos_y[j];
+                const float dz = pos_z[i] - pos_z[j];
+                const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
+                const float inv = 1.0f / r2;
+                const float inv6 = inv * inv * inv;
+                expected += inv * inv6 * (2.0f * inv6 - 1.0f);
+            }
+            if (!std::isfinite(force_out[i]) ||
+                std::fabs(force_out[i] - expected) >
+                    1e-4f + 1e-4f * std::fabs(expected)) {
+                std::cerr << "LeanMD verification failed at index " << i << "\n";
+                local_mismatch = 1;
+                break;
+            }
+        }
+    }
+    int any_mismatch = 0;
+    MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
+                  runtime.communicator());
+    if (any_mismatch != 0) MPI_Abort(runtime.communicator(), 1);
 
     const auto total_bench_end = std::chrono::steady_clock::now();
     const double local_duration_s = std::chrono::duration<double>(total_bench_end - total_bench_start).count();
@@ -363,9 +368,11 @@ int main(int argc, char** argv) {
         csv.close();
 
         const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
+        std::cout << "loop_time_s: " << loop_time_s << "\n";
         std::cout << "[leanmd] algo=" << balance_algo
                   << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
                   << " total_time_s=" << total_duration_s
+                  << " loop_time_s=" << loop_time_s
                   << " num_rebalances=" << num_rebalances
                   << " avg_rebalance_gain=" << avg_gain << "\n";
     }

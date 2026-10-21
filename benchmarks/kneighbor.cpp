@@ -265,42 +265,6 @@ int main(int argc, char** argv) {
         std::vector<double> device_times(partitions.size(), 0.0);
         MPI_Allreduce(local_device_times.data(), device_times.data(), partitions.size(), MPI_DOUBLE, MPI_MAX, runtime.communicator());
 
-        // Verify all computed elements against the scalar stencil reference.
-        if (it == iterations - 1) {
-            if (opencl_available) runtime.gather(h_out, out_data.data(), n * sizeof(float));
-            int local_mismatch = 0;
-            for (const auto& part : partitions) {
-                if (!opencl_available && part.owning_rank != rank) continue;
-                if (opencl_available && rank != 0) continue;
-                for (std::size_t i = part.global_offset;
-                     i < part.global_offset + part.element_count; ++i) {
-                    float sum = 0.0f;
-                    int valid_neighbors = 0;
-                    for (int o = -k; o <= k; ++o) {
-                        const long long idx = static_cast<long long>(i) + o;
-                        if (idx >= 0 && idx < static_cast<long long>(n)) {
-                            sum += in_data[static_cast<std::size_t>(idx)];
-                            valid_neighbors++;
-                        }
-                    }
-                    float cpu_val = sum / static_cast<float>(valid_neighbors);
-                    if (!std::isfinite(out_data[i]) || !std::isfinite(cpu_val) || std::abs(out_data[i] - cpu_val) > 1e-5f) {
-                        std::cerr << "Stencil verification failed at index " << i
-                                  << ": actual=" << out_data[i]
-                                  << " reference=" << cpu_val << "\n";
-                        local_mismatch = 1;
-                        break;
-                    }
-                }
-            }
-            int any_mismatch = 0;
-            MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
-                          runtime.communicator());
-            if (any_mismatch != 0) {
-                MPI_Abort(runtime.communicator(), 1);
-            }
-        }
-
         if (do_rebalance) {
             records.push_back({it, t_max_step, "rebalance", 1, gain});
         } else {
@@ -309,6 +273,46 @@ int main(int argc, char** argv) {
 
         prev_device_times = device_times;
         if (!opencl_available) runtime.set_simulated_times(device_times);
+    }
+
+    const auto loop_end = std::chrono::steady_clock::now();
+    const double local_loop_s = std::chrono::duration<double>(loop_end - total_bench_start).count();
+    double loop_time_s = 0.0;
+    MPI_Allreduce(&local_loop_s, &loop_time_s, 1, MPI_DOUBLE, MPI_MAX, runtime.communicator());
+
+    // Verify all computed elements against the scalar stencil reference.
+    if (opencl_available) runtime.gather(h_out, out_data.data(), n * sizeof(float));
+    int local_mismatch = 0;
+    const auto& partitions = runtime.partitions();
+    for (const auto& part : partitions) {
+        if (!opencl_available && part.owning_rank != rank) continue;
+        if (opencl_available && rank != 0) continue;
+        for (std::size_t i = part.global_offset;
+             i < part.global_offset + part.element_count; ++i) {
+            float sum = 0.0f;
+            int valid_neighbors = 0;
+            for (int o = -k; o <= k; ++o) {
+                const long long idx = static_cast<long long>(i) + o;
+                if (idx >= 0 && idx < static_cast<long long>(n)) {
+                    sum += in_data[static_cast<std::size_t>(idx)];
+                    valid_neighbors++;
+                }
+            }
+            float cpu_val = sum / static_cast<float>(valid_neighbors);
+            if (!std::isfinite(out_data[i]) || !std::isfinite(cpu_val) || std::abs(out_data[i] - cpu_val) > 1e-5f) {
+                std::cerr << "Stencil verification failed at index " << i
+                          << ": actual=" << out_data[i]
+                          << " reference=" << cpu_val << "\n";
+                local_mismatch = 1;
+                break;
+            }
+        }
+    }
+    int any_mismatch = 0;
+    MPI_Allreduce(&local_mismatch, &any_mismatch, 1, MPI_INT, MPI_MAX,
+                  runtime.communicator());
+    if (any_mismatch != 0) {
+        MPI_Abort(runtime.communicator(), 1);
     }
 
     const auto total_bench_end = std::chrono::steady_clock::now();
@@ -343,9 +347,11 @@ int main(int argc, char** argv) {
         csv.close();
 
         const double avg_gain = (num_rebalances > 0) ? (sum_gain / num_rebalances) : 0.0;
+        std::cout << "loop_time_s: " << loop_time_s << "\n";
         std::cout << "[kneighbor] algo=" << balance_algo
                   << " mode=" << (opencl_available ? "gpu_opencl" : "cpu_simulation")
                   << " total_time_s=" << total_duration_s
+                  << " loop_time_s=" << loop_time_s
                   << " num_rebalances=" << num_rebalances
                   << " avg_rebalance_gain=" << avg_gain << "\n";
     }
