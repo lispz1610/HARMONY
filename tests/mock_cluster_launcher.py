@@ -7,7 +7,10 @@ and balance-metrics logs without requiring live GPUs or PBS.
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+from datetime import datetime
 
 
 def parse_args(argv):
@@ -21,6 +24,8 @@ def parse_args(argv):
                 "test_async_halo_opencl",
                 "kneighbor",
                 "leanmd",
+                "telemetry",
+                "nvidia-smi",
             )
         ):
             binary_index = i
@@ -189,9 +194,46 @@ def simulate_benchmark(binary_name, target_args):
     sys.exit(0)
 
 
+def simulate_telemetry(target_args):
+    """Simulates multi-rank hardware telemetry output across 2 ranks/hosts."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # If mock or real nvidia-smi is in PATH, query it to preserve exact query expectations
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            res = subprocess.run(
+                [
+                    smi,
+                    "--query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active",
+                    "--format=csv,noheader,nounits",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            if lines:
+                sys.stdout.write(f"compute-1-0, 0, {lines[0]}\n")
+                line1 = lines[1] if len(lines) > 1 else lines[0]
+                sys.stdout.write(f"compute-1-1, 1, {line1}\n")
+                sys.exit(0)
+        except Exception:
+            pass
+
+    # Default mock telemetry across 2 ranks/hosts
+    sys.stdout.write(f"compute-1-0, 0, {now}, NVIDIA A100-PCIE-40GB, 38, 12, 1410, 1215, 78.42, [N/A]\n")
+    sys.stdout.write(f"compute-1-1, 1, {now}, NVIDIA A100-PCIE-40GB, 42, 18, 1410, 1215, 82.10, [N/A]\n")
+    sys.exit(0)
+
+
 def main():
     binary, target_args = parse_args(sys.argv[1:])
     if not binary:
+        # Check if telemetry requested via flags
+        if any("telemetry" in a or "nvidia-smi" in a for a in sys.argv[1:]):
+            simulate_telemetry([])
         sys.stderr.write("mock_cluster_launcher: No executable binary specified\n")
         sys.exit(1)
 
@@ -202,6 +244,8 @@ def main():
         simulate_test_async_halo(target_args)
     elif "kneighbor" in binary_name or "leanmd" in binary_name:
         simulate_benchmark(binary_name, target_args)
+    elif "telemetry" in binary_name or "nvidia-smi" in binary_name or any("telemetry" in a for a in sys.argv[1:]):
+        simulate_telemetry(target_args)
     else:
         # Generic successful exit for other test executables
         sys.stdout.write(f"Mock execution for {binary_name} succeeded.\n")

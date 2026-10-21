@@ -150,6 +150,77 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertAlmostEqual(records[1]["power_draw_w"], 210.50)
         self.assertEqual(records[1]["utilization_gpu_pct"], 98)
 
+    def test_parse_multi_node_hardware_telemetry(self):
+        """Parses multi-node hardware_telemetry.log tagged with host and rank."""
+        telemetry_file = self.output_dir / "hardware_telemetry.log"
+        telemetry_file.write_text(
+            "host, rank, timestamp, name, temperature.gpu, utilization.gpu, clocks.current.graphics, clocks.current.memory, power.draw, clocks_throttle_reasons.active\n"
+            "compute-1-0, 0, 2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 12, 1410, 1215, 64.20, [N/A]\n"
+            "compute-1-1, 1, 2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 42, 18, 1410, 1215, 78.50, [N/A]\n",
+            encoding="utf-8"
+        )
+        records = asm.parse_hardware_telemetry(telemetry_file)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["host"], "compute-1-0")
+        self.assertEqual(records[0]["rank"], 0)
+        self.assertEqual(records[0]["temperature_gpu"], 38)
+        self.assertEqual(records[0]["utilization_gpu_pct"], 12)
+        self.assertEqual(records[0]["clocks_graphics_mhz"], 1410)
+        self.assertEqual(records[0]["clocks_memory_mhz"], 1215)
+        self.assertAlmostEqual(records[0]["power_draw_w"], 64.20)
+
+        self.assertEqual(records[1]["host"], "compute-1-1")
+        self.assertEqual(records[1]["rank"], 1)
+        self.assertEqual(records[1]["temperature_gpu"], 42)
+        self.assertEqual(records[1]["utilization_gpu_pct"], 18)
+        self.assertEqual(records[1]["clocks_graphics_mhz"], 1410)
+        self.assertEqual(records[1]["clocks_memory_mhz"], 1215)
+        self.assertAlmostEqual(records[1]["power_draw_w"], 78.50)
+
+    def test_multi_node_telemetry_in_json_and_report(self):
+        """Preserves host and rank in hardware_telemetry.json and generates per-node report summaries."""
+        telemetry_file = self.output_dir / "hardware_telemetry.log"
+        telemetry_file.write_text(
+            "compute-1-0, 0, 2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 12, 1410, 1215, 64.20, [N/A]\n"
+            "compute-1-1, 1, 2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 42, 18, 1410, 1215, 78.50, [N/A]\n",
+            encoding="utf-8"
+        )
+        runs = [
+            {
+                "benchmark": "kneighbor",
+                "algo": "erad",
+                "seed": 42,
+                "repetition": 1,
+                "stage": "matrix",
+                "wall_s": 3.74,
+                "step_sum_s": 2.74,
+                "unaccounted_s": 1.00,
+                "rebalance_count": 9,
+                "status": "SUCCESS",
+            }
+        ]
+        asm.generate_artifacts(self.output_dir, runs)
+
+        # 1. Check hardware_telemetry.json
+        telemetry_json = self.output_dir / "hardware_telemetry.json"
+        self.assertTrue(telemetry_json.exists())
+        with open(telemetry_json, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[0]["host"], "compute-1-0")
+        self.assertEqual(data[0]["rank"], 0)
+        self.assertEqual(data[1]["host"], "compute-1-1")
+        self.assertEqual(data[1]["rank"], 1)
+
+        # 2. Check SUPER_JOB_REPORT.md
+        report_md = self.output_dir / "SUPER_JOB_REPORT.md"
+        self.assertTrue(report_md.exists())
+        content = report_md.read_text(encoding="utf-8")
+        self.assertIn("compute-1-0", content)
+        self.assertIn("compute-1-1", content)
+        self.assertIn("Hardware Telemetry by Node & Rank", content)
+        self.assertIn("Inter-Node Thermal Stability", content)
+
     def test_telemetry_parsing_creates_hardware_telemetry_json(self):
         """Hardware telemetry parsing creates hardware_telemetry.json with distinct graphics/memory clocks and power."""
         telemetry_file = self.output_dir / "hardware_telemetry.log"

@@ -274,7 +274,7 @@ def parse_csv_file(csv_path: Path):
 def parse_hardware_telemetry(telemetry_path: Path):
     """
     Parses hardware_telemetry.log into structured telemetry records.
-    Handles nvidia-smi CSV formatting with or without units.
+    Handles multi-node (host/rank tagged) and legacy nvidia-smi CSV formatting.
     """
     if not telemetry_path.exists():
         return []
@@ -287,35 +287,70 @@ def parse_hardware_telemetry(telemetry_path: Path):
         if not lines:
             return []
 
-        # Check for CSV header or raw data
+        def clean_num(val_str):
+            m = re.search(r"([0-9.]+)", val_str)
+            return float(m.group(1)) if m else 0.0
+
+        def clean_int(val_str):
+            m = re.search(r"(\d+)", val_str)
+            return int(m.group(1)) if m else 0
+
         for line in lines:
+            if line.startswith("#"):
+                continue
+
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 2:
                 continue
-            # Skip header if present
-            if any("timestamp" in p.lower() or "name" in p.lower() for p in parts):
+
+            # Skip header lines if present
+            if any(p.lower() in ("timestamp", "timestamp.gpu", "name", "utilization.gpu", "clocks.current.graphics") for p in parts):
+                continue
+            if parts[0].lower() in ("host", "timestamp"):
                 continue
 
-            # Standard fields: timestamp, name, temp, util_gpu, clocks_graphics, clocks_memory, power, throttle_reasons
-            timestamp = parts[0]
-            name = parts[1] if len(parts) > 1 else ""
+            host = None
+            rank = None
 
-            def clean_num(val_str):
-                m = re.search(r"([0-9.]+)", val_str)
-                return float(m.group(1)) if m else 0.0
-
-            def clean_int(val_str):
-                m = re.search(r"(\d+)", val_str)
-                return int(m.group(1)) if m else 0
-
-            temp = clean_int(parts[2]) if len(parts) > 2 else 0
-            util_gpu = clean_int(parts[3]) if len(parts) > 3 else 0
-            clocks_graphics = clean_int(parts[4]) if len(parts) > 4 else 0
-            clocks_memory = clean_int(parts[5]) if len(parts) > 5 else 0
-            power = clean_num(parts[6]) if len(parts) > 6 else 0.0
-            throttle = ", ".join(parts[7:]).strip() if len(parts) > 7 else ""
+            # Detect format based on column counts and rank/timestamp structure
+            # Multi-node format (10+ cols): host, rank, timestamp, name, temp, util, gfx_clock, mem_clock, power, throttle
+            if len(parts) >= 10 and re.match(r"^\d+$", parts[1]):
+                host = parts[0]
+                rank = int(parts[1])
+                timestamp = parts[2]
+                name = parts[3]
+                temp = clean_int(parts[4])
+                util_gpu = clean_int(parts[5])
+                clocks_graphics = clean_int(parts[6])
+                clocks_memory = clean_int(parts[7])
+                power = clean_num(parts[8])
+                throttle = ", ".join(parts[9:]).strip()
+            elif len(parts) >= 9 and re.search(r"\d{4}[-/]", parts[1]):
+                # Host without rank (9 cols): host, timestamp, name, temp, util, gfx_clock, mem_clock, power, throttle
+                host = parts[0]
+                rank = None
+                timestamp = parts[1]
+                name = parts[2]
+                temp = clean_int(parts[3])
+                util_gpu = clean_int(parts[4])
+                clocks_graphics = clean_int(parts[5])
+                clocks_memory = clean_int(parts[6])
+                power = clean_num(parts[7])
+                throttle = ", ".join(parts[8:]).strip()
+            else:
+                # Legacy 8-col format: timestamp, name, temp, util, gfx_clock, mem_clock, power, throttle
+                timestamp = parts[0]
+                name = parts[1] if len(parts) > 1 else ""
+                temp = clean_int(parts[2]) if len(parts) > 2 else 0
+                util_gpu = clean_int(parts[3]) if len(parts) > 3 else 0
+                clocks_graphics = clean_int(parts[4]) if len(parts) > 4 else 0
+                clocks_memory = clean_int(parts[5]) if len(parts) > 5 else 0
+                power = clean_num(parts[6]) if len(parts) > 6 else 0.0
+                throttle = ", ".join(parts[7:]).strip() if len(parts) > 7 else ""
 
             records.append({
+                "host": host,
+                "rank": rank,
                 "timestamp": timestamp,
                 "name": name,
                 "temperature_gpu": temp,
@@ -1036,6 +1071,13 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
             for dev in ld.get("devices", []):
                 devices.add(dev["name"])
 
+    if telemetry_records:
+        for tr in telemetry_records:
+            if tr.get("host"):
+                hosts.add(tr["host"])
+            if tr.get("name") and tr["name"] != "placeholder":
+                devices.add(tr["name"])
+
     devices_str = ", ".join(sorted(devices)) if devices else "NVIDIA A100 80GB PCIe (recovered / probed)"
     hosts_str = ", ".join(sorted(hosts)) if hosts else "PBS compute allocation"
 
@@ -1211,11 +1253,94 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
     # Section 7: Telemetry Summary
     if telemetry_records:
         md.append("## 7. Hardware Telemetry & Environmental Stability\n")
+
+        # Group by (host, rank)
+        node_groups = {}
+        for r in telemetry_records:
+            h = r.get("host")
+            rk = r.get("rank")
+            key = (h, rk)
+            if key not in node_groups:
+                node_groups[key] = []
+            node_groups[key].append(r)
+
+        has_node_info = any(h is not None or rk is not None for (h, rk) in node_groups.keys())
+
+        if has_node_info:
+            md.append("### Hardware Telemetry by Node & Rank\n")
+            md.append("| Host | Rank | Device | Samples | Temp (°C) Min/Mean/Max | Power (W) Min/Mean/Max | Graphics Clock (MHz) Min/Mean/Max | Memory Clock (MHz) Min/Mean/Max | Throttle Reasons |")
+            md.append("|---|---:|---|---:|---:|---:|---:|---:|---|")
+
+            sorted_keys = sorted(
+                node_groups.keys(),
+                key=lambda k: (str(k[0] or ""), k[1] if isinstance(k[1], int) else -1)
+            )
+
+            for h, rk in sorted_keys:
+                recs = node_groups[(h, rk)]
+                h_str = str(h) if h is not None else "unknown"
+                rk_str = str(rk) if rk is not None else "N/A"
+                dev_names = {r["name"] for r in recs if r.get("name") and r["name"] != "placeholder"}
+                dev_str = ", ".join(sorted(dev_names)) if dev_names else "placeholder"
+
+                t_list = [r["temperature_gpu"] for r in recs if r.get("temperature_gpu")]
+                p_list = [r["power_draw_w"] for r in recs if r.get("power_draw_w")]
+                g_list = [r["clocks_graphics_mhz"] for r in recs if r.get("clocks_graphics_mhz")]
+                m_list = [r["clocks_memory_mhz"] for r in recs if r.get("clocks_memory_mhz")]
+
+                t_str = f"{min(t_list)} / {statistics.mean(t_list):.1f} / {max(t_list)}" if t_list else "N/A"
+                p_str = f"{min(p_list):.1f} / {statistics.mean(p_list):.1f} / {max(p_list):.1f}" if p_list else "N/A"
+                g_str = f"{min(g_list)} / {statistics.mean(g_list):.0f} / {max(g_list)}" if g_list else "N/A"
+                m_str = f"{min(m_list)} / {statistics.mean(m_list):.0f} / {max(m_list)}" if m_list else "N/A"
+
+                throttle_set = {
+                    r["throttle_reasons"]
+                    for r in recs
+                    if r.get("throttle_reasons") and r["throttle_reasons"] not in ("", "[N/A]", "0x0000000000000000", "None")
+                }
+                th_str = ", ".join(sorted(throttle_set)) if throttle_set else "None"
+
+                md.append(f"| {h_str} | {rk_str} | {dev_str} | {len(recs)} | {t_str} | {p_str} | {g_str} | {m_str} | {th_str} |")
+
+            md.append("")
+
+            # Thermal / clock difference check across nodes
+            if len(sorted_keys) >= 2:
+                temp_means = {}
+                clock_means = {}
+                for k in sorted_keys:
+                    recs = node_groups[k]
+                    t_list = [r["temperature_gpu"] for r in recs if r.get("temperature_gpu")]
+                    g_list = [r["clocks_graphics_mhz"] for r in recs if r.get("clocks_graphics_mhz")]
+                    if t_list:
+                        temp_means[k] = statistics.mean(t_list)
+                    if g_list:
+                        clock_means[k] = statistics.mean(g_list)
+
+                if temp_means:
+                    min_k = min(temp_means, key=temp_means.get)
+                    max_k = max(temp_means, key=temp_means.get)
+                    delta_t = temp_means[max_k] - temp_means[min_k]
+                    md.append(f"- **Inter-Node Thermal Stability:** Mean temperature spread across nodes is {delta_t:.1f}°C (coolest: `{min_k[0]}` rank {min_k[1]} at {temp_means[min_k]:.1f}°C, warmest: `{max_k[0]}` rank {max_k[1]} at {temp_means[max_k]:.1f}°C).")
+
+                if clock_means:
+                    min_g = min(clock_means, key=clock_means.get)
+                    max_g = max(clock_means, key=clock_means.get)
+                    delta_g = clock_means[max_g] - clock_means[min_g]
+                    if delta_g < 15:
+                        md.append(f"- **Clock Uniformity:** GPU graphics clocks remained uniform across all nodes (spread: {delta_g:.0f} MHz).")
+                    else:
+                        md.append(f"- **Clock Divergence:** Graphics clock discrepancy detected between nodes: {delta_g:.0f} MHz difference (`{min_g[0]}` vs `{max_g[0]}`).")
+                md.append("")
+
+        # Aggregate Metrics Table
         temps = [r["temperature_gpu"] for r in telemetry_records if r.get("temperature_gpu")]
         powers = [r["power_draw_w"] for r in telemetry_records if r.get("power_draw_w")]
         gfx_clocks = [r["clocks_graphics_mhz"] for r in telemetry_records if r.get("clocks_graphics_mhz")]
         mem_clocks = [r["clocks_memory_mhz"] for r in telemetry_records if r.get("clocks_memory_mhz")]
 
+        if has_node_info:
+            md.append("### Aggregate Cluster Metrics\n")
         md.append("| Metric | Min | Mean | Max |")
         md.append("|---|---:|---:|---:|")
         if temps:

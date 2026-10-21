@@ -468,6 +468,60 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         self.assertIn("NVIDIA A100-PCIE-40GB", content)
         self.assertIn("78.42", content)
 
+    def test_hardware_telemetry_multinode_mock_launcher(self):
+        """Mock launcher queries telemetry across both allocated nodes (compute-1-0 and compute-1-1)."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script([
+            "--bin-dir", self.bin_dir,
+            "--output-dir", self.out_dir,
+            "--n", "64",
+            "--iterations", "2",
+            "--seeds", "42",
+            "--launcher", launcher_cmd,
+        ])
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        telem_file = os.path.join(self.out_dir, "hardware_telemetry.log")
+        with open(telem_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("compute-1-0", content)
+        self.assertIn("compute-1-1", content)
+        # Verify rank tagging
+        self.assertIn("compute-1-0, 0,", content)
+        self.assertIn("compute-1-1, 1,", content)
+
+    def test_hardware_telemetry_pbs_nodefile(self):
+        """When launcher is not set but PBS_NODEFILE is provided, records telemetry for each node in file."""
+        self._create_dummy_binaries()
+        nodefile = os.path.join(self.temp_dir, "pbs_nodes")
+        with open(nodefile, "w", encoding="utf-8") as f:
+            f.write("compute-1-0\ncompute-1-1\n")
+
+        # Pass empty or non-matching launcher flag override
+        proc = self._run_script(
+            [
+                "--bin-dir", self.bin_dir,
+                "--output-dir", self.out_dir,
+                "--n", "64",
+                "--iterations", "2",
+                "--seeds", "42",
+                "--skip-preflight",
+            ],
+            env={"PBS_NODEFILE": nodefile, "MPI_LAUNCHER": ""},
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        telem_file = os.path.join(self.out_dir, "hardware_telemetry.log")
+        with open(telem_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("compute-1-0", content)
+        self.assertIn("compute-1-1", content)
+        self.assertIn("compute-1-0, 0,", content)
+        self.assertIn("compute-1-1, 1,", content)
+
     def test_fault_tolerance_sample_failure_continues_remaining_runs(self):
         """When mock launcher fails on one run, runner logs failure and continues remaining runs."""
         self._create_dummy_binaries()
@@ -579,6 +633,55 @@ class TestSuperMatrixDryRun(unittest.TestCase):
             "timeout 60s" in script_text,
             "Expected preflight halo test wrapped with timeout 60s"
         )
+
+    def test_multinode_telemetry_dryrun_e2e_analysis(self):
+        """End-to-end integration: runner captures multi-node telemetry and analyzer produces json & report."""
+        self._create_dummy_binaries()
+        launcher_cmd = f"python3 {self.mock_launcher_path}"
+        proc = self._run_script([
+            "--bin-dir", self.bin_dir,
+            "--output-dir", self.out_dir,
+            "--n", "32",
+            "--iterations", "2",
+            "--seeds", "42",
+            "--launcher", launcher_cmd,
+            "--skip-preflight",
+        ])
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+
+        # Run analyzer
+        analyzer_script = os.path.join(self.root_dir, "benchmarks", "analyze_super_matrix.py")
+        res = subprocess.run(
+            ["python3", analyzer_script, "--output-dir", self.out_dir],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Analyzer failed: {res.stderr}\n{res.stdout}")
+
+        # Check hardware_telemetry.json
+        telemetry_json = os.path.join(self.out_dir, "hardware_telemetry.json")
+        self.assertTrue(os.path.isfile(telemetry_json), "hardware_telemetry.json not found")
+        with open(telemetry_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        hosts = {entry.get("host") for entry in data}
+        ranks = {entry.get("rank") for entry in data}
+        self.assertIn("compute-1-0", hosts)
+        self.assertIn("compute-1-1", hosts)
+        self.assertIn(0, ranks)
+        self.assertIn(1, ranks)
+
+        # Check SUPER_JOB_REPORT.md
+        report_md = os.path.join(self.out_dir, "SUPER_JOB_REPORT.md")
+        self.assertTrue(os.path.isfile(report_md), "SUPER_JOB_REPORT.md not found")
+        with open(report_md, "r", encoding="utf-8") as f:
+            report_text = f.read()
+
+        self.assertIn("compute-1-0", report_text)
+        self.assertIn("compute-1-1", report_text)
+        self.assertIn("Hardware Telemetry by Node & Rank", report_text)
+        self.assertIn("Aggregate Cluster Metrics", report_text)
 
 
 if __name__ == "__main__":

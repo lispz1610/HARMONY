@@ -208,7 +208,9 @@ Stage 5: Post-Processing & Telemetry
 fi
 
 # Configure launcher
-if [[ -n "$mpi_launcher" ]]; then
+if [[ "$mpi_launcher" == "none" ]]; then
+    launcher_cmd=()
+elif [[ -n "$mpi_launcher" ]]; then
     read -r -a launcher_cmd <<< "$mpi_launcher"
 elif command -v prun >/dev/null 2>&1; then
     launcher_cmd=("prun")
@@ -232,12 +234,74 @@ record_telemetry() {
     local now
     now="$(date -u +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")"
     echo "# [telemetry] block=${block_name} timestamp=${now}" >> "$telem_file"
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        if ! nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits >> "$telem_file" 2>/dev/null; then
-            echo "${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi query failed for block ${block_name})" >> "$telem_file"
+
+    local probed=0
+
+    # 1. Query telemetry across all participating ranks/nodes via configured launcher
+    if [[ ${#launcher_cmd[@]} -gt 0 ]]; then
+        local probe_script="${script_dir}/telemetry_probe.sh"
+        local probe_out=""
+        if probe_out=$("${launcher_cmd[@]}" "$probe_script" 2>/dev/null) && [[ -n "$probe_out" ]]; then
+            if [[ -n "${PBS_NODEFILE:-}" && -f "${PBS_NODEFILE:-}" ]]; then
+                local all_found=1
+                while IFS= read -r node || [[ -n "$node" ]]; do
+                    node="$(echo "$node" | tr -d '[:space:]')"
+                    [[ -z "$node" ]] && continue
+                    if ! echo "$probe_out" | grep -Fq "$node"; then
+                        all_found=0
+                        break
+                    fi
+                done < "$PBS_NODEFILE"
+                if [[ $all_found -eq 1 ]]; then
+                    echo "$probe_out" >> "$telem_file"
+                    probed=1
+                fi
+            else
+                echo "$probe_out" >> "$telem_file"
+                probed=1
+            fi
         fi
-    else
-        echo "${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi not available for block ${block_name})" >> "$telem_file"
+    fi
+
+    # 2. Check $PBS_NODEFILE if present and not yet probed
+    if [[ $probed -eq 0 && -n "${PBS_NODEFILE:-}" && -f "${PBS_NODEFILE:-}" ]]; then
+        local rank=0
+        while IFS= read -r node || [[ -n "$node" ]]; do
+            node="$(echo "$node" | tr -d '[:space:]')"
+            [[ -z "$node" ]] && continue
+            if [[ $rank -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1; then
+                local smi_out=""
+                if smi_out=$(nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$smi_out" ]]; then
+                    while IFS= read -r line; do
+                        [[ -n "$line" ]] && echo "${node}, ${rank}, ${line}" >> "$telem_file"
+                    done <<< "$smi_out"
+                    probed=1
+                fi
+            fi
+            if [[ $rank -gt 0 || $probed -eq 0 ]]; then
+                echo "${node}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (telemetry queried via PBS_NODEFILE for block ${block_name})" >> "$telem_file"
+                probed=1
+            fi
+            rank=$((rank + 1))
+        done < "$PBS_NODEFILE"
+    fi
+
+    # 3. Graceful fallback to local nvidia-smi or placeholder
+    if [[ $probed -eq 0 ]]; then
+        local host
+        host="$(hostname -s 2>/dev/null || hostname)"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            local smi_out=""
+            if smi_out=$(nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$smi_out" ]]; then
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] && echo "${host}, 0, ${line}" >> "$telem_file"
+                done <<< "$smi_out"
+            else
+                echo "${host}, 0, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi query failed for block ${block_name})" >> "$telem_file"
+            fi
+        else
+            echo "${host}, 0, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (nvidia-smi not available for block ${block_name})" >> "$telem_file"
+        fi
     fi
 }
 
