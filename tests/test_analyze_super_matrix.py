@@ -221,6 +221,37 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertIn("Hardware Telemetry by Node & Rank", content)
         self.assertIn("Inter-Node Thermal Stability", content)
 
+    def test_unavailable_telemetry_marker_is_reported_not_dropped(self):
+        """An UNAVAILABLE marker from the runner yields an explicit unavailable record and report row."""
+        telemetry_file = self.output_dir / "hardware_telemetry.log"
+        telemetry_file.write_text(
+            "# [telemetry] block=before_warmup timestamp=2026-10-20 22:00:00\n"
+            "compute-1-0, 0, 2026/10/20 22:00:00.000, NVIDIA A100 80GB PCIe, 38, 12, 1410, 1215, 64.20, [N/A]\n"
+            "# [telemetry-unavailable] host=compute-1-1 rank=1 block=before_warmup reason=no ssh-free path to remote node\n",
+            encoding="utf-8",
+        )
+        records = asm.parse_hardware_telemetry(telemetry_file)
+        unavailable = [r for r in records if r.get("host") == "compute-1-1"]
+        self.assertEqual(len(unavailable), 1)
+        self.assertEqual(unavailable[0]["rank"], 1)
+        self.assertFalse(unavailable[0]["available"])
+        self.assertIn("no ssh-free path", unavailable[0]["unavailable_reason"])
+        self.assertTrue([r for r in records if r["host"] == "compute-1-0"][0]["available"])
+
+        runs = [{
+            "benchmark": "kneighbor", "algo": "erad", "seed": 42, "repetition": 1, "stage": "matrix",
+            "wall_s": 3.74, "step_sum_s": 2.74, "unaccounted_s": 1.0, "rebalance_count": 9, "status": "SUCCESS",
+        }]
+        asm.generate_artifacts(self.output_dir, runs)
+        with open(self.output_dir / "hardware_telemetry.json", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("compute-1-1", {r["host"] for r in data})
+        content = (self.output_dir / "SUPER_JOB_REPORT.md").read_text(encoding="utf-8")
+        row = next(l for l in content.splitlines() if l.startswith("| compute-1-1 |"))
+        self.assertIn("UNAVAILABLE", row)
+        # Unavailable samples must not contaminate aggregate statistics (zero temperature etc.).
+        self.assertNotIn("| GPU Temperature (°C) | 0", content)
+
     def test_telemetry_parsing_creates_hardware_telemetry_json(self):
         """Hardware telemetry parsing creates hardware_telemetry.json with distinct graphics/memory clocks and power."""
         telemetry_file = self.output_dir / "hardware_telemetry.log"

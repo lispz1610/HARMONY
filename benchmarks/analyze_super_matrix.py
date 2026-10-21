@@ -296,6 +296,27 @@ def parse_hardware_telemetry(telemetry_path: Path):
             return int(m.group(1)) if m else 0
 
         for line in lines:
+            if line.startswith("# [telemetry-unavailable]"):
+                # Explicit marker from the runner: this node's telemetry could not be collected.
+                host_m = re.search(r"host=(\S+)", line)
+                rank_m = re.search(r"rank=(\d+)", line)
+                reason_m = re.search(r"reason=(.*)$", line)
+                records.append({
+                    "host": host_m.group(1) if host_m else None,
+                    "rank": int(rank_m.group(1)) if rank_m else None,
+                    "timestamp": "",
+                    "name": "",
+                    "temperature_gpu": 0,
+                    "utilization_gpu_pct": 0,
+                    "clocks_graphics_mhz": 0,
+                    "clocks_memory_mhz": 0,
+                    "power_draw_w": 0.0,
+                    "throttle_reasons": "",
+                    "available": False,
+                    "unavailable_reason": reason_m.group(1).strip() if reason_m else "unknown",
+                })
+                continue
+
             if line.startswith("#"):
                 continue
 
@@ -361,6 +382,7 @@ def parse_hardware_telemetry(telemetry_path: Path):
                 "clocks_memory_mhz": clocks_memory,
                 "power_draw_w": power,
                 "throttle_reasons": throttle,
+                "available": True,
             })
     except Exception:
         return []
@@ -1342,9 +1364,14 @@ def generate_markdown_report(report_path: Path, runs, paired, telemetry_records,
             )
 
             for h, rk in sorted_keys:
-                recs = node_groups[(h, rk)]
+                all_recs = node_groups[(h, rk)]
+                recs = [r for r in all_recs if r.get("available", True)]
                 h_str = str(h) if h is not None else "unknown"
                 rk_str = str(rk) if rk is not None else "N/A"
+                if not recs:
+                    reasons = sorted({r.get("unavailable_reason", "unknown") for r in all_recs})
+                    md.append(f"| {h_str} | {rk_str} | UNAVAILABLE ({'; '.join(reasons)}) | 0 | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE |")
+                    continue
                 dev_names = {r["name"] for r in recs if r.get("name") and r["name"] != "placeholder"}
                 dev_str = ", ".join(sorted(dev_names)) if dev_names else "placeholder"
 

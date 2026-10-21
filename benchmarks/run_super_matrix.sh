@@ -264,22 +264,29 @@ record_telemetry() {
         fi
     fi
 
-    # 2. Check $PBS_NODEFILE if present and not yet probed
+    # 2. Check $PBS_NODEFILE if present and not yet probed.
+    # Only nodes this shell can reach without ssh (rank 0 and the local host) are queried;
+    # every other node gets an explicit "telemetry-unavailable" marker instead of a fake sample.
     if [[ $probed -eq 0 && -n "${PBS_NODEFILE:-}" && -f "${PBS_NODEFILE:-}" ]]; then
         local rank=0
+        local local_host
+        local_host="$(hostname -s 2>/dev/null || hostname)"
         while IFS= read -r node || [[ -n "$node" ]]; do
             node="$(echo "$node" | tr -d '[:space:]')"
             [[ -z "$node" ]] && continue
             local node_clean="${node%\[*\]}"
-            if [[ $rank -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1; then
-                local smi_out=""
-                if smi_out=$(nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$smi_out" ]]; then
-                    while IFS= read -r line; do
-                        [[ -n "$line" ]] && echo "${node_clean}, ${rank}, ${line}" >> "$telem_file"
-                    done <<< "$smi_out"
-                    local apps_out=""
-                    apps_out=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
-                    if [[ -n "$apps_out" ]]; then
+            local node_short="${node_clean%%.*}"
+            local node_probed=0
+            local unavailable_reason="no ssh-free path to query nvidia-smi on a non-local node (launcher telemetry probe failed or did not cover it)"
+            if [[ $rank -eq 0 || "$node_short" == "$local_host" ]]; then
+                if command -v nvidia-smi >/dev/null 2>&1; then
+                    local smi_out=""
+                    if smi_out=$(nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gpu,clocks.current.graphics,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$smi_out" ]]; then
+                        while IFS= read -r line; do
+                            [[ -n "$line" ]] && echo "${node_clean}, ${rank}, ${line}" >> "$telem_file"
+                        done <<< "$smi_out"
+                        local apps_out=""
+                        apps_out=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
                         local apps_found=0
                         while IFS= read -r app_line; do
                             if [[ -n "$app_line" ]] && [[ "$app_line" != *"NVIDIA"* ]]; then
@@ -290,17 +297,18 @@ record_telemetry() {
                         if [[ $apps_found -eq 0 ]]; then
                             echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
                         fi
+                        node_probed=1
                     else
-                        echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
+                        unavailable_reason="nvidia-smi query failed on the local node"
                     fi
-                    probed=1
+                else
+                    unavailable_reason="nvidia-smi not available on the local node"
                 fi
             fi
-            if [[ $rank -gt 0 || $probed -eq 0 ]]; then
-                echo "${node_clean}, ${rank}, ${now}, placeholder, N/A, N/A, N/A, N/A, N/A, [N/A] (telemetry queried via PBS_NODEFILE for block ${block_name})" >> "$telem_file"
-                echo "# [compute-apps] host=${node_clean} rank=${rank} shared_workload=none" >> "$telem_file"
-                probed=1
+            if [[ $node_probed -eq 0 ]]; then
+                echo "# [telemetry-unavailable] host=${node_clean} rank=${rank} block=${block_name} reason=${unavailable_reason}" >> "$telem_file"
             fi
+            probed=1
             rank=$((rank + 1))
         done < "$PBS_NODEFILE"
     fi

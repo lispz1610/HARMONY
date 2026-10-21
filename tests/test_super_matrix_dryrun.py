@@ -467,6 +467,55 @@ class TestSuperMatrixDryRun(unittest.TestCase):
         self.assertIn("rep", content)
         self.assertIn("aba", content)
 
+    def _run_with_telemetry_probe_failing(self, nodes):
+        """Runs the runner with a launcher whose telemetry probe fails, forcing the PBS_NODEFILE fallback."""
+        self._create_dummy_binaries()
+        mock_bin_dir = os.path.join(self.temp_dir, "mock_smi_dir")
+        os.makedirs(mock_bin_dir, exist_ok=True)
+        mock_smi = os.path.join(mock_bin_dir, "nvidia-smi")
+        with open(mock_smi, "w", encoding="utf-8") as f:
+            f.write(
+                '#!/bin/sh\n'
+                'echo "2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB, 38, 12, 1410, 1215, 78.42, [N/A]"\n'
+            )
+        os.chmod(mock_smi, os.stat(mock_smi).st_mode | stat.S_IEXEC)
+
+        wrapper = os.path.join(self.temp_dir, "failing_telemetry_launcher.sh")
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write(
+                '#!/bin/sh\n'
+                'case "$*" in *telemetry_probe*) exit 1;; esac\n'
+                f'exec python3 "{self.mock_launcher_path}" "$@"\n'
+            )
+        os.chmod(wrapper, 0o755)
+
+        nodefile = os.path.join(self.temp_dir, "nodefile")
+        with open(nodefile, "w", encoding="utf-8") as f:
+            f.write("\n".join(nodes) + "\n")
+
+        proc = self._run_script(
+            ["--bin-dir", self.bin_dir, "--output-dir", self.out_dir, "--n", "32",
+             "--iterations", "2", "--seeds", "42", "--launcher", wrapper, "--skip-preflight"],
+            env={"PATH": f"{mock_bin_dir}:{os.environ.get('PATH', '')}", "PBS_NODEFILE": nodefile},
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}\n{proc.stdout}")
+        with open(os.path.join(self.out_dir, "hardware_telemetry.log"), "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_nodefile_fallback_marks_remote_rank_telemetry_unavailable(self):
+        """Remote rank>0 nodes cannot be queried without ssh: an explicit UNAVAILABLE marker with reason is logged."""
+        content = self._run_with_telemetry_probe_failing(["remote-node-a", "remote-node-b"])
+        self.assertIn("remote-node-a, 0, 2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB", content)
+        self.assertIn("# [telemetry-unavailable] host=remote-node-b rank=1 block=before_warmup reason=", content)
+        self.assertNotIn("remote-node-b, 1, ", content, "no fabricated placeholder sample row for remote node")
+
+    def test_nodefile_fallback_collects_real_nvidia_smi_for_local_rank_gt_0(self):
+        """When the rank>0 node is the local host, real nvidia-smi output is collected for it."""
+        local_host = subprocess.run(["hostname", "-s"], stdout=subprocess.PIPE, text=True).stdout.strip()
+        content = self._run_with_telemetry_probe_failing(["remote-node-a", local_host])
+        self.assertIn(f"{local_host}, 1, 2026/10/20 22:00:00.000, NVIDIA A100-PCIE-40GB", content)
+        self.assertNotIn("telemetry-unavailable", content)
+
     def test_hardware_telemetry_with_mock_nvidia_smi(self):
         """Verify hardware_telemetry queries nvidia-smi with exact query flags when available."""
         self._create_dummy_binaries()
