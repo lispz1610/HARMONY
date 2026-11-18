@@ -12,10 +12,15 @@ The default set of triage labels (`needs-triage`, `needs-info`, `ready-for-agent
 
 This is a single-context repository (`GLOSSARY.md` + `docs/adr/` at the repo root). See `docs/agents/domain.md`.
 
+### Runtime layout & core freeze
+
+- Public runtime API headers live under `include/harmony/` (`namespace harmony`) and implementation sources under `src/`, compiled into `lib/libharmony.a`, `bin/`, and `tests/bin/` via `./build.sh all`.
+- Layer 2 evaluation and validation harnesses (`job_harmony_super.pbs`, `benchmarks/`, `colab/`) MUST NOT modify any files under `include/harmony/` or `src/` (frozen against baseline `c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77`).
+
 ### Coding standards & review
 
 Review standards and artifact conventions are documented in `CODING_STANDARDS.md`.
 
 ### Invariant checks
 
-Run `bash tests/check_invariants.sh` to verify frozen runtime core invariants, unit tests, prebuilt harness, and glossary domain terminology before proposing or merging changes.
+Run `bash tests/check_invariants.sh` to verify frozen runtime core invariants, C++ and Python unit tests, prebuilt benchmark harness guards, and glossary domain terminology before proposing or merging changes.
