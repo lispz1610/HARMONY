@@ -270,7 +270,7 @@ TimingReport Runtime::Impl::timing_report() {
 
     // ---- Processes: phase times and host name of every rank -----------------
     constexpr int kPhases = static_cast<int>(Phase::count);
-    std::vector<double> all_phases(static_cast<std::size_t>(kPhases) * size_);
+    std::vector<double> all_phases(static_cast<std::size_t>(kPhases) * mpi_size_);
     detail::check_mpi(MPI_Allgather(seconds.data(), kPhases, MPI_DOUBLE, all_phases.data(), kPhases, MPI_DOUBLE,
                                     comm_),
                       "MPI_Allgather(phase times)");
@@ -278,12 +278,12 @@ TimingReport Runtime::Impl::timing_report() {
     char host[MPI_MAX_PROCESSOR_NAME] = {};
     int host_len = 0;
     MPI_Get_processor_name(host, &host_len);
-    std::vector<char> hosts(static_cast<std::size_t>(MPI_MAX_PROCESSOR_NAME) * size_);
+    std::vector<char> hosts(static_cast<std::size_t>(MPI_MAX_PROCESSOR_NAME) * mpi_size_);
     detail::check_mpi(MPI_Allgather(host, MPI_MAX_PROCESSOR_NAME, MPI_CHAR, hosts.data(), MPI_MAX_PROCESSOR_NAME,
                                     MPI_CHAR, comm_),
                       "MPI_Allgather(host names)");
 
-    for (int r = 0; r < size_; ++r) {
+    for (int r = 0; r < mpi_size_; ++r) {
         const double* p = &all_phases[static_cast<std::size_t>(r) * kPhases];
         RankReport rr;
         rr.rank = r;
@@ -305,40 +305,74 @@ TimingReport Runtime::Impl::timing_report() {
     }
 
     // ---- Devices: {global index, compute, active} from every rank -----------
-    std::vector<double> local_dev;
-    for (std::size_t d = 0; d < local_devices_.size(); ++d) {
-        local_dev.push_back(static_cast<double>(local_devices_[d].global_index));
-        local_dev.push_back(kernel_busy[d]);
-        local_dev.push_back(active_busy[d]);
-    }
-    std::vector<int> counts(size_), displs(size_);
-    int total = 0;
-    for (int r = 0; r < size_; ++r) {
-        counts[r] = all_device_counts_.empty() ? 0 : all_device_counts_[r] * 3;
-        displs[r] = total;
-        total += counts[r];
-    }
-    std::vector<double> all_dev(static_cast<std::size_t>(total));
-    detail::check_mpi(MPI_Allgatherv(local_dev.data(), static_cast<int>(local_dev.size()), MPI_DOUBLE,
-                                     all_dev.data(), counts.data(), displs.data(), MPI_DOUBLE, comm_),
-                      "MPI_Allgatherv(device times)");
-
-    for (std::size_t i = 0; i + 2 < all_dev.size(); i += 3) {
-        DeviceReport dr;
-        dr.global_index = static_cast<int>(all_dev[i]);
-        dr.compute_seconds = all_dev[i + 1];
-        dr.transfer_seconds = std::max(0.0, all_dev[i + 2] - all_dev[i + 1]);
-        dr.idle_seconds = std::max(0.0, wall - all_dev[i + 2]);
+    if (local_devices_.empty() && simulated_ranks_ > 0 && simulated_ranks_ != mpi_size_) {
         for (const DeviceInfo& info : global_devices_) {
-            if (info.global_index != dr.global_index) continue;
+            DeviceReport dr;
+            dr.global_index = info.global_index;
             dr.rank = info.rank;
             dr.name = info.name;
             dr.kind = info.kind;
+            if (info.rank == rank_ && info.local_index >= 0 &&
+                static_cast<std::size_t>(info.local_index) < kernel_busy.size() &&
+                static_cast<std::size_t>(info.local_index) < active_busy.size()) {
+                const std::size_t li = static_cast<std::size_t>(info.local_index);
+                dr.compute_seconds = kernel_busy[li];
+                dr.transfer_seconds = std::max(0.0, active_busy[li] - kernel_busy[li]);
+                dr.idle_seconds = std::max(0.0, wall - active_busy[li]);
+            } else {
+                dr.idle_seconds = wall;
+            }
+            for (const DevicePartition& p : partitions_) {
+                if (p.device_global_index == dr.global_index) dr.elements = p.element_count;
+            }
+            report.devices.push_back(dr);
         }
-        for (const DevicePartition& p : partitions_) {
-            if (p.device_global_index == dr.global_index) dr.elements = p.element_count;
+    } else {
+        std::vector<double> local_dev;
+        if (!local_devices_.empty()) {
+            for (std::size_t d = 0; d < local_devices_.size(); ++d) {
+                local_dev.push_back(static_cast<double>(local_devices_[d].global_index));
+                local_dev.push_back(d < kernel_busy.size() ? kernel_busy[d] : 0.0);
+                local_dev.push_back(d < active_busy.size() ? active_busy[d] : 0.0);
+            }
+        } else {
+            for (std::size_t d = 0; d < devices_.size(); ++d) {
+                local_dev.push_back(static_cast<double>(devices_[d].global_index));
+                local_dev.push_back(d < kernel_busy.size() ? kernel_busy[d] : 0.0);
+                local_dev.push_back(d < active_busy.size() ? active_busy[d] : 0.0);
+            }
         }
-        report.devices.push_back(dr);
+        std::vector<int> counts(mpi_size_), displs(mpi_size_);
+        int total = 0;
+        for (int r = 0; r < mpi_size_; ++r) {
+            counts[r] = (all_device_counts_.size() == static_cast<std::size_t>(mpi_size_))
+                            ? all_device_counts_[static_cast<std::size_t>(r)] * 3
+                            : 0;
+            displs[r] = total;
+            total += counts[r];
+        }
+        std::vector<double> all_dev(static_cast<std::size_t>(total));
+        detail::check_mpi(MPI_Allgatherv(local_dev.data(), static_cast<int>(local_dev.size()), MPI_DOUBLE,
+                                         all_dev.data(), counts.data(), displs.data(), MPI_DOUBLE, comm_),
+                          "MPI_Allgatherv(device times)");
+
+        for (std::size_t i = 0; i + 2 < all_dev.size(); i += 3) {
+            DeviceReport dr;
+            dr.global_index = static_cast<int>(all_dev[i]);
+            dr.compute_seconds = all_dev[i + 1];
+            dr.transfer_seconds = std::max(0.0, all_dev[i + 2] - all_dev[i + 1]);
+            dr.idle_seconds = std::max(0.0, wall - all_dev[i + 2]);
+            for (const DeviceInfo& info : global_devices_) {
+                if (info.global_index != dr.global_index) continue;
+                dr.rank = info.rank;
+                dr.name = info.name;
+                dr.kind = info.kind;
+            }
+            for (const DevicePartition& p : partitions_) {
+                if (p.device_global_index == dr.global_index) dr.elements = p.element_count;
+            }
+            report.devices.push_back(dr);
+        }
     }
 
     // ---- Critical path: the process of the slowest device ---------------------

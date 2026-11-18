@@ -74,6 +74,10 @@ public:
     // --- devices.cpp --------------------------------------------------------
     void initialize_mpi_from_runtime();
     void discover_devices(const DeviceSelection& selection);
+    void set_simulated_devices_count(int count) noexcept;
+    void set_simulated_ranks_for_testing(int ranks) noexcept;
+    void set_simulated_times(const std::vector<double>& times) noexcept;
+    void clear_simulated_times() noexcept;
     void print_devices(std::ostream& os) const;
 
     const std::vector<DeviceInfo>& devices() const noexcept { return devices_; }
@@ -81,7 +85,7 @@ public:
     const std::vector<DevicePartition>& partitions() const noexcept { return partitions_; }
     const std::vector<DeviceTiming>& device_timings() const noexcept { return device_timings_; }
     int rank() const noexcept { return rank_; }
-    int size() const noexcept { return size_; }
+    int size() const noexcept { return simulated_ranks_ > 0 ? simulated_ranks_ : mpi_size_; }
     MPI_Comm communicator() const noexcept { return comm_; }
 
     // --- resources.cpp ------------------------------------------------------
@@ -241,7 +245,8 @@ private:
     int& argc_;
     char**& argv_;
     int rank_{0};
-    int size_{1};
+    int mpi_size_{1};
+    int simulated_ranks_{0};
     MPI_Comm comm_{MPI_COMM_WORLD};
     MPI_Comm halo_comm_{MPI_COMM_NULL};  // private communicator for halo messages
 
@@ -306,6 +311,8 @@ private:
     bool verbose_{true};
     int balance_attempts_{0};
     bool devices_discovered_{false};
+    bool simulated_devices_{false};
+    std::vector<double> simulated_times_;
 };
 
 } // namespace harmony

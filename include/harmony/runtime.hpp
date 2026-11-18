@@ -158,6 +158,12 @@ public:
     // Rank 0 prints every load-balancing attempt as it happens (default: on).
     void set_verbose(bool verbose);
 
+    // Testing seams (simulated devices/ranks without an OpenCL ICD) ----------
+    void set_simulated_devices_count(int count) noexcept;
+    void set_simulated_ranks_for_testing(int ranks) noexcept;
+    void set_simulated_times(const std::vector<double>& times) noexcept;
+    void clear_simulated_times() noexcept;
+
 private:
     class Impl;
     explicit Runtime(std::unique_ptr<Impl> impl);

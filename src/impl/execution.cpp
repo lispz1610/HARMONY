@@ -57,7 +57,10 @@ void append_unique(std::vector<cl_event>& out, const std::vector<cl_event>& even
 } // namespace
 
 void Runtime::Impl::execute(const ExecutionStep& step) {
-    if (step.invocations.empty()) return;
+    const bool simulated_balance_only =
+        step.invocations.empty() && simulated_devices_ && devices_discovered_ &&
+        step.balance.mode != BalanceMode::off;
+    if (step.invocations.empty() && !simulated_balance_only) return;
     PhaseTimer timer(*this, Phase::launch);
 
     std::vector<ResolvedArgs> fields;
@@ -183,7 +186,11 @@ void Runtime::Impl::run_invocation(const KernelInvocation& ki, const ResolvedArg
         }
     }
 
-    if (stale.empty()) {
+    if (simulated_devices_) {
+        if (!stale.empty() && sync == HaloSync::global) {
+            wait_before_halo_exchange(sync);
+        }
+    } else if (stale.empty()) {
         run_full_phase(rk, ki, fields, queue_slot);
     } else {
         std::size_t halo = 0;
@@ -273,16 +280,15 @@ void Runtime::Impl::enqueue_range(std::size_t d, cl_kernel kernel, const KernelI
     const std::vector<cl_command_queue>& queues = local_devices_[d].kernel_queues;
     cl_command_queue queue = queues[queue_slot % queues.size()];
 
-    cl_event ev = nullptr;
+    detail::ScopedEvent ev;
     detail::check_cl(clEnqueueNDRangeKernel(queue, kernel, 1, &gwo, &gws, lws, static_cast<cl_uint>(deps.size()),
-                                            deps.empty() ? nullptr : deps.data(), &ev),
+                                            deps.empty() ? nullptr : deps.data(), ev.out_ptr()),
                      part == LaunchPart::full       ? "clEnqueueNDRangeKernel(full)"
                      : part == LaunchPart::interior ? "clEnqueueNDRangeKernel(interior)"
                                                     : "clEnqueueNDRangeKernel(border)");
 
-    record_field_events(fields, d, part, ev);
-    append_balance_window_kernel_events(d, ev);
-    clReleaseEvent(ev);
+    record_field_events(fields, d, part, ev.get());
+    append_balance_window_kernel_events(d, ev.get());
 }
 
 // Events a launch must wait for. The interior never touches the ghost
