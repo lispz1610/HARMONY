@@ -26,8 +26,10 @@ Usage: ./build.sh [options] [targets]
 Targets (default: lib tools):
   lib        static library lib/libharmony.a
   tools      bin/migration_profiler and bin/topo_probe
+  benchmarks bin/kneighbor and bin/leanmd (needs lib)
   examples   builds every example with its own build.sh (needs lib)
   tests      builds C++ tests with tests/build.sh (needs lib)
+  all        builds lib, tools, benchmarks, examples and tests
   install    copies include/ and lib/ to the prefix given with -p
   clean      removes build/, lib/, bin/, examples/*/bin/ and tests/ build output
 
@@ -158,7 +160,7 @@ build_tests() {
 needs_configure=0
 for target in "${TARGETS[@]}"; do
     case "$target" in
-        lib|tools|examples|tests|install) needs_configure=1 ;;
+        lib|tools|benchmarks|examples|tests|all|install) needs_configure=1 ;;
         clean) ;;
         *) PRINT_ERROR "unknown target '$target'"; usage; exit 1 ;;
     esac
@@ -166,27 +168,40 @@ done
 [ "$needs_configure" = "1" ] && configure
 
 built_lib=0
+ensure_lib() {
+    if [ "$built_lib" != "1" ]; then
+        ADD_SUBDIRECTORY src || exit 1
+        built_lib=1
+    fi
+}
+
 for target in "${TARGETS[@]}"; do
     case "$target" in
         clean)
             clean ;;
         lib)
-            ADD_SUBDIRECTORY src || exit 1
-            built_lib=1 ;;
+            ensure_lib ;;
         tools)
             ADD_SUBDIRECTORY tools/migration_profiler || exit 1
             ADD_SUBDIRECTORY tools/topo_probe || exit 1 ;;
+        benchmarks)
+            ensure_lib
+            ADD_SUBDIRECTORY benchmarks || exit 1 ;;
         examples)
-            [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
-            built_lib=1
+            ensure_lib
             build_examples || exit 1 ;;
         tests)
-            [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
-            built_lib=1
+            ensure_lib
+            build_tests || exit 1 ;;
+        all)
+            ensure_lib
+            ADD_SUBDIRECTORY tools/migration_profiler || exit 1
+            ADD_SUBDIRECTORY tools/topo_probe || exit 1
+            ADD_SUBDIRECTORY benchmarks || exit 1
+            build_examples || exit 1
             build_tests || exit 1 ;;
         install)
-            [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
-            built_lib=1
+            ensure_lib
             install_files ;;
     esac
 done
