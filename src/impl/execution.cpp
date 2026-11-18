@@ -368,6 +368,8 @@ void Runtime::Impl::maybe_balance_after_step(const ExecutionStep& step) {
         balance_policy_announced_ = true;
         balance_policy_ = policy;
         print_balance_policy(policy);
+    } else {
+        balance_policy_ = policy;
     }
 
     const bool is_threshold = policy.mode == BalanceMode::dynamic_threshold ||
@@ -394,13 +396,18 @@ void Runtime::Impl::maybe_balance_after_step(const ExecutionStep& step) {
     record.iteration = it;
     record.warmup_probe = probe;
     record.policy = std::string(is_dynamic ? "dynamic " : "static ") + (is_threshold ? "threshold" : "profiled");
+    record.algorithm = (policy.algorithm == BalanceAlgorithm::hwtopolb) ? "hwtopolb" : "erad";
+    record.perturbation_factor =
+        (policy.algorithm == BalanceAlgorithm::hwtopolb) ? policy.perturbation_factor : 0.0f;
+    record.seed = policy.seed;
+    record.power_budget_watts = policy.use_power_cap ? policy.power_budget_watts : 0.0;
     for (const DevicePartition& p : partitions_) record.elements_before.push_back(p.element_count);
 
     if (fields.empty()) {
         reset_balance_window_events();
         record.reason = "no proportional field to move";
     } else {
-        record.applied = is_threshold ? maybe_rebalance_from_timings(fields, policy.threshold, record)
+        record.applied = is_threshold ? maybe_rebalance_from_timings(fields, policy, record)
                                       : maybe_rebalance_profiled(fields, policy, record);
     }
 

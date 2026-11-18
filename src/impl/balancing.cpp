@@ -14,10 +14,13 @@
 #include "runtime_impl.hpp"
 #include "detail/format.hpp"
 #include "detail/load_math.hpp"
+#include "harmony/algorithms.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 
 namespace harmony {
@@ -94,16 +97,126 @@ void estimate_iteration_times(const std::vector<double>& times, const std::vecto
 
 } // namespace
 
+unsigned int Runtime::Impl::synchronize_hwtopolb_seed(unsigned int policy_seed) {
+    unsigned int attempt_seed = policy_seed;
+    if (rank_ == 0) {
+        if (attempt_seed == 0) {
+            std::random_device rd;
+            attempt_seed = rd();
+            if (attempt_seed == 0) attempt_seed = 1u;
+        } else if (balance_attempts_ > 0) {
+            attempt_seed = policy_seed + static_cast<unsigned int>(balance_attempts_);
+            if (attempt_seed == 0) attempt_seed = 1u;
+        }
+    }
+    PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+    detail::check_mpi(MPI_Bcast(&attempt_seed, 1, MPI_UNSIGNED, 0, comm_), "MPI_Bcast(hwtopolb seed)");
+    return attempt_seed;
+}
+
+void Runtime::Impl::apply_collective_power_cap(std::vector<float>& proposed,
+                                               const AutoBalancePolicy& policy,
+                                               BalanceRecord& record) {
+    int power_cap_error = 0;
+    std::string power_cap_msg;
+    double throttle = 1.0;
+    int has_power_metrics = 0;
+    if (rank_ == 0 && !proposed.empty()) {
+        try {
+            if (!topo_metrics_.has_value()) {
+                throw Error("Power cap requires topology power measurements");
+            }
+            has_power_metrics = (!topo_metrics_->current_power_watts.empty() &&
+                                 !topo_metrics_->thermal_tdp_watts.empty()) ? 1 : 0;
+            proposed = apply_power_cap(
+                proposed, *topo_metrics_, policy.power_budget_watts, &throttle, &current_loads_);
+        } catch (const std::exception& e) {
+            power_cap_error = 1;
+            power_cap_msg = e.what();
+        } catch (...) {
+            power_cap_error = 1;
+            power_cap_msg = "Power cap infeasible or measurements unavailable";
+        }
+    }
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(MPI_Bcast(&power_cap_error, 1, MPI_INT, 0, comm_), "MPI_Bcast(power cap status)");
+    }
+    if (power_cap_error != 0) {
+        int msg_len = (rank_ == 0) ? static_cast<int>(power_cap_msg.size()) : 0;
+        {
+            PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+            detail::check_mpi(MPI_Bcast(&msg_len, 1, MPI_INT, 0, comm_), "MPI_Bcast(power cap error length)");
+            if (rank_ != 0) power_cap_msg.resize(static_cast<std::size_t>(msg_len));
+            if (msg_len > 0) {
+                detail::check_mpi(MPI_Bcast(power_cap_msg.data(), msg_len, MPI_CHAR, 0, comm_),
+                                  "MPI_Bcast(power cap error message)");
+            }
+        }
+        throw Error(power_cap_msg.empty() ? "Power cap infeasible or measurements unavailable" : power_cap_msg);
+    }
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(MPI_Bcast(&has_power_metrics, 1, MPI_INT, 0, comm_), "MPI_Bcast(power cap active)");
+        detail::check_mpi(MPI_Bcast(&throttle, 1, MPI_DOUBLE, 0, comm_), "MPI_Bcast(power cap throttle)");
+    }
+    record.power_capped = (has_power_metrics != 0);
+    record.throttle_factor = throttle;
+}
+
 // Measures the window, proposes a division proportional to each device's
 // throughput and fills the measured part of the record. Returns false (and
 // the reason) when there is nothing to decide.
-bool Runtime::Impl::propose_division(std::vector<DevicePartition>& new_parts, BalanceRecord& record,
+bool Runtime::Impl::propose_division(std::vector<DevicePartition>& new_parts,
+                                     const AutoBalancePolicy& policy, BalanceRecord& record,
                                      const char* context) {
     record.window_iterations = iteration_counter_ - balance_window_start_iteration_;
     const std::vector<double> times = collect_global_balance_times_from_window(context);
     record.window_seconds = times;
 
-    const std::vector<float> proposed = detail::compute_loads_from_partition_throughput(times, partitions_);
+    const bool apply_contention = policy.use_contention_adjustment && topo_metrics_.has_value() &&
+                                  !topo_metrics_->memory_contention_factor.empty();
+    record.contention_adjusted = apply_contention;
+    record.algorithm = (policy.algorithm == BalanceAlgorithm::hwtopolb) ? "hwtopolb" : "erad";
+    record.perturbation_factor =
+        (policy.algorithm == BalanceAlgorithm::hwtopolb) ? policy.perturbation_factor : 0.0f;
+    record.seed = policy.seed;
+    record.power_capped = false;
+    record.power_budget_watts = policy.use_power_cap ? policy.power_budget_watts : 0.0;
+    record.throttle_factor = 1.0;
+
+    std::vector<float> proposed;
+    if (policy.algorithm == BalanceAlgorithm::hwtopolb && policy.perturbation_factor > 0.0f) {
+        const unsigned int attempt_seed = synchronize_hwtopolb_seed(policy.seed);
+        record.seed = attempt_seed;
+        proposed = apply_contention
+            ? hwtopolb_loads(times, partitions_, policy.perturbation_factor, attempt_seed,
+                             *topo_metrics_, true)
+            : hwtopolb_loads(times, partitions_, policy.perturbation_factor, attempt_seed);
+    } else {
+        proposed = apply_contention
+            ? erad_loads(times, partitions_, *topo_metrics_, true)
+            : erad_loads(times, partitions_);
+    }
+
+    if (policy.use_power_cap) {
+        apply_collective_power_cap(proposed, policy, record);
+    }
+
+    int proposed_count = (rank_ == 0) ? static_cast<int>(proposed.size()) : 0;
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(MPI_Bcast(&proposed_count, 1, MPI_INT, 0, comm_),
+                          "MPI_Bcast(balance proposal size)");
+        if (rank_ != 0) {
+            proposed.resize(static_cast<std::size_t>(proposed_count));
+        }
+        if (proposed_count > 0) {
+            detail::check_mpi(MPI_Bcast(proposed.data(), proposed_count, MPI_FLOAT, 0, comm_),
+                              "MPI_Bcast(balance proposal)");
+        }
+    }
+
     new_parts = partitions_from_loads(proposed);
     if (proposed.empty() || new_parts.size() != partitions_.size()) {
         reset_balance_window_events();
@@ -125,7 +238,7 @@ bool Runtime::Impl::propose_division(std::vector<DevicePartition>& new_parts, Ba
 }
 
 bool Runtime::Impl::maybe_rebalance_from_timings(const std::vector<FieldHandle>& requested_fields,
-                                                 float threshold, BalanceRecord& record) {
+                                                 const AutoBalancePolicy& policy, BalanceRecord& record) {
     if (!partition_.has_value() || partitions_.empty()) {
         record.reason = "no partition defined yet";
         return false;
@@ -133,13 +246,13 @@ bool Runtime::Impl::maybe_rebalance_from_timings(const std::vector<FieldHandle>&
     const std::vector<FieldHandle> fields = unique_existing_proportional_fields(requested_fields);
 
     std::vector<DevicePartition> new_parts;
-    if (!propose_division(new_parts, record, "MPI_Allreduce(balance times)")) return false;
+    if (!propose_division(new_parts, policy, record, "MPI_Allreduce(balance times)")) return false;
     const std::vector<DevicePartition> old_parts = partitions_;
 
     const double distance = detail::l2_norm_diff(current_loads_, loads_from_partitions(new_parts));
-    const bool accept = distance >= static_cast<double>(threshold);
+    const bool accept = distance >= static_cast<double>(policy.threshold);
     record.reason = "division change " + detail::format_number(distance, 3) + (accept ? " >= " : " < ") +
-                    "threshold " + detail::format_number(threshold, 4);
+                    "threshold " + detail::format_number(policy.threshold, 4);
     if (!accept) {
         reset_balance_window_events();
         return false;
@@ -168,7 +281,7 @@ bool Runtime::Impl::maybe_rebalance_profiled(const std::vector<FieldHandle>& req
 
     // 1. Measure and propose.
     std::vector<DevicePartition> new_parts;
-    if (!propose_division(new_parts, record, "MPI_Allreduce(profiled balance times)")) return false;
+    if (!propose_division(new_parts, policy, record, "MPI_Allreduce(profiled balance times)")) return false;
     const std::vector<DevicePartition> old_parts = partitions_;
 
     // 2. Cost model: migration cost vs. time saved until the end of the run.

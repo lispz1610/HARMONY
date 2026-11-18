@@ -226,12 +226,16 @@ private:
     std::vector<FieldHandle> all_field_handles() const;
 
     // --- balancing.cpp ------------------------------------------------------
-    bool maybe_rebalance_from_timings(const std::vector<FieldHandle>& requested_fields, float threshold,
-                                   BalanceRecord& record);
+    bool maybe_rebalance_from_timings(const std::vector<FieldHandle>& requested_fields,
+                                      const AutoBalancePolicy& policy, BalanceRecord& record);
     bool maybe_rebalance_profiled(const std::vector<FieldHandle>& requested_fields,
                                   const AutoBalancePolicy& policy, BalanceRecord& record);
     std::vector<double> collect_global_balance_times_from_window(const char* context);
-    bool propose_division(std::vector<DevicePartition>& new_parts, BalanceRecord& record, const char* context);
+    unsigned int synchronize_hwtopolb_seed(unsigned int policy_seed);
+    void apply_collective_power_cap(std::vector<float>& proposed, const AutoBalancePolicy& policy,
+                                    BalanceRecord& record);
+    bool propose_division(std::vector<DevicePartition>& new_parts, const AutoBalancePolicy& policy,
+                          BalanceRecord& record, const char* context);
     std::size_t max_bytes_received_by_a_rank(const std::vector<FieldHandle>& fields,
                                              const std::vector<DevicePartition>& old_parts,
                                              const std::vector<DevicePartition>& new_parts) const;
