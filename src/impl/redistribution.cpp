@@ -129,6 +129,9 @@ void Runtime::Impl::redistribute_field_intersection(FieldHandle fh,
                                        const std::vector<DevicePartition>& old_parts,
                                        const std::vector<DevicePartition>& new_parts) {
     detail::RegisteredField& rf = field_or_throw(fh, "redistribute_field_intersection()");
+    if (local_devices_.empty()) {
+        return;
+    }
     const std::size_t elem_bytes = rf.element_bytes();
     const std::size_t total_bytes = rf.total_bytes();
 
@@ -173,14 +176,16 @@ void Runtime::Impl::redistribute_field_intersection(FieldHandle fh,
 
                 if (src_here && src.local_index >= 0) {
                     const std::size_t d = replica_or_throw(src.local_index, "source");
-                    cl_event read_ev = nullptr;
+                    detail::ScopedEvent read_ev;
                     detail::check_cl(
                         clEnqueueReadBuffer(local_devices_[d].transfer_queue, rf.replicas[d], CL_FALSE,
-                                            chunk_off, chunk_len, chunk.data(), 0, nullptr, &read_ev),
+                                            chunk_off, chunk_len, chunk.data(), 0, nullptr, read_ev.out_ptr()),
                         "clEnqueueReadBuffer(redistribute read)");
-                    detail::check_cl(clWaitForEvents(1, &read_ev), "clWaitForEvents(redistribute read)");
-                    track_transfer_event(d, read_ev);
-                    clReleaseEvent(read_ev);
+                    detail::check_cl(clFlush(local_devices_[d].transfer_queue),
+                                     "clFlush(redistribute read)");
+                    cl_event raw_read = read_ev.get();
+                    detail::check_cl(clWaitForEvents(1, &raw_read), "clWaitForEvents(redistribute read)");
+                    track_transfer_event(d, raw_read);
                 }
 
                 if (!(src_here && dst_here)) {
@@ -195,14 +200,19 @@ void Runtime::Impl::redistribute_field_intersection(FieldHandle fh,
 
                 if (dst_here && dst.local_index >= 0) {
                     const std::size_t d = replica_or_throw(dst.local_index, "destination");
-                    cl_event write_ev = nullptr;
+                    detail::ScopedEvent write_ev;
                     detail::check_cl(
-                        clEnqueueWriteBuffer(local_devices_[d].transfer_queue, rf.replicas[d], CL_TRUE,
-                                             chunk_off, chunk_len, chunk.data(), 0, nullptr, &write_ev),
+                        clEnqueueWriteBuffer(local_devices_[d].transfer_queue, rf.replicas[d], CL_FALSE,
+                                             chunk_off, chunk_len, chunk.data(), 0, nullptr, write_ev.out_ptr()),
                         src_here ? "clEnqueueWriteBuffer(redistribute local)"
                                  : "clEnqueueWriteBuffer(redistribute remote)");
-                    track_transfer_event(d, write_ev);
-                    clReleaseEvent(write_ev);
+                    detail::check_cl(clFlush(local_devices_[d].transfer_queue),
+                                     "clFlush(redistribute write)");
+                    cl_event raw_write = write_ev.get();
+                    detail::check_cl(clWaitForEvents(1, &raw_write),
+                                     src_here ? "clWaitForEvents(redistribute local)"
+                                              : "clWaitForEvents(redistribute remote)");
+                    track_transfer_event(d, raw_write);
                 }
             }
         }

@@ -27,8 +27,9 @@ Targets (default: lib tools):
   lib        static library lib/libharmony.a
   tools      bin/migration_profiler
   examples   builds every example with its own build.sh (needs lib)
+  tests      builds C++ tests with tests/build.sh (needs lib)
   install    copies include/ and lib/ to the prefix given with -p
-  clean      removes build/, lib/, bin/ and the examples' build output
+  clean      removes build/, lib/, bin/, examples/*/bin/ and tests/ build output
 
 Options:
   -r         release build (default): -O3
@@ -81,8 +82,11 @@ clean() {
     rm -rf "$ROOT_DIR/build" "$ROOT_DIR/lib" "$ROOT_DIR/bin"
     local ex
     for ex in "$ROOT_DIR"/examples/*/build.sh; do
-        [ -f "$ex" ] && (cd "$(dirname "$ex")" && ./build.sh clean > /dev/null)
+        [ -f "$ex" ] && (cd "$(dirname "$ex")" && bash ./build.sh clean > /dev/null)
     done
+    if [ -f "$ROOT_DIR/tests/build.sh" ]; then
+        (cd "$ROOT_DIR/tests" && bash ./build.sh clean > /dev/null)
+    fi
     PRINT_OK "clean"
 }
 
@@ -134,8 +138,19 @@ build_examples() {
     local ex status=0
     for ex in "$ROOT_DIR"/examples/*/build.sh; do
         PRINT_INFO "${COLOR_BOLD}example $(basename "$(dirname "$ex")")${COLOR_RESET}"
-        (cd "$(dirname "$ex")" && HARMONY_ROOT="$ROOT_DIR" ./build.sh) || status=1
+        (cd "$(dirname "$ex")" && HARMONY_ROOT="$ROOT_DIR" bash ./build.sh) || status=1
     done
+    return $status
+}
+
+build_tests() {
+    local status=0
+    if [ ! -f "$ROOT_DIR/tests/build.sh" ]; then
+        PRINT_ERROR "tests/build.sh not found"
+        return 1
+    fi
+    PRINT_INFO "${COLOR_BOLD}tests${COLOR_RESET}"
+    (cd "$ROOT_DIR/tests" && HARMONY_ROOT="$ROOT_DIR" bash ./build.sh) || status=1
     return $status
 }
 
@@ -143,7 +158,7 @@ build_examples() {
 needs_configure=0
 for target in "${TARGETS[@]}"; do
     case "$target" in
-        lib|tools|examples|install) needs_configure=1 ;;
+        lib|tools|examples|tests|install) needs_configure=1 ;;
         clean) ;;
         *) PRINT_ERROR "unknown target '$target'"; usage; exit 1 ;;
     esac
@@ -164,6 +179,10 @@ for target in "${TARGETS[@]}"; do
             [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
             built_lib=1
             build_examples || exit 1 ;;
+        tests)
+            [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
+            built_lib=1
+            build_tests || exit 1 ;;
         install)
             [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
             built_lib=1

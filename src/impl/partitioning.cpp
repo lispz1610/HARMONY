@@ -26,22 +26,24 @@ void Runtime::Impl::set_partition(const PartitionSpec& spec) {
 // Global devices are numbered rank by rank, so the owner of global device g
 // is found by walking the per-rank device counts.
 int Runtime::Impl::owner_rank_of_global_device(int g) const {
+    const int n_ranks = size();
     int acc = 0;
-    for (int r = 0; r < size_; ++r) {
-        if (g < acc + all_device_counts_[r]) return r;
-        acc += all_device_counts_[r];
+    for (int r = 0; r < n_ranks && static_cast<std::size_t>(r) < all_device_counts_.size(); ++r) {
+        if (g < acc + all_device_counts_[static_cast<std::size_t>(r)]) return r;
+        acc += all_device_counts_[static_cast<std::size_t>(r)];
     }
-    return size_ - 1;
+    return n_ranks - 1;
 }
 
 // Local index of global device g on this rank, or -1 if another rank owns it.
 int Runtime::Impl::local_index_of_global_device(int g) const {
+    const int n_ranks = size();
     int acc = 0;
-    for (int r = 0; r < size_; ++r) {
-        if (g < acc + all_device_counts_[r]) {
+    for (int r = 0; r < n_ranks && static_cast<std::size_t>(r) < all_device_counts_.size(); ++r) {
+        if (g < acc + all_device_counts_[static_cast<std::size_t>(r)]) {
             return (r == rank_) ? (g - acc) : -1;
         }
-        acc += all_device_counts_[r];
+        acc += all_device_counts_[static_cast<std::size_t>(r)];
     }
     return -1;
 }

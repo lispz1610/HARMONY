@@ -24,6 +24,21 @@ namespace harmony {
 
 // Kernel seconds of every partition in the current window, known by all ranks.
 std::vector<double> Runtime::Impl::collect_global_balance_times_from_window(const char* context) {
+    if (!simulated_times_.empty()) {
+        if (!devices_.empty() && simulated_times_.size() == partitions_.size()) {
+            std::vector<double> local_elapsed(devices_.size(), 0.0);
+            for (std::size_t i = 0; i < partitions_.size(); ++i) {
+                const DevicePartition& dp = partitions_[i];
+                if (dp.owning_rank == rank_ && dp.local_index >= 0 &&
+                    static_cast<std::size_t>(dp.local_index) < local_elapsed.size()) {
+                    local_elapsed[static_cast<std::size_t>(dp.local_index)] = simulated_times_[i];
+                }
+            }
+            update_device_timings(local_elapsed);
+        }
+        return simulated_times_;
+    }
+
     const std::vector<double> measured = compute_balance_window_elapsed_local();
 
     std::vector<double> local_times(partitions_.size(), 0.0);
@@ -207,7 +222,7 @@ bool Runtime::Impl::maybe_rebalance_profiled(const std::vector<FieldHandle>& req
 std::size_t Runtime::Impl::max_bytes_received_by_a_rank(const std::vector<FieldHandle>& fields,
                                                         const std::vector<DevicePartition>& old_parts,
                                                         const std::vector<DevicePartition>& new_parts) const {
-    std::vector<std::size_t> rank_recv_bytes(static_cast<std::size_t>(size_), 0);
+    std::vector<std::size_t> rank_recv_bytes(static_cast<std::size_t>(std::max(1, size())), 0);
 
     for (FieldHandle fh : fields) {
         auto fit = fields_.find(fh.value);
