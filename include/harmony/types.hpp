@@ -153,6 +153,34 @@ struct DeviceTiming {
 };
 
 // ---------------------------------------------------------------------------
+// Hardware topology metrics
+// ---------------------------------------------------------------------------
+
+struct TopoMetrics {
+    // Per-device PCIe round-trip latency in nanoseconds (ns).
+    std::vector<double> pcie_latency_ns;
+    // Per-device PCIe peak bandwidth in gigabytes per second (GB/s).
+    std::vector<double> pcie_bandwidth_gbps;
+    // Rank-to-rank MPI latency in nanoseconds, indexed by [src_rank * rank_count + dst_rank].
+    std::vector<double> mpi_latency_ns;
+    // Rank-to-rank MPI bandwidth in gigabytes per second with the same indexing.
+    std::vector<double> mpi_bandwidth_gbps;
+    bool synthetic{false};
+
+    // Flat N x N matrix of NUMA distances (where N is the number of NUMA nodes).
+    std::vector<int> numa_distance;
+    // Mapping from global device index to NUMA node index.
+    std::vector<int> device_numa_node;
+
+    // Per-device memory contention factor in [1.0, inf), where 1.0 = no contention.
+    std::vector<double> memory_contention_factor;
+    // Per-device Thermal Design Power in watts (W).
+    std::vector<double> thermal_tdp_watts;
+    // Per-device current measured power draw in watts (W).
+    std::vector<double> current_power_watts;
+};
+
+// ---------------------------------------------------------------------------
 // Specifications
 // ---------------------------------------------------------------------------
 

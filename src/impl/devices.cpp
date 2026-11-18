@@ -4,6 +4,8 @@
 #include "detail/format.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -117,6 +119,7 @@ void Runtime::Impl::clear_runtime_state() {
     static_balance_attempted_ = false;
     balance_policy_announced_ = false;
     balance_policy_.reset();
+    topo_metrics_.reset();
 }
 
 namespace {
@@ -371,6 +374,106 @@ void Runtime::Impl::discover_devices(const DeviceSelection& selection) {
 void Runtime::Impl::set_simulated_ranks_for_testing(int ranks) noexcept {
     simulated_ranks_ = (ranks > 0) ? ranks : 0;
     all_device_counts_.clear();
+    topo_metrics_.reset();
+}
+
+void Runtime::Impl::set_topo_metrics(const TopoMetrics& metrics) {
+    if (!devices_discovered_ || global_devices_.empty()) {
+        throw Error("set_topo_metrics(): devices must be discovered before setting topology metrics");
+    }
+
+    const int rank_count = size();
+    if (rank_count <= 0) {
+        throw Error("set_topo_metrics(): invalid rank count");
+    }
+
+    const std::size_t total_devices = global_devices_.size();
+    const std::size_t num_ranks = static_cast<std::size_t>(rank_count);
+    const std::size_t expected_matrix_size = num_ranks * num_ranks;
+    if (metrics.mpi_latency_ns.size() != expected_matrix_size ||
+        metrics.mpi_bandwidth_gbps.size() != expected_matrix_size) {
+        throw Error("Invalid MPI matrix dimensions");
+    }
+
+    auto require_device_dim = [total_devices](std::size_t sz, const char* name) {
+        if (sz != 0 && sz != total_devices) {
+            throw Error(std::string("Invalid ") + name + " dimensions");
+        }
+    };
+    require_device_dim(metrics.pcie_latency_ns.size(), "pcie_latency_ns");
+    require_device_dim(metrics.pcie_bandwidth_gbps.size(), "pcie_bandwidth_gbps");
+    require_device_dim(metrics.device_numa_node.size(), "device_numa_node");
+    require_device_dim(metrics.memory_contention_factor.size(), "memory_contention_factor");
+    require_device_dim(metrics.thermal_tdp_watts.size(), "thermal_tdp_watts");
+    require_device_dim(metrics.current_power_watts.size(), "current_power_watts");
+
+    struct DoubleRangeSpec {
+        const std::vector<double>& values;
+        double minimum;
+        bool strict;
+        const char* name;
+    };
+    const std::array<DoubleRangeSpec, 7> specs{{
+        {metrics.pcie_latency_ns, 0.0, false, "pcie_latency_ns"},
+        {metrics.pcie_bandwidth_gbps, 0.0, true, "pcie_bandwidth_gbps"},
+        {metrics.mpi_latency_ns, 0.0, false, "mpi_latency_ns"},
+        {metrics.mpi_bandwidth_gbps, 0.0, false, "mpi_bandwidth_gbps"},
+        {metrics.memory_contention_factor, 1.0, false, "memory_contention_factor"},
+        {metrics.thermal_tdp_watts, 0.0, true, "thermal_tdp_watts"},
+        {metrics.current_power_watts, 0.0, false, "current_power_watts"}
+    }};
+    for (const auto& spec : specs) {
+        for (double value : spec.values) {
+            if (!std::isfinite(value) || (spec.strict ? value <= spec.minimum : value < spec.minimum)) {
+                throw Error(std::string("Invalid ") + spec.name + " value");
+            }
+        }
+    }
+
+    for (std::size_t source = 0; source < num_ranks; ++source) {
+        for (std::size_t target = 0; target < num_ranks; ++target) {
+            if (source != target && metrics.mpi_bandwidth_gbps[source * num_ranks + target] <= 0.0) {
+                throw Error("Off-diagonal MPI bandwidth must be positive");
+            }
+        }
+    }
+
+    std::size_t num_nodes = 0;
+    if (!metrics.numa_distance.empty()) {
+        const std::size_t n_dist = metrics.numa_distance.size();
+        num_nodes = static_cast<std::size_t>(std::llround(std::sqrt(static_cast<double>(n_dist))));
+        if (num_nodes == 0 || num_nodes * num_nodes != n_dist) {
+            throw Error("numa_distance must be an N x N matrix");
+        }
+        for (std::size_t i = 0; i < num_nodes; ++i) {
+            const int diag = metrics.numa_distance[i * num_nodes + i];
+            if (diag <= 0) {
+                throw Error("numa_distance diagonal entries must be positive integers");
+            }
+            for (std::size_t j = 0; j < num_nodes; ++j) {
+                const int val = metrics.numa_distance[i * num_nodes + j];
+                if (val <= 0) {
+                    throw Error("numa_distance values must be positive integers");
+                }
+                if (val < diag) {
+                    throw Error("numa_distance diagonal must be the minimum distance");
+                }
+            }
+        }
+    }
+
+    if (!metrics.device_numa_node.empty()) {
+        if (metrics.numa_distance.empty()) {
+            throw Error("device_numa_node provided without numa_distance matrix");
+        }
+        for (int node : metrics.device_numa_node) {
+            if (node < 0 || static_cast<std::size_t>(node) >= num_nodes) {
+                throw Error("device_numa_node out of range");
+            }
+        }
+    }
+
+    topo_metrics_ = metrics;
 }
 
 void Runtime::Impl::set_simulated_times(const std::vector<double>& times) noexcept {
