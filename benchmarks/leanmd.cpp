@@ -16,56 +16,6 @@
 #define KERNEL_FILE "benchmarks/leanmd.cl"
 #endif
 
-namespace {
-
-void run_simulated_partition_work(const std::vector<harmony::DevicePartition>& partitions,
-                                  int rank,
-                                  int cutoff,
-                                  const std::vector<float>& pos_x,
-                                  const std::vector<float>& pos_y,
-                                  const std::vector<float>& pos_z,
-                                  std::vector<float>& force_out,
-                                  std::vector<double>& local_device_times) {
-    const std::size_t n = pos_x.size();
-    for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
-        const auto& p = partitions[p_idx];
-        if (p.owning_rank != rank || p.element_count == 0) continue;
-
-        const std::size_t offset = p.global_offset;
-        const std::size_t count = p.element_count;
-        const int work_passes = (p.device_global_index == 0 ? 2 : 1);
-
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int pass = 0; pass < work_passes; ++pass) {
-            for (std::size_t i = offset; i < offset + count; ++i) {
-                const float xi = pos_x[i];
-                const float yi = pos_y[i];
-                const float zi = pos_z[i];
-                float f_total = 0.0f;
-
-                const std::size_t s =
-                    (i > static_cast<std::size_t>(cutoff)) ? (i - static_cast<std::size_t>(cutoff)) : 0;
-                const std::size_t e = std::min(n - 1, i + static_cast<std::size_t>(cutoff));
-                for (std::size_t j = s; j <= e; ++j) {
-                    if (i == j) continue;
-                    const float dx = xi - pos_x[j];
-                    const float dy = yi - pos_y[j];
-                    const float dz = zi - pos_z[j];
-                    const float r2 = dx * dx + dy * dy + dz * dz + 1.0e-6f;
-                    const float r2inv = 1.0f / r2;
-                    const float r6inv = r2inv * r2inv * r2inv;
-                    f_total += r2inv * r6inv * (2.0f * r6inv - 1.0f);
-                }
-                force_out[i] = f_total;
-            }
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        local_device_times[p_idx] = std::chrono::duration<double>(t1 - t0).count();
-    }
-}
-
-} // namespace
-
 int main(int argc, char** argv) {
     try {
         harmony::Runtime runtime = harmony::Runtime::create(argc, argv);
@@ -132,44 +82,12 @@ int main(int argc, char** argv) {
             .synchronize_at_end(true);
         const harmony::ExecutionStep step = step_builder.build();
 
-        std::vector<double> step_times(static_cast<std::size_t>(opt.iterations), 0.0);
-        std::vector<double> sim_window_times;
-        bool sim_static_attempted = false;
-
         const auto total_bench_start = std::chrono::steady_clock::now();
-        runtime.start_timing();
-
-        for (int it = 0; it < opt.iterations; ++it) {
-            const auto step_start = std::chrono::steady_clock::now();
-
-            if (!opencl_available) {
-                const auto& partitions = runtime.partitions();
-                if (sim_window_times.size() != partitions.size()) {
-                    sim_window_times.assign(partitions.size(), 0.0);
-                }
-                std::vector<double> local_device_times(partitions.size(), 0.0);
-                run_simulated_partition_work(
-                    partitions, rank, opt.k, pos_x, pos_y, pos_z, force_out, local_device_times);
-                std::vector<double> iter_device_times(partitions.size(), 0.0);
-                MPI_Allreduce(local_device_times.data(), iter_device_times.data(),
-                              static_cast<int>(partitions.size()), MPI_DOUBLE, MPI_MAX, runtime.communicator());
-                for (std::size_t i = 0; i < partitions.size(); ++i) {
-                    sim_window_times[i] += iter_device_times[i];
-                }
-                runtime.set_simulated_times(sim_window_times);
-            }
-
-            runtime.execute(step);
-
-            if (!opencl_available &&
-                harmony_bench::should_reset_sim_window(policy, it + 1, opt.iterations, sim_static_attempted)) {
-                std::fill(sim_window_times.begin(), sim_window_times.end(), 0.0);
-            }
-
-            const auto step_end = std::chrono::steady_clock::now();
-            step_times[static_cast<std::size_t>(it)] =
-                std::chrono::duration<double>(step_end - step_start).count();
-        }
+        const std::vector<double> step_times = harmony_bench::run_benchmark_loop(
+            runtime, step, policy, opt, opencl_available,
+            [&](std::size_t i) {
+                force_out[i] = harmony_bench::leanmd_ref_at(pos_x, pos_y, pos_z, i, opt.k);
+            });
 
         const double loop_time_s = runtime.stop_timing();
 

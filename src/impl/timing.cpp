@@ -26,6 +26,18 @@ namespace {
 
 int index_of(Phase p) { return static_cast<int>(p); }
 
+const char* balance_mode_label(BalanceMode mode) noexcept {
+    switch (mode) {
+        case BalanceMode::off: return "off";
+        case BalanceMode::static_threshold: return "static threshold";
+        case BalanceMode::dynamic_threshold: return "dynamic threshold";
+        case BalanceMode::static_profiled: return "static profiled";
+        case BalanceMode::dynamic_profiled: return "dynamic profiled";
+        case BalanceMode::hierarchical: return "hierarchical";
+    }
+    return "unknown";
+}
+
 // Attempts listed in the summary; beyond this only the applied ones.
 constexpr std::size_t kMaxSummaryRows = 30;
 // Changes shown in the table of shares over time.
@@ -154,13 +166,7 @@ void Runtime::Impl::print_balance_policy(const AutoBalancePolicy& policy) {
     const int warmup = std::max(0, policy.warmup);
 
     std::ostringstream out;
-    out << "[HARMONY] Load balancing: ";
-    if (is_hierarchical) {
-        out << "hierarchical";
-    } else {
-        out << (is_dynamic ? "dynamic " : "static ")
-            << (is_threshold ? "threshold" : "profiled");
-    }
+    out << "[HARMONY] Load balancing: " << balance_mode_label(policy.mode);
     out << " (algorithm: " << (policy.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad");
     if (policy.algorithm == BalanceAlgorithm::hwtopolb) {
         out << ", perturbation=" << detail::format_number(policy.perturbation_factor, 4)
@@ -465,10 +471,14 @@ void Runtime::Impl::print_timing_report(std::ostream& os) {
     out << "\nMPI processes: " << r.ranks.size() << "    Devices: " << r.devices.size() << "\n";
     if (balance_policy_) {
         const AutoBalancePolicy& p = *balance_policy_;
-        const bool is_dynamic = p.mode == BalanceMode::dynamic_threshold || p.mode == BalanceMode::dynamic_profiled;
-        const bool is_threshold = p.mode == BalanceMode::dynamic_threshold || p.mode == BalanceMode::static_threshold;
+        const bool is_hierarchical = p.mode == BalanceMode::hierarchical;
+        const bool is_dynamic = is_hierarchical ||
+                                p.mode == BalanceMode::dynamic_threshold ||
+                                p.mode == BalanceMode::dynamic_profiled;
+        const bool is_threshold = p.mode == BalanceMode::dynamic_threshold ||
+                                  p.mode == BalanceMode::static_threshold;
         const int interval = std::max(1, p.interval);
-        out << "Load balancing: " << (is_dynamic ? "dynamic " : "static ") << (is_threshold ? "threshold" : "profiled")
+        out << "Load balancing: " << balance_mode_label(p.mode)
             << ", algorithm " << (p.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad")
             << ", warm-up probe at " << (p.warmup > 0 ? detail::format_count(static_cast<std::size_t>(p.warmup)) : "-")
             << ", interval " << detail::format_count(static_cast<std::size_t>(interval))

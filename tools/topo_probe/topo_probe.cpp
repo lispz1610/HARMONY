@@ -227,13 +227,19 @@ std::vector<LocalDeviceProbe> probe_opencl_devices(bool allow_synthetic) {
         err = clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devs);
         if (err == CL_DEVICE_NOT_FOUND || num_devs == 0) continue;
         if (err != CL_SUCCESS) {
-            abort_probe("GPU discovery failed.");
+            if (!allow_synthetic) {
+                abort_probe("GPU discovery failed.");
+            }
+            continue;
         }
 
         std::vector<cl_device_id> devs(num_devs);
         err = clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, num_devs, devs.data(), nullptr);
         if (err != CL_SUCCESS) {
-            abort_probe("GPU device listing failed.");
+            if (!allow_synthetic) {
+                abort_probe("GPU device listing failed.");
+            }
+            continue;
         }
 
         for (cl_device_id dev : devs) {

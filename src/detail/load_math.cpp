@@ -11,31 +11,6 @@ namespace harmony {
 
 namespace {
 
-double compute_partition_capacities(
-    const std::vector<double>& times,
-    const std::vector<DevicePartition>& partitions,
-    const TopoMetrics* metrics,
-    bool use_contention_adjustment,
-    std::vector<double>& out_capacity) {
-    out_capacity.assign(times.size(), 0.0);
-    const bool apply_contention =
-        use_contention_adjustment && metrics != nullptr && !metrics->memory_contention_factor.empty();
-    double total_capacity = 0.0;
-    for (std::size_t i = 0; i < times.size(); ++i) {
-        if (partitions[i].element_count == 0 || times[i] <= 1.0e-12) continue;
-        double cap = static_cast<double>(partitions[i].element_count) / times[i];
-        if (apply_contention) {
-            const int dev_idx = (partitions[i].device_global_index >= 0)
-                ? partitions[i].device_global_index
-                : static_cast<int>(i);
-            cap = adjusted_capacity(*metrics, dev_idx, cap);
-        }
-        out_capacity[i] = cap;
-        total_capacity += cap;
-    }
-    return total_capacity;
-}
-
 std::vector<float> cumulative_from_shares(const std::vector<double>& shares) {
     std::vector<float> loads(shares.size(), 0.0f);
     if (shares.empty()) return loads;
@@ -62,7 +37,7 @@ std::vector<float> erad_loads_impl(
     }
 
     std::vector<double> capacity;
-    const double total_capacity = compute_partition_capacities(
+    const double total_capacity = detail::compute_partition_capacities(
         times, partitions, metrics, use_contention_adjustment, capacity);
     if (total_capacity <= 0.0) {
         return detail::equal_cumulative_loads(times.size());
@@ -94,7 +69,7 @@ std::vector<float> hwtopolb_loads_impl(
 
     const std::size_t n = times.size();
     std::vector<double> capacity;
-    const double total_capacity = compute_partition_capacities(
+    const double total_capacity = detail::compute_partition_capacities(
         times, partitions, metrics, use_contention_adjustment, capacity);
 
     std::vector<double> share(n, 0.0);
@@ -107,31 +82,8 @@ std::vector<float> hwtopolb_loads_impl(
         }
     }
 
-    std::mt19937 gen;
-    if (seed != 0) {
-        gen.seed(seed);
-    } else {
-        std::random_device rd;
-        gen.seed(rd());
-    }
-
-    std::uniform_real_distribution<float> dist(-perturbation_factor, perturbation_factor);
-    std::vector<double> perturbed(n, 0.0);
-    double sum_perturbed = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double delta_i = static_cast<double>(dist(gen));
-        perturbed[i] = std::max(1.0e-6, share[i] * (1.0 + delta_i));
-        sum_perturbed += perturbed[i];
-    }
-
-    if (sum_perturbed <= 0.0) {
-        return erad_loads_impl(times, partitions, metrics, use_contention_adjustment);
-    }
-
-    for (std::size_t i = 0; i < n; ++i) {
-        perturbed[i] /= sum_perturbed;
-    }
-    return cumulative_from_shares(perturbed);
+    detail::perturb_shares(share, perturbation_factor, seed);
+    return cumulative_from_shares(share);
 }
 
 } // namespace
@@ -481,6 +433,60 @@ bool intersect_1d(std::size_t off1, std::size_t len1,
     out_off = lo;
     out_len = hi - lo;
     return true;
+}
+
+double compute_partition_capacities(
+    const std::vector<double>& times,
+    const std::vector<DevicePartition>& partitions,
+    const TopoMetrics* metrics,
+    bool use_contention_adjustment,
+    std::vector<double>& out_capacity) {
+    const std::size_t n = std::min(times.size(), partitions.size());
+    out_capacity.assign(n, 0.0);
+    const bool apply_contention =
+        use_contention_adjustment && metrics != nullptr && !metrics->memory_contention_factor.empty();
+    double total_capacity = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (partitions[i].element_count == 0 || times[i] <= 1.0e-12) continue;
+        double cap = static_cast<double>(partitions[i].element_count) / times[i];
+        if (apply_contention) {
+            const int dev_idx = (partitions[i].device_global_index >= 0)
+                ? partitions[i].device_global_index
+                : static_cast<int>(i);
+            cap = adjusted_capacity(*metrics, dev_idx, cap);
+        }
+        out_capacity[i] = cap;
+        total_capacity += cap;
+    }
+    return total_capacity;
+}
+
+void perturb_shares(std::vector<double>& shares, float perturbation_factor, unsigned int seed) {
+    if (shares.empty() || perturbation_factor <= 0.0f) return;
+    if (!std::isfinite(perturbation_factor)) {
+        throw Error("perturb_shares(): perturbation_factor must be finite");
+    }
+
+    std::mt19937 gen;
+    if (seed != 0) {
+        gen.seed(seed);
+    } else {
+        std::random_device rd;
+        gen.seed(rd());
+    }
+
+    std::uniform_real_distribution<float> dist(-perturbation_factor, perturbation_factor);
+    double sum_perturbed = 0.0;
+    for (double& s : shares) {
+        const double delta_i = static_cast<double>(dist(gen));
+        s = std::max(1.0e-6, s * (1.0 + delta_i));
+        sum_perturbed += s;
+    }
+    if (sum_perturbed > 0.0) {
+        for (double& s : shares) {
+            s /= sum_perturbed;
+        }
+    }
 }
 
 } // namespace harmony::detail

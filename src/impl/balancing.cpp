@@ -72,15 +72,13 @@ void estimate_iteration_times(const std::vector<double>& times, const std::vecto
                               const std::vector<DevicePartition>& new_parts, std::size_t window_iterations,
                               double& now, double& after) {
     now = 0.0;
-    std::vector<double> capacity(old_parts.size(), 0.0);
-    bool all_measured = true;
     for (std::size_t i = 0; i < old_parts.size() && i < times.size(); ++i) {
         now = std::max(now, times[i]);
-        if (times[i] > 1.0e-12 && old_parts[i].element_count > 0) {
-            capacity[i] = static_cast<double>(old_parts[i].element_count) / times[i];
-        }
     }
+    std::vector<double> capacity;
+    (void)detail::compute_partition_capacities(times, old_parts, nullptr, false, capacity);
 
+    bool all_measured = true;
     after = 0.0;
     for (std::size_t i = 0; i < new_parts.size(); ++i) {
         if (new_parts[i].element_count == 0) continue;
@@ -332,23 +330,12 @@ bool Runtime::Impl::passes_numa_cost_gate(const std::vector<FieldHandle>& fields
 
         const std::vector<double>& times = record.window_seconds;
         double t_max_current = 0.0;
-        double total_cap = 0.0;
-        std::vector<double> capacity(old_parts.size(), 0.0);
-        const bool apply_contention = policy.use_contention_adjustment &&
-                                      !topo_metrics_->memory_contention_factor.empty();
         for (std::size_t i = 0; i < old_parts.size() && i < times.size(); ++i) {
             t_max_current = std::max(t_max_current, times[i]);
-            if (times[i] > 1.0e-12 && old_parts[i].element_count > 0) {
-                double cap = static_cast<double>(old_parts[i].element_count) / times[i];
-                if (apply_contention) {
-                    const int dev_idx = (old_parts[i].device_global_index >= 0)
-                        ? old_parts[i].device_global_index : static_cast<int>(i);
-                    cap = adjusted_capacity(*topo_metrics_, dev_idx, cap);
-                }
-                capacity[i] = cap;
-                total_cap += cap;
-            }
         }
+        std::vector<double> capacity;
+        const double total_cap = detail::compute_partition_capacities(
+            times, old_parts, &(*topo_metrics_), policy.use_contention_adjustment, capacity);
 
         double t_max_projected = t_max_current;
         if (total_cap > 0.0) {
@@ -493,6 +480,10 @@ struct RankPhase1Result {
 void compute_inter_node_loads(int num_ranks,
                               std::size_t global_elements,
                               const std::vector<double>& rank_data,
+                              const std::vector<int>& rank_device_counts,
+                              BalanceAlgorithm algorithm,
+                              float perturbation_factor,
+                              unsigned int attempt_seed,
                               bool verbose,
                               std::vector<float>& inter_cum_loads,
                               int& abort_migration_flag,
@@ -537,12 +528,52 @@ void compute_inter_node_loads(int num_ranks,
                 elements_accum / static_cast<double>(global_elements));
         }
         inter_cum_loads.back() = 1.0f;
-    } else if (total_capacity <= 0.0) {
-        inter_cum_loads = detail::equal_cumulative_loads(static_cast<std::size_t>(num_ranks));
     } else {
+        std::vector<double> shares(static_cast<std::size_t>(num_ranks), 0.0);
+        if (total_capacity <= 0.0) {
+            int active_ranks = 0;
+            for (int r = 0; r < num_ranks; ++r) {
+                if (static_cast<std::size_t>(r) < rank_device_counts.size() &&
+                    rank_device_counts[static_cast<std::size_t>(r)] > 0) {
+                    ++active_ranks;
+                }
+            }
+            if (active_ranks == 0) {
+                std::fill(shares.begin(), shares.end(), 1.0 / static_cast<double>(num_ranks));
+            } else {
+                for (int r = 0; r < num_ranks; ++r) {
+                    if (static_cast<std::size_t>(r) < rank_device_counts.size() &&
+                        rank_device_counts[static_cast<std::size_t>(r)] > 0) {
+                        shares[static_cast<std::size_t>(r)] = 1.0 / static_cast<double>(active_ranks);
+                    }
+                }
+            }
+        } else {
+            for (int r = 0; r < num_ranks; ++r) {
+                shares[static_cast<std::size_t>(r)] = capacities[static_cast<std::size_t>(r)] / total_capacity;
+            }
+        }
+
+        if (algorithm == BalanceAlgorithm::hwtopolb && perturbation_factor > 0.0f) {
+            std::vector<std::size_t> active_indices;
+            std::vector<double> active_shares;
+            for (int r = 0; r < num_ranks; ++r) {
+                const bool active = static_cast<std::size_t>(r) >= rank_device_counts.size() ||
+                                    rank_device_counts[static_cast<std::size_t>(r)] > 0;
+                if (active) {
+                    active_indices.push_back(static_cast<std::size_t>(r));
+                    active_shares.push_back(shares[static_cast<std::size_t>(r)]);
+                }
+            }
+            detail::perturb_shares(active_shares, perturbation_factor, attempt_seed);
+            for (std::size_t k = 0; k < active_indices.size(); ++k) {
+                shares[active_indices[k]] = active_shares[k];
+            }
+        }
+
         double cum_cap = 0.0;
         for (int r = 0; r < num_ranks; ++r) {
-            cum_cap += capacities[static_cast<std::size_t>(r)] / total_capacity;
+            cum_cap += shares[static_cast<std::size_t>(r)];
             inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(cum_cap);
         }
         inter_cum_loads.back() = 1.0f;
@@ -575,6 +606,21 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
     const bool apply_contention = policy.use_contention_adjustment && topo_metrics_.has_value() &&
                                   !topo_metrics_->memory_contention_factor.empty();
     record.contention_adjusted = apply_contention;
+    record.algorithm = (policy.algorithm == BalanceAlgorithm::hwtopolb) ? "hwtopolb" : "erad";
+    record.perturbation_factor =
+        (policy.algorithm == BalanceAlgorithm::hwtopolb) ? policy.perturbation_factor : 0.0f;
+    record.seed = policy.seed;
+    record.power_capped = false;
+    record.power_budget_watts = policy.use_power_cap ? policy.power_budget_watts : 0.0;
+    record.throttle_factor = 1.0;
+
+    const bool use_hwtopolb =
+        (policy.algorithm == BalanceAlgorithm::hwtopolb && policy.perturbation_factor > 0.0f);
+    unsigned int attempt_seed = policy.seed;
+    if (use_hwtopolb) {
+        attempt_seed = synchronize_hwtopolb_seed(policy.seed);
+        record.seed = attempt_seed;
+    }
 
     const int num_ranks = std::max(1, size());
     const bool in_process_sim_ranks = (mpi_size_ == 1 && simulated_ranks_ > 1);
@@ -636,6 +682,12 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
             } else {
                 std::fill(res.p_local.begin(), res.p_local.end(), 1.0 / static_cast<double>(n_local));
             }
+            if (use_hwtopolb && n_local > 1) {
+                unsigned int local_seed =
+                    attempt_seed ^ (static_cast<unsigned int>(target_rank) * 0x9e3779b9u);
+                if (local_seed == 0) local_seed = 1u;
+                detail::perturb_shares(res.p_local, policy.perturbation_factor, local_seed);
+            }
             res.local_max_time = std::max(*std::max_element(local_times.begin(), local_times.end()), 1.0e-9);
         }
         return res;
@@ -683,7 +735,8 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
             rank_data[static_cast<std::size_t>(r * 3 + 2)] = all_phase1[r].local_capacity;
         }
         std::vector<float> inter_cum_loads;
-        compute_inter_node_loads(num_ranks, partition_->global_elements, rank_data, verbose_,
+        compute_inter_node_loads(num_ranks, partition_->global_elements, rank_data, rank_device_counts,
+                                 policy.algorithm, policy.perturbation_factor, attempt_seed, verbose_,
                                  inter_cum_loads, abort_migration_flag, global_max_time, projected_time);
         std::vector<std::size_t> rank_cuts;
         compute_rank_cuts(inter_cum_loads, rank_device_counts, partition_->global_elements, gran, rank_cuts);
@@ -723,7 +776,8 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
 
         std::vector<float> inter_cum_loads(static_cast<std::size_t>(mpi_size_), 0.0f);
         if (rank_ == 0) {
-            compute_inter_node_loads(mpi_size_, partition_->global_elements, rank_data, verbose_,
+            compute_inter_node_loads(mpi_size_, partition_->global_elements, rank_data, rank_device_counts,
+                                     policy.algorithm, policy.perturbation_factor, attempt_seed, verbose_,
                                      inter_cum_loads, abort_migration_flag, global_max_time, projected_time);
         }
 
@@ -833,10 +887,40 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
         }
     }
 
-    if (rank_ == 0) {
+    if (policy.use_power_cap) {
+        std::vector<float> proposed = loads_from_partitions(new_parts);
+        apply_collective_power_cap(proposed, policy, record);
+        int proposed_count = (rank_ == 0) ? static_cast<int>(proposed.size()) : 0;
+        {
+            PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+            detail::check_mpi(MPI_Bcast(&proposed_count, 1, MPI_INT, 0, comm_),
+                              "MPI_Bcast(hierarchical power cap size)");
+            if (rank_ != 0) {
+                proposed.resize(static_cast<std::size_t>(proposed_count));
+            }
+            if (proposed_count > 0) {
+                detail::check_mpi(MPI_Bcast(proposed.data(), proposed_count, MPI_FLOAT, 0, comm_),
+                                  "MPI_Bcast(hierarchical power cap loads)");
+            }
+        }
+        std::vector<DevicePartition> capped_parts = partitions_from_loads(proposed, /*allow_empty=*/true);
+        if (!capped_parts.empty() && capped_parts.size() == new_parts.size()) {
+            new_parts = std::move(capped_parts);
+        }
+    }
+
+    if (!in_process_sim_ranks && mpi_size_ > 1) {
+        double timing_pair[2] = {global_max_time, projected_time};
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(MPI_Bcast(timing_pair, 2, MPI_DOUBLE, 0, comm_),
+                          "MPI_Bcast(hierarchical timing estimates)");
+        global_max_time = timing_pair[0];
+        projected_time = timing_pair[1];
+    }
+    {
         const double window_n = static_cast<double>(std::max<std::size_t>(record.window_iterations, 1));
         record.iteration_seconds_before = global_max_time / window_n;
-        record.iteration_seconds_after = (abort_migration_flag != 0)
+        record.iteration_seconds_after = (abort_migration_flag != 0 && !record.power_capped)
             ? record.iteration_seconds_before
             : (projected_time / window_n);
     }
@@ -852,7 +936,7 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
         covered_elements += part.element_count;
     }
     if (covered_elements != partition_->global_elements) local_invalid_partition = 1;
-    if (abort_migration_flag == 0 && !in_process_sim_ranks) {
+    if ((abort_migration_flag == 0 || policy.use_power_cap) && !in_process_sim_ranks) {
         int any_invalid_partition = 0;
         {
             PhaseTimer mpi_timer(*this, Phase::mpi_balance);
@@ -875,13 +959,14 @@ bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>&
             synchronize_all_local_devices(true);
         }
         reset_balance_window_events();
-        record.reason = (abort_migration_flag != 0)
+        record.reason = (abort_migration_flag != 0 && !record.power_capped)
             ? "inter-node migration aborted due to hysteresis (gain < 5%)"
             : "the division is already balanced";
     } else {
         apply_partitions(fields, old_parts, new_parts, record,
-                         /*synchronize_ranks=*/(abort_migration_flag == 0 && !in_process_sim_ranks));
-        record.reason = (abort_migration_flag != 0)
+                         /*synchronize_ranks=*/(!in_process_sim_ranks &&
+                                                (abort_migration_flag == 0 || policy.use_power_cap)));
+        record.reason = (abort_migration_flag != 0 && !record.power_capped)
             ? "intra-node rebalance applied (inter-node migration aborted due to hysteresis)"
             : "hierarchical two-phase rebalance applied";
     }

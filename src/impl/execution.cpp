@@ -140,10 +140,9 @@ void Runtime::Impl::prune_micro_partitions_for_halos(std::size_t max_halo_width)
 }
 
 void Runtime::Impl::execute(const ExecutionStep& step) {
-    const bool simulated_balance_only =
-        step.invocations.empty() && simulated_devices_ && devices_discovered_ &&
-        step.balance.mode != BalanceMode::off;
-    if (step.invocations.empty() && !simulated_balance_only) return;
+    const bool simulated_step =
+        step.invocations.empty() && simulated_devices_ && devices_discovered_;
+    if (step.invocations.empty() && !simulated_step) return;
     PhaseTimer timer(*this, Phase::launch);
 
     std::size_t max_halo_width = 0;

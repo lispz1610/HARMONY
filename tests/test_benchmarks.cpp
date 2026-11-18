@@ -184,6 +184,44 @@ void test_runtime_benchmark_policy_and_report_determinism(int argc, char** argv)
     }
 }
 
+void test_run_benchmark_loop_balance_off_records_iterations(int argc, char** argv) {
+    harmony::Runtime rt = harmony::Runtime::create(argc, argv);
+    rt.set_verbose(false);
+    rt.set_simulated_devices_count(2);
+    rt.set_partition({200, 1, sizeof(float), 1});
+    auto f_out = rt.create_field({"out_data", 200, 1, sizeof(float),
+                                  harmony::BufferUsage::write_only, nullptr,
+                                  harmony::RedistributionDependency::proportional});
+
+    const char* args[] = {
+        "kneighbor", "--n", "200", "--iterations", "4",
+        "--balance-interval", "0", "--device", "sim"
+    };
+    const auto opt = harmony_bench::parse_options(
+        static_cast<int>(sizeof(args) / sizeof(args[0])),
+        const_cast<char**>(args), "kneighbor", 5);
+    const auto policy = harmony_bench::build_balance_policy(opt);
+    assert(policy.mode == harmony::BalanceMode::off);
+
+    const auto step = rt.step("kneighbor_off")
+        .with_balance(policy)
+        .tag_field(f_out, harmony::StepFieldRole::rebalance_source)
+        .build();
+
+    std::vector<float> in_data(200, 1.0f);
+    std::vector<float> out_data(200, 0.0f);
+    const std::vector<double> step_times = harmony_bench::run_benchmark_loop(
+        rt, step, policy, opt, /*opencl_available=*/false,
+        [&](std::size_t i) { out_data[i] = harmony_bench::kneighbor_ref_at(in_data, i, opt.k); });
+    const double loop_s = rt.stop_timing();
+    assert(std::isfinite(loop_s) && loop_s >= 0.0);
+    assert(step_times.size() == 4);
+
+    const auto report = rt.timing_report();
+    assert(report.iterations == 4);
+    assert(report.balance.empty());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -195,6 +233,7 @@ int main(int argc, char** argv) {
     test_parse_benchmark_options_and_policy();
     test_reference_worked_examples();
     test_runtime_benchmark_policy_and_report_determinism(argc, argv);
+    test_run_benchmark_loop_balance_off_records_iterations(argc, argv);
 
     if (rank == 0) {
         std::cout << "[PASS] test_benchmarks\n";

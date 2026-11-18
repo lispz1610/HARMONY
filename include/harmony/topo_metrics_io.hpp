@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -265,6 +266,121 @@ inline void topo_require_finite_doubles(const std::vector<double>& values, const
 
 } // namespace detail
 
+inline void validate_topo_metrics(
+    const TopoMetrics& metrics,
+    std::optional<std::size_t> expected_devices = std::nullopt,
+    std::optional<std::size_t> expected_ranks = std::nullopt) {
+    struct DeviceFieldDim {
+        std::size_t size;
+        const char* name;
+    };
+    const std::array<DeviceFieldDim, 6> device_dims{{
+        {metrics.pcie_latency_ns.size(), "pcie_latency_ns"},
+        {metrics.pcie_bandwidth_gbps.size(), "pcie_bandwidth_gbps"},
+        {metrics.device_numa_node.size(), "device_numa_node"},
+        {metrics.memory_contention_factor.size(), "memory_contention_factor"},
+        {metrics.thermal_tdp_watts.size(), "thermal_tdp_watts"},
+        {metrics.current_power_watts.size(), "current_power_watts"}
+    }};
+    std::optional<std::size_t> target_devices = expected_devices;
+    for (const auto& dim : device_dims) {
+        if (dim.size == 0) continue;
+        if (!target_devices.has_value()) {
+            target_devices = dim.size;
+        } else if (dim.size != *target_devices) {
+            throw Error(std::string("Invalid ") + dim.name + " dimensions");
+        }
+    }
+
+    std::size_t num_ranks = 0;
+    if (expected_ranks.has_value()) {
+        if (*expected_ranks == 0) {
+            throw Error("Invalid MPI rank count");
+        }
+        num_ranks = *expected_ranks;
+        const std::size_t expected_matrix_size = num_ranks * num_ranks;
+        if (metrics.mpi_latency_ns.size() != expected_matrix_size ||
+            metrics.mpi_bandwidth_gbps.size() != expected_matrix_size) {
+            throw Error("Invalid MPI matrix dimensions");
+        }
+    } else if (!metrics.mpi_latency_ns.empty() || !metrics.mpi_bandwidth_gbps.empty()) {
+        if (metrics.mpi_latency_ns.size() != metrics.mpi_bandwidth_gbps.size()) {
+            throw Error("Invalid MPI matrix dimensions");
+        }
+        const std::size_t n_mpi = metrics.mpi_latency_ns.size();
+        num_ranks = static_cast<std::size_t>(std::llround(std::sqrt(static_cast<double>(n_mpi))));
+        if (num_ranks == 0 || num_ranks * num_ranks != n_mpi) {
+            throw Error("Invalid MPI matrix dimensions");
+        }
+    }
+
+    struct DoubleRangeSpec {
+        const std::vector<double>& values;
+        double minimum;
+        bool strict;
+        const char* name;
+    };
+    const std::array<DoubleRangeSpec, 7> specs{{
+        {metrics.pcie_latency_ns, 0.0, false, "pcie_latency_ns"},
+        {metrics.pcie_bandwidth_gbps, 0.0, true, "pcie_bandwidth_gbps"},
+        {metrics.mpi_latency_ns, 0.0, false, "mpi_latency_ns"},
+        {metrics.mpi_bandwidth_gbps, 0.0, false, "mpi_bandwidth_gbps"},
+        {metrics.memory_contention_factor, 1.0, false, "memory_contention_factor"},
+        {metrics.thermal_tdp_watts, 0.0, true, "thermal_tdp_watts"},
+        {metrics.current_power_watts, 0.0, false, "current_power_watts"}
+    }};
+    for (const auto& spec : specs) {
+        for (double value : spec.values) {
+            if (!std::isfinite(value) || (spec.strict ? value <= spec.minimum : value < spec.minimum)) {
+                throw Error(std::string("Invalid ") + spec.name + " value");
+            }
+        }
+    }
+
+    for (std::size_t source = 0; source < num_ranks; ++source) {
+        for (std::size_t target = 0; target < num_ranks; ++target) {
+            if (source != target && metrics.mpi_bandwidth_gbps[source * num_ranks + target] <= 0.0) {
+                throw Error("Off-diagonal MPI bandwidth must be positive");
+            }
+        }
+    }
+
+    std::size_t num_nodes = 0;
+    if (!metrics.numa_distance.empty()) {
+        const std::size_t n_dist = metrics.numa_distance.size();
+        num_nodes = static_cast<std::size_t>(std::llround(std::sqrt(static_cast<double>(n_dist))));
+        if (num_nodes == 0 || num_nodes * num_nodes != n_dist) {
+            throw Error("numa_distance must be an N x N matrix");
+        }
+        for (std::size_t i = 0; i < num_nodes; ++i) {
+            const int diag = metrics.numa_distance[i * num_nodes + i];
+            if (diag <= 0) {
+                throw Error("numa_distance diagonal entries must be positive integers");
+            }
+            for (std::size_t j = 0; j < num_nodes; ++j) {
+                const int val = metrics.numa_distance[i * num_nodes + j];
+                if (val <= 0) {
+                    throw Error("numa_distance values must be positive integers");
+                }
+                if (val < diag) {
+                    throw Error("numa_distance diagonal must be the minimum distance");
+                }
+            }
+        }
+    }
+
+    if (!metrics.device_numa_node.empty()) {
+        if (metrics.numa_distance.empty()) {
+            throw Error("device_numa_node provided without numa_distance matrix");
+        }
+        for (int node : metrics.device_numa_node) {
+            if (node < 0 || static_cast<std::size_t>(node) >= num_nodes) {
+                throw Error("device_numa_node out of range");
+            }
+        }
+    }
+}
+
 inline TopoMetrics load_topo_metrics(const std::string& json_path) {
     std::ifstream ifs(json_path);
     if (!ifs.is_open()) {
@@ -358,6 +474,7 @@ inline TopoMetrics load_topo_metrics(const std::string& json_path) {
         throw Error("JSON parse error: trailing characters after object");
     }
 
+    validate_topo_metrics(metrics);
     return metrics;
 }
 
