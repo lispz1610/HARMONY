@@ -110,6 +110,27 @@ else
     rm -rf "$tmp_dir"
 fi
 
+ASYNC_HALO_TEST="bin/test_async_halo_opencl"
+if [ ! -x "$ASYNC_HALO_TEST" ]; then
+    echo "FAIL  test_async_halo_opencl binary not found at $ASYNC_HALO_TEST"
+    failed=1
+else
+    executed=$((executed + 1))
+    halo_log=$(mktemp)
+    $MPIRUN -np 2 "./$ASYNC_HALO_TEST" --require-gpu > "$halo_log" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ] && grep -q "^PASS:" "$halo_log"; then
+        echo "PASS  test_async_halo_opencl --require-gpu (-np 2)"
+    elif [ "$rc" -eq 1 ] && grep -q "Preflight failed:" "$halo_log"; then
+        echo "PASS  test_async_halo_opencl --require-gpu (rejects missing OpenCL GPU, exit 1)"
+    else
+        echo "FAIL  test_async_halo_opencl --require-gpu (-np 2, exit $rc)"
+        cat "$halo_log"
+        failed=1
+    fi
+    rm -f "$halo_log"
+fi
+
 if [ "$executed" -eq 0 ]; then
     echo "error: no executable test binaries found in $PWD/bin" >&2
     exit 1

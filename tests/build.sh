@@ -55,6 +55,7 @@ for src in "${TEST_SOURCES[@]}"; do
     "$CXX" -std=c++17 ${CXXFLAGS:--O3} -Wall -Wextra ${EXTRA_CXXFLAGS:-} \
         -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX \
         -DCL_TARGET_OPENCL_VERSION=${CL_TARGET_OPENCL_VERSION:-$HARMONY_CL_TARGET_OPENCL_VERSION} \
+        -DHARMONY_ROOT_DIR="\"$HARMONY_ROOT\"" \
         -I"$HARMONY_ROOT/include" -I"$HARMONY_ROOT/src" $OPENCL_CFLAGS \
         "$src" -o "bin/$name" \
         -L"$HARMONY_ROOT/lib" -lharmony $OPENCL_LIBS
