@@ -78,6 +78,8 @@ public:
     void set_simulated_ranks_for_testing(int ranks) noexcept;
     void set_simulated_times(const std::vector<double>& times) noexcept;
     void clear_simulated_times() noexcept;
+    void set_topo_metrics(const TopoMetrics& metrics);
+    const std::optional<TopoMetrics>& topo_metrics() const noexcept { return topo_metrics_; }
     void print_devices(std::ostream& os) const;
 
     const std::vector<DeviceInfo>& devices() const noexcept { return devices_; }
@@ -313,6 +315,7 @@ private:
     bool devices_discovered_{false};
     bool simulated_devices_{false};
     std::vector<double> simulated_times_;
+    std::optional<TopoMetrics> topo_metrics_{};
 };
 
 } // namespace harmony

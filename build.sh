@@ -25,7 +25,7 @@ Usage: ./build.sh [options] [targets]
 
 Targets (default: lib tools):
   lib        static library lib/libharmony.a
-  tools      bin/migration_profiler
+  tools      bin/migration_profiler and bin/topo_probe
   examples   builds every example with its own build.sh (needs lib)
   tests      builds C++ tests with tests/build.sh (needs lib)
   install    copies include/ and lib/ to the prefix given with -p
@@ -174,7 +174,8 @@ for target in "${TARGETS[@]}"; do
             ADD_SUBDIRECTORY src || exit 1
             built_lib=1 ;;
         tools)
-            ADD_SUBDIRECTORY tools/migration_profiler || exit 1 ;;
+            ADD_SUBDIRECTORY tools/migration_profiler || exit 1
+            ADD_SUBDIRECTORY tools/topo_probe || exit 1 ;;
         examples)
             [ "$built_lib" = "1" ] || ADD_SUBDIRECTORY src || exit 1
             built_lib=1

@@ -33,6 +33,7 @@
 
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -157,6 +158,10 @@ public:
 
     // Rank 0 prints every load-balancing attempt as it happens (default: on).
     void set_verbose(bool verbose);
+
+    // Hardware topology metrics ----------------------------------------------
+    void set_topo_metrics(const TopoMetrics& metrics);
+    const std::optional<TopoMetrics>& topo_metrics() const noexcept;
 
     // Testing seams (simulated devices/ranks without an OpenCL ICD) ----------
     void set_simulated_devices_count(int count) noexcept;

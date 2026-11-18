@@ -31,6 +31,9 @@ executed=0
 for exe in "${TEST_BINS[@]}"; do
     [ -x "$exe" ] || continue
     name=$(basename "$exe")
+    if [ "$name" = "test_probe_runtime_integration" ]; then
+        continue
+    fi
     for np in $RANKS_LIST; do
         executed=$((executed + 1))
         log=$(mktemp)
@@ -48,6 +51,64 @@ for exe in "${TEST_BINS[@]}"; do
         rm -f "$log"
     done
 done
+
+TOPO_PROBE="../bin/topo_probe"
+PROBE_TEST="bin/test_probe_runtime_integration"
+
+if [ ! -x "$TOPO_PROBE" ]; then
+    echo "FAIL  topo_probe binary not found at $TOPO_PROBE (run ./build.sh tools first)"
+    failed=1
+elif [ ! -x "$PROBE_TEST" ]; then
+    echo "FAIL  test_probe_runtime_integration binary not found at $PROBE_TEST"
+    failed=1
+else
+    tmp_dir=$(mktemp -d)
+    nosynth_json="$tmp_dir/nosynth.json"
+    nosynth_log="$tmp_dir/nosynth.log"
+    executed=$((executed + 1))
+    $MPIRUN -np 1 "$TOPO_PROBE" --output-json "$nosynth_json" > "$nosynth_log" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "PASS  topo_probe (non-synthetic rejects missing OpenCL GPU, exit $rc)"
+    elif grep -q "^mode=measured$" "$nosynth_log" && [ -f "$nosynth_json" ]; then
+        echo "PASS  topo_probe (non-synthetic measured real OpenCL GPU)"
+    else
+        echo "FAIL  topo_probe (non-synthetic exited 0 without mode=measured)"
+        cat "$nosynth_log"
+        failed=1
+    fi
+
+    for np in $RANKS_LIST; do
+        executed=$((executed + 1))
+        probe_json="$tmp_dir/probe_np${np}.json"
+        probe_log="$tmp_dir/probe_np${np}.log"
+        integ_log="$tmp_dir/integ_np${np}.log"
+
+        $MPIRUN -np "$np" "$TOPO_PROBE" --synthetic --output-json "$probe_json" > "$probe_log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ] || [ ! -f "$probe_json" ] || \
+           ! grep -q "^mode=synthetic$" "$probe_log" || \
+           ! grep -q "^rank_device_counts=" "$probe_log"; then
+            echo "FAIL  topo_probe --synthetic (-np $np, exit $rc)"
+            cat "$probe_log"
+            failed=1
+            continue
+        fi
+        echo "PASS  topo_probe --synthetic (-np $np)"
+
+        $MPIRUN -np "$np" "./$PROBE_TEST" "$probe_json" > "$integ_log" 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "PASS  test_probe_runtime_integration (-np $np)"
+        else
+            echo "FAIL  test_probe_runtime_integration (-np $np, exit $rc)"
+            cat "$integ_log"
+            failed=1
+        fi
+    done
+
+    rm -rf "$tmp_dir"
+fi
 
 if [ "$executed" -eq 0 ]; then
     echo "error: no executable test binaries found in $PWD/bin" >&2
