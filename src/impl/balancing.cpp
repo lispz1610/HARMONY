@@ -17,9 +17,11 @@
 #include "harmony/algorithms.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <sstream>
 
@@ -237,6 +239,155 @@ bool Runtime::Impl::propose_division(std::vector<DevicePartition>& new_parts,
     return true;
 }
 
+void Runtime::Impl::validate_collective_balance_inputs(const std::vector<FieldHandle>& fields,
+                                                         const char* context) {
+    unsigned long long field_signature = 1469598103934665603ULL;
+    for (FieldHandle fh : fields) {
+        field_signature ^= static_cast<unsigned long long>(fh.value);
+        field_signature *= 1099511628211ULL;
+    }
+
+    const unsigned long long local_state[6] = {
+        partition_.has_value() ? 1ULL : 0ULL,
+        static_cast<unsigned long long>(partitions_.size()),
+        static_cast<unsigned long long>(simulated_times_.size()),
+        static_cast<unsigned long long>(fields.size()),
+        static_cast<unsigned long long>(current_loads_.size()),
+        field_signature
+    };
+    unsigned long long min_state[6] = {};
+    unsigned long long max_state[6] = {};
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(
+            MPI_Allreduce(local_state, min_state, 6, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+            "MPI_Allreduce(balance input minima)");
+        detail::check_mpi(
+            MPI_Allreduce(local_state, max_state, 6, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+            "MPI_Allreduce(balance input maxima)");
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (min_state[i] != max_state[i]) {
+            throw Error(std::string(context) + ": inconsistent balance inputs across ranks");
+        }
+    }
+}
+
+double Runtime::Impl::estimate_total_migration_cost_seconds(
+    const std::vector<FieldHandle>& fields,
+    const std::vector<DevicePartition>& old_parts,
+    const std::vector<DevicePartition>& new_parts) const {
+    if (!topo_metrics_.has_value()) return 0.0;
+
+    double total_cost_s = 0.0;
+    for (FieldHandle fh : fields) {
+        auto fit = fields_.find(fh.value);
+        if (fit == fields_.end()) continue;
+        const std::size_t elem_bytes = fit->second.element_bytes();
+
+        std::size_t src_idx = 0;
+        std::size_t dst_idx = 0;
+        while (src_idx < old_parts.size() && dst_idx < new_parts.size()) {
+            const DevicePartition& src = old_parts[src_idx];
+            const DevicePartition& dst = new_parts[dst_idx];
+            const std::size_t src_end = src.global_offset + src.element_count;
+            const std::size_t dst_end = dst.global_offset + dst.element_count;
+
+            std::size_t start = 0;
+            std::size_t len = 0;
+            if (detail::intersect_1d(src.global_offset, src.element_count,
+                                     dst.global_offset, dst.element_count, start, len)) {
+                const int src_dev = (src.device_global_index >= 0)
+                    ? src.device_global_index : static_cast<int>(src_idx);
+                const int dst_dev = (dst.device_global_index >= 0)
+                    ? dst.device_global_index : static_cast<int>(dst_idx);
+                if (src_dev != dst_dev) {
+                    total_cost_s += estimate_migration_cost_bytes(
+                        *topo_metrics_, src_dev, dst_dev,
+                        src.owning_rank, dst.owning_rank, len * elem_bytes);
+                }
+            }
+
+            if (src_end <= dst_end) ++src_idx;
+            if (dst_end <= src_end) ++dst_idx;
+        }
+    }
+    return total_cost_s;
+}
+
+bool Runtime::Impl::passes_numa_cost_gate(const std::vector<FieldHandle>& fields,
+                                          const std::vector<DevicePartition>& old_parts,
+                                          const std::vector<DevicePartition>& new_parts,
+                                          const AutoBalancePolicy& policy,
+                                          BalanceRecord& record) {
+    int local_skip = 0;
+    double total_migration_cost_s = 0.0;
+    double expected_gain_s = 0.0;
+
+    if (topo_metrics_.has_value() && !policy.use_power_cap) {
+        const double numa_ratio_limit = (policy.numa_cost_gain_ratio_threshold >= 0.0)
+            ? policy.numa_cost_gain_ratio_threshold
+            : numa_cost_gain_ratio_threshold_;
+        total_migration_cost_s = estimate_total_migration_cost_seconds(fields, old_parts, new_parts);
+
+        const std::vector<double>& times = record.window_seconds;
+        double t_max_current = 0.0;
+        double total_cap = 0.0;
+        std::vector<double> capacity(old_parts.size(), 0.0);
+        const bool apply_contention = policy.use_contention_adjustment &&
+                                      !topo_metrics_->memory_contention_factor.empty();
+        for (std::size_t i = 0; i < old_parts.size() && i < times.size(); ++i) {
+            t_max_current = std::max(t_max_current, times[i]);
+            if (times[i] > 1.0e-12 && old_parts[i].element_count > 0) {
+                double cap = static_cast<double>(old_parts[i].element_count) / times[i];
+                if (apply_contention) {
+                    const int dev_idx = (old_parts[i].device_global_index >= 0)
+                        ? old_parts[i].device_global_index : static_cast<int>(i);
+                    cap = adjusted_capacity(*topo_metrics_, dev_idx, cap);
+                }
+                capacity[i] = cap;
+                total_cap += cap;
+            }
+        }
+
+        double t_max_projected = t_max_current;
+        if (total_cap > 0.0) {
+            t_max_projected = 0.0;
+            for (std::size_t i = 0; i < new_parts.size(); ++i) {
+                if (new_parts[i].element_count == 0) continue;
+                if (i >= capacity.size() || capacity[i] <= 0.0) {
+                    t_max_projected = t_max_current;
+                    break;
+                }
+                t_max_projected = std::max(
+                    t_max_projected, static_cast<double>(new_parts[i].element_count) / capacity[i]);
+            }
+        }
+        expected_gain_s = std::max(0.0, t_max_current - t_max_projected);
+        local_skip = (total_migration_cost_s > numa_ratio_limit * expected_gain_s) ? 1 : 0;
+    }
+
+    int global_skip = 0;
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(
+            MPI_Allreduce(&local_skip, &global_skip, 1, MPI_INT, MPI_LOR, comm_),
+            "MPI_Allreduce(NUMA decision to skip rebalance)");
+    }
+
+    if (global_skip != 0) {
+        if (verbose_ && rank_ == 0) {
+            std::cout << "[NUMA] migration cost exceeds gain threshold, skipping rebalance" << std::endl;
+        }
+        record.reason = "[NUMA] migration cost exceeds gain threshold (cost=" +
+                        detail::format_seconds(total_migration_cost_s) +
+                        ", gain=" + detail::format_seconds(expected_gain_s) + ")";
+        reset_balance_window_events();
+        return false;
+    }
+    return true;
+}
+
 bool Runtime::Impl::maybe_rebalance_from_timings(const std::vector<FieldHandle>& requested_fields,
                                                  const AutoBalancePolicy& policy, BalanceRecord& record) {
     if (!partition_.has_value() || partitions_.empty()) {
@@ -258,8 +409,495 @@ bool Runtime::Impl::maybe_rebalance_from_timings(const std::vector<FieldHandle>&
         return false;
     }
 
+    if (!passes_numa_cost_gate(fields, old_parts, new_parts, policy, record)) {
+        return false;
+    }
+
     apply_partitions(fields, old_parts, new_parts, record);
     return true;
+}
+
+namespace {
+
+constexpr double kHierarchicalHysteresisMinGain = 0.05;
+
+void compute_rank_cuts(const std::vector<float>& inter_cum_loads,
+                       const std::vector<int>& rank_device_counts,
+                       std::size_t global_elements,
+                       std::size_t gran,
+                       std::vector<std::size_t>& rank_cuts) {
+    const std::size_t n_ranks = inter_cum_loads.size();
+    const std::size_t total_units = global_elements / gran;
+    rank_cuts.assign(n_ranks + 1, 0);
+
+    std::size_t last_active = n_ranks;
+    for (std::size_t r = n_ranks; r > 0; --r) {
+        if (rank_device_counts[r - 1] > 0) {
+            last_active = r - 1;
+            break;
+        }
+    }
+
+    for (std::size_t r = 0; r + 1 < n_ranks; ++r) {
+        if (rank_device_counts[r] == 0) {
+            rank_cuts[r + 1] = rank_cuts[r];
+            continue;
+        }
+        if (r >= last_active) {
+            rank_cuts[r + 1] = global_elements;
+            continue;
+        }
+        const double raw = static_cast<double>(inter_cum_loads[r]) * static_cast<double>(total_units);
+        std::size_t cut = static_cast<std::size_t>(std::llround(raw)) * gran;
+        rank_cuts[r + 1] = std::clamp(cut, rank_cuts[r], global_elements);
+    }
+    rank_cuts.back() = global_elements;
+}
+
+void compute_local_device_cuts(std::size_t rank_start,
+                               std::size_t rank_end,
+                               std::size_t gran,
+                               const std::vector<double>& p_local,
+                               std::vector<unsigned long long>& local_offsets,
+                               std::vector<unsigned long long>& local_counts) {
+    const std::size_t n_local = p_local.size();
+    const std::size_t rank_elements = rank_end - rank_start;
+    const std::size_t rank_units = rank_elements / gran;
+
+    std::vector<std::size_t> dev_cuts(n_local + 1, rank_start);
+    double cum_p = 0.0;
+    for (std::size_t li = 0; li + 1 < n_local; ++li) {
+        cum_p += p_local[li];
+        const double raw = cum_p * static_cast<double>(rank_units);
+        const std::size_t cut = rank_start + static_cast<std::size_t>(std::llround(raw)) * gran;
+        dev_cuts[li + 1] = std::clamp(cut, dev_cuts[li], rank_end);
+    }
+    dev_cuts.back() = rank_end;
+
+    local_offsets.resize(n_local);
+    local_counts.resize(n_local);
+    for (std::size_t li = 0; li < n_local; ++li) {
+        local_offsets[li] = static_cast<unsigned long long>(dev_cuts[li]);
+        local_counts[li] = static_cast<unsigned long long>(dev_cuts[li + 1] - dev_cuts[li]);
+    }
+}
+
+struct RankPhase1Result {
+    std::vector<std::size_t> part_indices;
+    std::vector<double> p_local;
+    double local_capacity{0.0};
+    double local_max_time{0.0};
+    std::size_t rank_elements{0};
+};
+
+void compute_inter_node_loads(int num_ranks,
+                              std::size_t global_elements,
+                              const std::vector<double>& rank_data,
+                              bool verbose,
+                              std::vector<float>& inter_cum_loads,
+                              int& abort_migration_flag,
+                              double& global_max_time,
+                              double& projected_time) {
+    double total_capacity = 0.0;
+    global_max_time = 0.0;
+    double inter_baseline_time = 0.0;
+    projected_time = 0.0;
+    std::vector<double> capacities(static_cast<std::size_t>(num_ranks), 0.0);
+    for (int r = 0; r < num_ranks; ++r) {
+        const double r_elements = rank_data[static_cast<std::size_t>(r * 3 + 0)];
+        const double r_max_time = rank_data[static_cast<std::size_t>(r * 3 + 1)];
+        const double r_capacity = rank_data[static_cast<std::size_t>(r * 3 + 2)];
+        total_capacity += r_capacity;
+        global_max_time = std::max(global_max_time, r_max_time);
+        const double r_intra_time = (r_capacity > 0.0) ? (r_elements / r_capacity) : r_max_time;
+        inter_baseline_time = std::max(inter_baseline_time, r_intra_time);
+        capacities[static_cast<std::size_t>(r)] = r_capacity;
+    }
+
+    if (total_capacity > 0.0) {
+        projected_time = static_cast<double>(global_elements) / total_capacity;
+    }
+
+    abort_migration_flag = 0;
+    if (inter_baseline_time > 0.0 && projected_time > 0.0 &&
+        (inter_baseline_time - projected_time) < kHierarchicalHysteresisMinGain * inter_baseline_time) {
+        abort_migration_flag = 1;
+        if (verbose) {
+            std::cout << "[HIER] Inter-node migration aborted due to hysteresis (gain < 5%). projected_time="
+                      << projected_time << " global_max_time=" << global_max_time << std::endl;
+        }
+    }
+
+    inter_cum_loads.assign(static_cast<std::size_t>(num_ranks), 1.0f);
+    if (abort_migration_flag != 0) {
+        double elements_accum = 0.0;
+        for (int r = 0; r < num_ranks; ++r) {
+            elements_accum += rank_data[static_cast<std::size_t>(r * 3)];
+            inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(
+                elements_accum / static_cast<double>(global_elements));
+        }
+        inter_cum_loads.back() = 1.0f;
+    } else if (total_capacity <= 0.0) {
+        inter_cum_loads = detail::equal_cumulative_loads(static_cast<std::size_t>(num_ranks));
+    } else {
+        double cum_cap = 0.0;
+        for (int r = 0; r < num_ranks; ++r) {
+            cum_cap += capacities[static_cast<std::size_t>(r)] / total_capacity;
+            inter_cum_loads[static_cast<std::size_t>(r)] = static_cast<float>(cum_cap);
+        }
+        inter_cum_loads.back() = 1.0f;
+    }
+
+    if (verbose) {
+        const std::vector<float> inter_rank_loads = detail::cumulative_to_individual(inter_cum_loads);
+        std::cout << "[HIER] inter-node loads: [";
+        for (std::size_t r = 0; r < inter_rank_loads.size(); ++r) {
+            if (r > 0) std::cout << ", ";
+            std::cout << inter_rank_loads[r];
+        }
+        std::cout << "]" << std::endl;
+    }
+}
+
+} // namespace
+
+bool Runtime::Impl::maybe_rebalance_hierarchical(const std::vector<FieldHandle>& requested_fields,
+                                                 const AutoBalancePolicy& policy,
+                                                 BalanceRecord& record) {
+    if (!partition_.has_value() || partitions_.empty()) {
+        record.reason = "no partition defined yet";
+        return false;
+    }
+
+    record.window_iterations = iteration_counter_ - balance_window_start_iteration_;
+    const std::vector<FieldHandle> fields = unique_existing_proportional_fields(requested_fields);
+    const std::vector<DevicePartition> old_parts = partitions_;
+    const bool apply_contention = policy.use_contention_adjustment && topo_metrics_.has_value() &&
+                                  !topo_metrics_->memory_contention_factor.empty();
+    record.contention_adjusted = apply_contention;
+
+    const int num_ranks = std::max(1, size());
+    const bool in_process_sim_ranks = (mpi_size_ == 1 && simulated_ranks_ > 1);
+    const std::vector<double> window_elapsed = simulated_times_.empty()
+        ? compute_balance_window_elapsed_local()
+        : std::vector<double>{};
+
+    auto evaluate_phase1 = [&](int target_rank, bool update_timings) {
+        RankPhase1Result res;
+        for (std::size_t i = 0; i < old_parts.size(); ++i) {
+            if (old_parts[i].owning_rank == target_rank) res.part_indices.push_back(i);
+        }
+        const std::size_t n_local = res.part_indices.size();
+        std::vector<double> local_times(n_local, 0.0);
+        for (std::size_t li = 0; li < n_local; ++li) {
+            const std::size_t p_idx = res.part_indices[li];
+            const int g = old_parts[p_idx].device_global_index;
+            if (!simulated_times_.empty()) {
+                if (g >= 0 && static_cast<std::size_t>(g) < simulated_times_.size()) {
+                    local_times[li] = simulated_times_[static_cast<std::size_t>(g)];
+                } else if (li < simulated_times_.size()) {
+                    local_times[li] = simulated_times_[li];
+                }
+            } else if (li < window_elapsed.size() && window_elapsed[li] > 1.0e-12) {
+                local_times[li] = window_elapsed[li];
+            } else if (li < device_timings_.size()) {
+                if (device_timings_[li].kernel_seconds_last > 1.0e-12) {
+                    local_times[li] = device_timings_[li].kernel_seconds_last;
+                } else if (device_timings_[li].kernel_seconds_avg > 1.0e-12) {
+                    local_times[li] = device_timings_[li].kernel_seconds_avg;
+                }
+            }
+            if (local_times[li] <= 1.0e-12) local_times[li] = 1.0;
+            local_times[li] = std::max(local_times[li], 1.0e-9);
+        }
+        if (update_timings && !simulated_times_.empty()) {
+            update_device_timings(local_times);
+        }
+
+        // Unit-element floor on active devices prevents permanent starvation of 0-element ranks.
+        res.p_local.assign(n_local, 0.0);
+        for (std::size_t li = 0; li < n_local; ++li) {
+            const std::size_t p_idx = res.part_indices[li];
+            const double elements = std::max(1.0, static_cast<double>(old_parts[p_idx].element_count));
+            double cap = elements / local_times[li];
+            if (apply_contention) {
+                const int dev_idx = (old_parts[p_idx].device_global_index >= 0)
+                    ? old_parts[p_idx].device_global_index
+                    : static_cast<int>(p_idx);
+                cap = adjusted_capacity(*topo_metrics_, dev_idx, cap);
+            }
+            res.p_local[li] = cap;
+            res.local_capacity += cap;
+            res.rank_elements += old_parts[p_idx].element_count;
+        }
+        if (n_local > 0) {
+            if (res.local_capacity > 0.0) {
+                for (double& share : res.p_local) share /= res.local_capacity;
+            } else {
+                std::fill(res.p_local.begin(), res.p_local.end(), 1.0 / static_cast<double>(n_local));
+            }
+            res.local_max_time = std::max(*std::max_element(local_times.begin(), local_times.end()), 1.0e-9);
+        }
+        return res;
+    };
+
+    const RankPhase1Result my_phase1 = evaluate_phase1(rank_, true);
+
+    if (verbose_ && rank_ == 0) {
+        std::cout << "[HIER] intra-node loads: [";
+        for (std::size_t li = 0; li < my_phase1.p_local.size(); ++li) {
+            if (li > 0) std::cout << ", ";
+            std::cout << my_phase1.p_local[li];
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    {
+        PhaseTimer wait_timer(*this, Phase::device_wait);
+        synchronize_all_local_devices(false);
+    }
+
+    std::vector<int> rank_device_counts = all_device_counts_;
+    if (rank_device_counts.size() != static_cast<std::size_t>(num_ranks)) {
+        rank_device_counts.assign(static_cast<std::size_t>(num_ranks), 0);
+        for (const DevicePartition& dp : old_parts) {
+            if (dp.owning_rank >= 0 && dp.owning_rank < num_ranks) {
+                ++rank_device_counts[static_cast<std::size_t>(dp.owning_rank)];
+            }
+        }
+    }
+
+    const std::size_t gran = std::max<std::size_t>(1, partition_->granularity);
+    std::vector<DevicePartition> new_parts = old_parts;
+    int abort_migration_flag = 0;
+    double global_max_time = 0.0;
+    double projected_time = 0.0;
+
+    if (in_process_sim_ranks) {
+        std::vector<RankPhase1Result> all_phase1(static_cast<std::size_t>(num_ranks));
+        std::vector<double> rank_data(static_cast<std::size_t>(num_ranks) * 3, 0.0);
+        for (int r = 0; r < num_ranks; ++r) {
+            all_phase1[static_cast<std::size_t>(r)] = (r == rank_) ? my_phase1 : evaluate_phase1(r, false);
+            rank_data[static_cast<std::size_t>(r * 3 + 0)] = static_cast<double>(all_phase1[r].rank_elements);
+            rank_data[static_cast<std::size_t>(r * 3 + 1)] = all_phase1[r].local_max_time;
+            rank_data[static_cast<std::size_t>(r * 3 + 2)] = all_phase1[r].local_capacity;
+        }
+        std::vector<float> inter_cum_loads;
+        compute_inter_node_loads(num_ranks, partition_->global_elements, rank_data, verbose_,
+                                 inter_cum_loads, abort_migration_flag, global_max_time, projected_time);
+        std::vector<std::size_t> rank_cuts;
+        compute_rank_cuts(inter_cum_loads, rank_device_counts, partition_->global_elements, gran, rank_cuts);
+
+        for (int r = 0; r < num_ranks; ++r) {
+            const RankPhase1Result& rp = all_phase1[static_cast<std::size_t>(r)];
+            std::size_t r_start = 0;
+            std::size_t r_end = 0;
+            if (abort_migration_flag != 0 && !rp.part_indices.empty()) {
+                r_start = old_parts[rp.part_indices.front()].global_offset;
+                r_end = old_parts[rp.part_indices.back()].global_offset +
+                        old_parts[rp.part_indices.back()].element_count;
+            } else {
+                r_start = rank_cuts[static_cast<std::size_t>(r)];
+                r_end = rank_cuts[static_cast<std::size_t>(r) + 1];
+            }
+            std::vector<unsigned long long> offs;
+            std::vector<unsigned long long> cnts;
+            compute_local_device_cuts(r_start, r_end, gran, rp.p_local, offs, cnts);
+            for (std::size_t li = 0; li < rp.part_indices.size(); ++li) {
+                const std::size_t p_idx = rp.part_indices[li];
+                new_parts[p_idx].global_offset = static_cast<std::size_t>(offs[li]);
+                new_parts[p_idx].element_count = static_cast<std::size_t>(cnts[li]);
+            }
+        }
+    } else {
+        double local_data[3] = {
+            static_cast<double>(my_phase1.rank_elements), my_phase1.local_max_time, my_phase1.local_capacity
+        };
+        std::vector<double> rank_data(static_cast<std::size_t>(mpi_size_) * 3, 0.0);
+        {
+            PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+            detail::check_mpi(
+                MPI_Gather(local_data, 3, MPI_DOUBLE, rank_data.data(), 3, MPI_DOUBLE, 0, comm_),
+                "MPI_Gather(hierarchical rank capacities)");
+        }
+
+        std::vector<float> inter_cum_loads(static_cast<std::size_t>(mpi_size_), 0.0f);
+        if (rank_ == 0) {
+            compute_inter_node_loads(mpi_size_, partition_->global_elements, rank_data, verbose_,
+                                     inter_cum_loads, abort_migration_flag, global_max_time, projected_time);
+        }
+
+        {
+            PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+            detail::check_mpi(
+                MPI_Bcast(inter_cum_loads.data(), mpi_size_, MPI_FLOAT, 0, comm_),
+                "MPI_Bcast(hierarchical inter_cum_loads)");
+            detail::check_mpi(
+                MPI_Bcast(&abort_migration_flag, 1, MPI_INT, 0, comm_),
+                "MPI_Bcast(hierarchical abort_migration_flag)");
+        }
+
+        std::vector<std::size_t> rank_cuts;
+        compute_rank_cuts(inter_cum_loads, rank_device_counts, partition_->global_elements, gran, rank_cuts);
+
+        const std::size_t n_local = my_phase1.part_indices.size();
+        std::size_t rank_start = 0;
+        std::size_t rank_end = 0;
+        if (abort_migration_flag != 0 && n_local > 0) {
+            rank_start = old_parts[my_phase1.part_indices.front()].global_offset;
+            rank_end = old_parts[my_phase1.part_indices.back()].global_offset +
+                       old_parts[my_phase1.part_indices.back()].element_count;
+        } else {
+            rank_start = rank_cuts[static_cast<std::size_t>(rank_)];
+            rank_end = rank_cuts[static_cast<std::size_t>(rank_) + 1];
+        }
+
+        std::vector<unsigned long long> local_offsets;
+        std::vector<unsigned long long> local_counts;
+        compute_local_device_cuts(rank_start, rank_end, gran, my_phase1.p_local, local_offsets, local_counts);
+
+        const std::size_t total_devices = old_parts.size();
+        if (abort_migration_flag == 0) {
+            std::vector<int> displs(static_cast<std::size_t>(mpi_size_), 0);
+            for (int r = 1; r < mpi_size_; ++r) {
+                displs[static_cast<std::size_t>(r)] =
+                    displs[static_cast<std::size_t>(r - 1)] + rank_device_counts[static_cast<std::size_t>(r - 1)];
+            }
+            std::vector<unsigned long long> all_offsets(total_devices, 0ULL);
+            std::vector<unsigned long long> all_counts(total_devices, 0ULL);
+            {
+                PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+                detail::check_mpi(
+                    MPI_Allgatherv(local_offsets.data(), static_cast<int>(n_local), MPI_UNSIGNED_LONG_LONG,
+                                   all_offsets.data(), rank_device_counts.data(), displs.data(),
+                                   MPI_UNSIGNED_LONG_LONG, comm_),
+                    "MPI_Allgatherv(hierarchical all_offsets)");
+                detail::check_mpi(
+                    MPI_Allgatherv(local_counts.data(), static_cast<int>(n_local), MPI_UNSIGNED_LONG_LONG,
+                                   all_counts.data(), rank_device_counts.data(), displs.data(),
+                                   MPI_UNSIGNED_LONG_LONG, comm_),
+                    "MPI_Allgatherv(hierarchical all_counts)");
+            }
+            for (std::size_t g = 0; g < total_devices; ++g) {
+                new_parts[g].global_offset = static_cast<std::size_t>(all_offsets[g]);
+                new_parts[g].element_count = static_cast<std::size_t>(all_counts[g]);
+            }
+
+            // C1 collective partition conservation check.
+            std::size_t covered = 0;
+            for (const DevicePartition& dp : new_parts) covered += dp.element_count;
+            unsigned long long covered_ull = static_cast<unsigned long long>(covered);
+            unsigned long long min_covered = 0;
+            unsigned long long max_covered = 0;
+            {
+                PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+                detail::check_mpi(
+                    MPI_Allreduce(&covered_ull, &min_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm_),
+                    "MPI_Allreduce(C1 partition conservation min)");
+                detail::check_mpi(
+                    MPI_Allreduce(&covered_ull, &max_covered, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm_),
+                    "MPI_Allreduce(C1 partition conservation max)");
+            }
+            if (min_covered != static_cast<unsigned long long>(partition_->global_elements) ||
+                max_covered != static_cast<unsigned long long>(partition_->global_elements)) {
+                reset_balance_window_events();
+                record.reason = "hierarchical partition conservation check failed";
+                return false;
+            }
+        } else {
+            const int max_devs_per_rank = rank_device_counts.empty()
+                ? 0
+                : *std::max_element(rank_device_counts.begin(), rank_device_counts.end());
+            if (max_devs_per_rank > 1) {
+                // Multiple devices on at least one rank: publish intra-node cuts cleanly via one Allreduce.
+                std::vector<unsigned long long> local_metadata(total_devices * 2, 0ULL);
+                std::vector<unsigned long long> global_metadata(total_devices * 2, 0ULL);
+                for (std::size_t li = 0; li < n_local; ++li) {
+                    const std::size_t p_idx = my_phase1.part_indices[li];
+                    local_metadata[p_idx * 2] = local_offsets[li];
+                    local_metadata[p_idx * 2 + 1] = local_counts[li];
+                }
+                {
+                    PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+                    detail::check_mpi(
+                        MPI_Allreduce(local_metadata.data(), global_metadata.data(),
+                                      static_cast<int>(global_metadata.size()), MPI_UNSIGNED_LONG_LONG,
+                                      MPI_SUM, comm_),
+                        "MPI_Allreduce(hierarchical local partition metadata)");
+                }
+                for (std::size_t g = 0; g < total_devices; ++g) {
+                    new_parts[g].global_offset = static_cast<std::size_t>(global_metadata[g * 2]);
+                    new_parts[g].element_count = static_cast<std::size_t>(global_metadata[g * 2 + 1]);
+                }
+            }
+        }
+    }
+
+    if (rank_ == 0) {
+        const double window_n = static_cast<double>(std::max<std::size_t>(record.window_iterations, 1));
+        record.iteration_seconds_before = global_max_time / window_n;
+        record.iteration_seconds_after = (abort_migration_flag != 0)
+            ? record.iteration_seconds_before
+            : (projected_time / window_n);
+    }
+
+    int local_invalid_partition = 0;
+    std::size_t covered_elements = 0;
+    for (const DevicePartition& part : new_parts) {
+        if (part.global_offset != covered_elements ||
+            part.element_count > partition_->global_elements - covered_elements) {
+            local_invalid_partition = 1;
+            break;
+        }
+        covered_elements += part.element_count;
+    }
+    if (covered_elements != partition_->global_elements) local_invalid_partition = 1;
+    if (abort_migration_flag == 0 && !in_process_sim_ranks) {
+        int any_invalid_partition = 0;
+        {
+            PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+            detail::check_mpi(
+                MPI_Allreduce(&local_invalid_partition, &any_invalid_partition, 1, MPI_INT, MPI_MAX, comm_),
+                "MPI_Allreduce(hierarchical partition coverage)");
+        }
+        if (any_invalid_partition != 0) {
+            throw Error("Hierarchical partition has a gap, overlap, or missing elements");
+        }
+    } else if (local_invalid_partition != 0) {
+        throw Error("Hierarchical partition has a gap, overlap, or missing elements");
+    }
+
+    const bool unchanged = detail::same_partition_layout(old_parts, new_parts);
+    if (unchanged) {
+        current_loads_ = loads_from_partitions(partitions_);
+        {
+            PhaseTimer wait_timer(*this, Phase::device_wait);
+            synchronize_all_local_devices(true);
+        }
+        reset_balance_window_events();
+        record.reason = (abort_migration_flag != 0)
+            ? "inter-node migration aborted due to hysteresis (gain < 5%)"
+            : "the division is already balanced";
+    } else {
+        apply_partitions(fields, old_parts, new_parts, record,
+                         /*synchronize_ranks=*/(abort_migration_flag == 0 && !in_process_sim_ranks));
+        record.reason = (abort_migration_flag != 0)
+            ? "intra-node rebalance applied (inter-node migration aborted due to hysteresis)"
+            : "hierarchical two-phase rebalance applied";
+    }
+
+    if (verbose_ && rank_ == 0) {
+        std::cout << "[HIER] final partition: [";
+        for (std::size_t i = 0; i < partitions_.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << "dev " << partitions_[i].device_global_index
+                      << ": offset=" << partitions_[i].global_offset
+                      << " count=" << partitions_[i].element_count;
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    return !unchanged;
 }
 
 bool Runtime::Impl::maybe_rebalance_profiled(const std::vector<FieldHandle>& requested_fields,

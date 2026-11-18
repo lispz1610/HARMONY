@@ -144,7 +144,9 @@ double Runtime::Impl::stop_timing() {
 // Printed once, the first time a step with balancing runs.
 void Runtime::Impl::print_balance_policy(const AutoBalancePolicy& policy) {
     if (!verbose_ || rank_ != 0) return;
-    const bool is_dynamic = policy.mode == BalanceMode::dynamic_threshold ||
+    const bool is_hierarchical = policy.mode == BalanceMode::hierarchical;
+    const bool is_dynamic = is_hierarchical ||
+                            policy.mode == BalanceMode::dynamic_threshold ||
                             policy.mode == BalanceMode::dynamic_profiled;
     const bool is_threshold = policy.mode == BalanceMode::dynamic_threshold ||
                               policy.mode == BalanceMode::static_threshold;
@@ -152,9 +154,14 @@ void Runtime::Impl::print_balance_policy(const AutoBalancePolicy& policy) {
     const int warmup = std::max(0, policy.warmup);
 
     std::ostringstream out;
-    out << "[HARMONY] Load balancing: " << (is_dynamic ? "dynamic " : "static ")
-        << (is_threshold ? "threshold" : "profiled")
-        << " (algorithm: " << (policy.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad");
+    out << "[HARMONY] Load balancing: ";
+    if (is_hierarchical) {
+        out << "hierarchical";
+    } else {
+        out << (is_dynamic ? "dynamic " : "static ")
+            << (is_threshold ? "threshold" : "profiled");
+    }
+    out << " (algorithm: " << (policy.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad");
     if (policy.algorithm == BalanceAlgorithm::hwtopolb) {
         out << ", perturbation=" << detail::format_number(policy.perturbation_factor, 4)
             << ", seed=" << policy.seed;
@@ -183,7 +190,9 @@ void Runtime::Impl::print_balance_policy(const AutoBalancePolicy& policy) {
     }
     out << "\n          Each one measures the iterations since the previous one and proposes shares proportional\n"
         << "          to the speed of each device; ";
-    if (is_threshold) {
+    if (is_hierarchical) {
+        out << "equalizes locally within each rank and applies inter-node migration only when gain >= 5%.\n";
+    } else if (is_threshold) {
         out << "the new division is applied when it changes by at least " << detail::format_number(policy.threshold, 4)
             << " (L2 distance of the cumulative loads).\n";
     } else {

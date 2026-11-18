@@ -35,7 +35,7 @@ void Runtime::Impl::rebalance_to(const std::vector<float>& loads) {
     cumulative.back() = 1.0f;
 
     const std::vector<DevicePartition> old_parts = partitions_;
-    const std::vector<DevicePartition> new_parts = partitions_from_loads(cumulative);
+    const std::vector<DevicePartition> new_parts = partitions_from_loads(cumulative, /*allow_empty=*/true);
     if (new_parts.size() != old_parts.size()) {
         throw Error("rebalance_to(): rounded partition count mismatch");
     }
@@ -72,15 +72,25 @@ std::vector<FieldHandle> Runtime::Impl::all_field_handles() const {
 void Runtime::Impl::apply_partitions(const std::vector<FieldHandle>& fields,
                                      const std::vector<DevicePartition>& old_parts,
                                      const std::vector<DevicePartition>& new_parts,
-                                     BalanceRecord& record) {
+                                     BalanceRecord& record,
+                                     bool synchronize_ranks) {
     PhaseTimer timer(*this, Phase::migration);
     const double t0 = MPI_Wtime();
 
-    synchronize_untimed(true);
-    redistribute_selected_registered_fields(fields, old_parts, new_parts);
+    auto sync_devices_or_ranks = [&]() {
+        if (synchronize_ranks) {
+            synchronize_untimed(true);
+        } else {
+            PhaseTimer wait_timer(*this, Phase::device_wait);
+            synchronize_all_local_devices(true);
+        }
+    };
+
+    sync_devices_or_ranks();
+    redistribute_selected_registered_fields(fields, old_parts, new_parts, synchronize_ranks);
     partitions_ = new_parts;
     current_loads_ = loads_from_partitions(partitions_);
-    synchronize_untimed(true);
+    sync_devices_or_ranks();
     reset_balance_window_events();
 
     // Partition borders moved: every ghost region now holds old data.
@@ -116,11 +126,14 @@ std::size_t Runtime::Impl::bytes_moved(const std::vector<FieldHandle>& fields,
 // Only proportional fields are moved (none = replicated, total = reserved).
 void Runtime::Impl::redistribute_selected_registered_fields(const std::vector<FieldHandle>& fields,
                                         const std::vector<DevicePartition>& old_parts,
-                                        const std::vector<DevicePartition>& new_parts) {
+                                        const std::vector<DevicePartition>& new_parts,
+                                        bool synchronize_ranks) {
     for (FieldHandle fh : unique_existing_proportional_fields(fields)) {
         redistribute_field_intersection(fh, old_parts, new_parts);
-        PhaseTimer timer(*this, Phase::mpi_migration);
-        detail::check_mpi(MPI_Barrier(comm_), "MPI_Barrier(redistribute field)");
+        if (synchronize_ranks) {
+            PhaseTimer timer(*this, Phase::mpi_migration);
+            detail::check_mpi(MPI_Barrier(comm_), "MPI_Barrier(redistribute field)");
+        }
     }
 }
 

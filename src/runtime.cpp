@@ -64,6 +64,12 @@ void Runtime::set_verbose(bool verbose) { impl_->set_verbose(verbose); }
 
 void Runtime::set_topo_metrics(const TopoMetrics& metrics) { impl_->set_topo_metrics(metrics); }
 const std::optional<TopoMetrics>& Runtime::topo_metrics() const noexcept { return impl_->topo_metrics(); }
+void Runtime::set_numa_cost_gain_ratio_threshold(double threshold) noexcept {
+    impl_->set_numa_cost_gain_ratio_threshold(threshold);
+}
+double Runtime::numa_cost_gain_ratio_threshold() const noexcept {
+    return impl_->numa_cost_gain_ratio_threshold();
+}
 
 void Runtime::set_simulated_devices_count(int count) noexcept {
     impl_->set_simulated_devices_count(count);
