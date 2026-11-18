@@ -30,7 +30,7 @@ We adopt an optional Pre-Cluster Validation testbed located in the `colab/` dire
    - `colab/harmony_colab.ipynb`: Provides a self-contained notebook interface with a 1-click execution flow for developers to clone, bootstrap, build, and validate changes directly from GitHub.
 
 3. **Core Runtime Freeze**:
-   - The core runtime in `include/harmony/` and `src/` remains 100% frozen and untouched (baseline `c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77`). All validation scripts and notebook drivers operate purely as external callers.
+   - The core runtime in `include/harmony/` and `src/` remains 100% frozen and untouched (baseline `8d7c3392c8d616997b342f778ca041a9a717aff2`). All validation scripts and notebook drivers operate purely as external callers.
 
 ## Consequences
 

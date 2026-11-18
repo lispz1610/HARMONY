@@ -90,6 +90,15 @@ void test_hierarchical_timing_imbalance(int argc, char** argv) {
     assert((report.balance[0].elements_before == std::vector<std::size_t>{500000, 500000}));
     assert((report.balance[0].elements_after == std::vector<std::size_t>{666667, 333333}));
 
+    std::ostringstream text_report;
+    rt.print_timing_report(text_report);
+    if (rank == 0) {
+        const std::string txt = text_report.str();
+        assert(txt.find("Load balancing: hierarchical") != std::string::npos);
+        assert(txt.find("static profiled") == std::string::npos);
+        assert(txt.find("(single attempt)") == std::string::npos);
+    }
+
     const std::string csv_path =
         "/tmp/harmony_test_hier_" + std::to_string(static_cast<long>(getpid())) + ".csv";
     rt.write_timing_report(csv_path);
@@ -379,6 +388,177 @@ void test_consecutive_micro_partitions_are_removed_before_halo(int argc, char** 
     assert(covered == 10);
 }
 
+void test_hierarchical_hwtopolb_seed_sync_and_record(int argc, char** argv) {
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    auto check_rank_agreement = [&](const harmony::Runtime& rt) {
+        const auto& parts = rt.partitions();
+        assert(parts.size() == 2);
+        assert(parts[0].element_count + parts[1].element_count == 1000000);
+        unsigned long long local_counts[2] = {
+            static_cast<unsigned long long>(parts[0].element_count),
+            static_cast<unsigned long long>(parts[1].element_count)
+        };
+        unsigned long long root_counts[2] = {local_counts[0], local_counts[1]};
+        MPI_Bcast(root_counts, 2, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        assert(local_counts[0] == root_counts[0]);
+        assert(local_counts[1] == root_counts[1]);
+    };
+
+    // Case A: seed == 0 auto-generates on rank 0, broadcasts via MPI_Bcast, and populates BalanceRecord.
+    {
+        auto rt = harmony::Runtime::create(argc, argv);
+        rt.set_verbose(false);
+        rt.set_simulated_devices_count(2);
+        rt.set_partition({1000000, 1, sizeof(float), 1});
+        auto fh = rt.create_field({"hw_auto", 1000000, 1, sizeof(float),
+                                   harmony::BufferUsage::read_write, nullptr,
+                                   harmony::RedistributionDependency::proportional});
+
+        harmony::AutoBalancePolicy policy;
+        policy.mode = harmony::BalanceMode::hierarchical;
+        policy.interval = 1;
+        policy.algorithm = harmony::BalanceAlgorithm::hwtopolb;
+        policy.perturbation_factor = 0.25f;
+        policy.seed = 0;
+
+        auto step = rt.step("hier_hwtopolb_auto")
+            .with_balance(policy)
+            .tag_field(fh, harmony::StepFieldRole::rebalance_source)
+            .build();
+
+        rt.set_simulated_times({0.010, 0.020});
+        rt.execute(step);
+        check_rank_agreement(rt);
+
+        const auto report = rt.timing_report();
+        assert(report.balance.size() == 1);
+        assert(report.balance[0].policy == "hierarchical");
+        assert(report.balance[0].algorithm == "hwtopolb");
+        assert(report.balance[0].applied);
+        assert(std::fabs(report.balance[0].perturbation_factor - 0.25f) < 1e-6f);
+        assert(report.balance[0].seed != 0);
+
+        unsigned int root_seed = report.balance[0].seed;
+        MPI_Bcast(&root_seed, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+        assert(report.balance[0].seed == root_seed);
+    }
+
+    // Case B: explicit seed is deterministic across runs and perturbs away from ERAD's 666667/333333.
+    auto run_seeded = [&](unsigned int seed) {
+        auto rt = harmony::Runtime::create(argc, argv);
+        rt.set_verbose(false);
+        rt.set_simulated_devices_count(2);
+        rt.set_partition({1000000, 1, sizeof(float), 1});
+        auto fh = rt.create_field({"hw_seed", 1000000, 1, sizeof(float),
+                                   harmony::BufferUsage::read_write, nullptr,
+                                   harmony::RedistributionDependency::proportional});
+
+        harmony::AutoBalancePolicy policy;
+        policy.mode = harmony::BalanceMode::hierarchical;
+        policy.interval = 1;
+        policy.algorithm = harmony::BalanceAlgorithm::hwtopolb;
+        policy.perturbation_factor = 0.25f;
+        policy.seed = seed;
+
+        auto step = rt.step("hier_hwtopolb_seeded")
+            .with_balance(policy)
+            .tag_field(fh, harmony::StepFieldRole::rebalance_source)
+            .build();
+
+        rt.set_simulated_times({0.010, 0.020});
+        rt.execute(step);
+        check_rank_agreement(rt);
+        const auto report = rt.timing_report();
+        assert(report.balance.size() == 1);
+        assert(report.balance[0].seed == seed);
+        assert(report.balance[0].algorithm == "hwtopolb");
+        assert(report.balance[0].applied);
+        return rt.partitions()[0].element_count;
+    };
+
+    const std::size_t run1 = run_seeded(123u);
+    const std::size_t run2 = run_seeded(123u);
+    assert(run1 == run2);
+    assert(run1 != 666667);
+    (void)rank;
+}
+
+void test_hierarchical_power_cap_and_record(int argc, char** argv) {
+    auto rt = harmony::Runtime::create(argc, argv);
+    rt.set_verbose(false);
+    rt.set_simulated_devices_count(2);
+    rt.set_partition({1000000, 1, sizeof(float), 1});
+    auto fh = rt.create_field({"hier_pcap", 1000000, 1, sizeof(float),
+                               harmony::BufferUsage::read_write, nullptr,
+                               harmony::RedistributionDependency::proportional});
+
+    const std::size_t n_ranks = static_cast<std::size_t>(rt.size());
+    harmony::TopoMetrics m;
+    m.pcie_latency_ns = {4000.0, 4000.0};
+    m.pcie_bandwidth_gbps = {15.0, 15.0};
+    m.mpi_latency_ns.assign(n_ranks * n_ranks, 0.0);
+    m.mpi_bandwidth_gbps.assign(n_ranks * n_ranks, 0.0);
+    for (std::size_t s = 0; s < n_ranks; ++s) {
+        for (std::size_t d = 0; d < n_ranks; ++d) {
+            if (s != d) {
+                m.mpi_latency_ns[s * n_ranks + d] = 1000.0;
+                m.mpi_bandwidth_gbps[s * n_ranks + d] = 3.0;
+            }
+        }
+    }
+    m.memory_contention_factor = {1.0, 2.0};
+    m.thermal_tdp_watts = {200.0, 200.0};
+    m.current_power_watts = {220.0, 50.0};
+    rt.set_topo_metrics(m);
+
+    harmony::AutoBalancePolicy policy;
+    policy.mode = harmony::BalanceMode::hierarchical;
+    policy.interval = 1;
+    policy.algorithm = harmony::BalanceAlgorithm::erad;
+    policy.use_contention_adjustment = true;
+    policy.use_power_cap = true;
+    policy.power_budget_watts = 350.0;
+
+    auto step = rt.step("hier_power")
+        .with_balance(policy)
+        .tag_field(fh, harmony::StepFieldRole::rebalance_source)
+        .build();
+
+    rt.start_timing();
+    rt.set_simulated_times({0.005, 0.010});
+    rt.execute(step);
+    (void)rt.stop_timing();
+
+    // Dev 0 drew 220W > 200W TDP, so apply_power_cap must shed load from Dev 0 to Dev 1.
+    assert(rt.partitions()[0].element_count < 500000);
+    assert(rt.partitions()[1].element_count > 500000);
+    assert(rt.partitions()[0].element_count + rt.partitions()[1].element_count == 1000000);
+
+    const auto report = rt.timing_report();
+    assert(report.balance.size() == 1);
+    assert(report.balance[0].policy == "hierarchical");
+    assert(report.balance[0].algorithm == "erad");
+    assert(report.balance[0].applied);
+    assert(report.balance[0].contention_adjusted);
+    assert(report.balance[0].power_capped);
+    assert(std::fabs(report.balance[0].power_budget_watts - 350.0) < 1e-9);
+    assert(std::fabs(report.balance[0].throttle_factor - 1.0) < 1e-9);
+
+    // Infeasible power cap must throw harmony::Error collectively across all ranks.
+    m.current_power_watts = {400.0, 400.0};
+    rt.set_topo_metrics(m);
+    rt.set_simulated_times({0.010, 0.010});
+    bool rejected = false;
+    try {
+        rt.execute(step);
+    } catch (const harmony::Error&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -397,6 +577,8 @@ int main(int argc, char** argv) {
     test_local_rebalance_keeps_global_partition_view(argc, argv);
     test_constant_throughput_converges(argc, argv);
     test_consecutive_micro_partitions_are_removed_before_halo(argc, argv);
+    test_hierarchical_hwtopolb_seed_sync_and_record(argc, argv);
+    test_hierarchical_power_cap_and_record(argc, argv);
 
     if (rank == 0) {
         std::cout << "[PASS] test_hierarchical\n";

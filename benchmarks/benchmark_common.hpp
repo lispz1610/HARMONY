@@ -8,6 +8,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -312,6 +313,76 @@ inline float leanmd_ref_at(const std::vector<float>& pos_x,
         expected += inv * inv6 * (2.0f * inv6 - 1.0f);
     }
     return expected;
+}
+
+template <typename ElementWorkFn>
+inline void run_simulated_partition_work(const std::vector<harmony::DevicePartition>& partitions,
+                                         int rank,
+                                         ElementWorkFn&& work_at,
+                                         std::vector<double>& local_device_times) {
+    for (std::size_t p_idx = 0; p_idx < partitions.size(); ++p_idx) {
+        const auto& p = partitions[p_idx];
+        if (p.owning_rank != rank || p.element_count == 0) continue;
+
+        const std::size_t offset = p.global_offset;
+        const std::size_t count = p.element_count;
+        const int work_passes = (p.device_global_index == 0 ? 2 : 1);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int pass = 0; pass < work_passes; ++pass) {
+            for (std::size_t i = offset; i < offset + count; ++i) {
+                work_at(i);
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        local_device_times[p_idx] = std::chrono::duration<double>(t1 - t0).count();
+    }
+}
+
+template <typename ElementWorkFn>
+inline std::vector<double> run_benchmark_loop(harmony::Runtime& runtime,
+                                              const harmony::ExecutionStep& step,
+                                              const harmony::AutoBalancePolicy& policy,
+                                              const BenchmarkOptions& opt,
+                                              bool opencl_available,
+                                              ElementWorkFn&& sim_work_at) {
+    const int rank = runtime.rank();
+    std::vector<double> step_times(static_cast<std::size_t>(opt.iterations), 0.0);
+    std::vector<double> sim_window_times;
+    bool sim_static_attempted = false;
+
+    runtime.start_timing();
+    for (int it = 0; it < opt.iterations; ++it) {
+        const auto step_start = std::chrono::steady_clock::now();
+
+        if (!opencl_available) {
+            const auto& partitions = runtime.partitions();
+            if (sim_window_times.size() != partitions.size()) {
+                sim_window_times.assign(partitions.size(), 0.0);
+            }
+            std::vector<double> local_device_times(partitions.size(), 0.0);
+            run_simulated_partition_work(partitions, rank, sim_work_at, local_device_times);
+            std::vector<double> iter_device_times(partitions.size(), 0.0);
+            MPI_Allreduce(local_device_times.data(), iter_device_times.data(),
+                          static_cast<int>(partitions.size()), MPI_DOUBLE, MPI_MAX, runtime.communicator());
+            for (std::size_t i = 0; i < partitions.size(); ++i) {
+                sim_window_times[i] += iter_device_times[i];
+            }
+            runtime.set_simulated_times(sim_window_times);
+        }
+
+        runtime.execute(step);
+
+        if (!opencl_available &&
+            should_reset_sim_window(policy, it + 1, opt.iterations, sim_static_attempted)) {
+            std::fill(sim_window_times.begin(), sim_window_times.end(), 0.0);
+        }
+
+        const auto step_end = std::chrono::steady_clock::now();
+        step_times[static_cast<std::size_t>(it)] =
+            std::chrono::duration<double>(step_end - step_start).count();
+    }
+    return step_times;
 }
 
 inline bool write_benchmark_outputs(harmony::Runtime& runtime,

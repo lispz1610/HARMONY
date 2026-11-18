@@ -380,6 +380,51 @@ void test_simulated_times_and_auto_rebalance(int argc, char** argv) {
     }
 }
 
+void test_simulated_balance_off_counts_iterations(int argc, char** argv) {
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    auto rt = harmony::Runtime::create(argc, argv);
+    rt.set_verbose(false);
+    rt.set_simulated_devices_count(2);
+    rt.set_partition({1000, 1, sizeof(float), 1});
+    auto f = rt.create_field({"u", 1000, 1, sizeof(float), harmony::BufferUsage::read_write, nullptr,
+                              harmony::RedistributionDependency::proportional});
+
+    harmony::AutoBalancePolicy off_policy;
+    off_policy.mode = harmony::BalanceMode::off;
+    auto step = rt.step("sim_off")
+        .with_balance(off_policy)
+        .tag_field(f, harmony::StepFieldRole::rebalance_source)
+        .synchronize_at_end(true)
+        .build();
+
+    rt.start_timing();
+    for (int it = 0; it < 5; ++it) {
+        rt.set_simulated_times({0.01, 0.02});
+        rt.execute(step);
+    }
+    const double wall = rt.stop_timing();
+    assert(wall >= 0.0);
+
+    const auto report = rt.timing_report();
+    assert(report.iterations == 5);
+    assert(report.balance.empty());
+    assert(rt.partitions()[0].element_count == 500);
+    assert(rt.partitions()[1].element_count == 500);
+
+    const std::string csv_path =
+        "/tmp/harmony_sim_off_" + std::to_string(static_cast<long>(getpid())) + ".csv";
+    rt.write_timing_report(csv_path);
+    if (rank == 0) {
+        std::ifstream ifs(csv_path);
+        assert(ifs.is_open());
+        const std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        assert(content.find(",5," + std::to_string(rt.size()) + ",2,0,0,0\n") != std::string::npos);
+        std::remove(csv_path.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -393,6 +438,7 @@ int main(int argc, char** argv) {
     test_simulated_discovery_and_partitioning(argc, argv);
     test_simulated_rebalance_to(argc, argv);
     test_simulated_times_and_auto_rebalance(argc, argv);
+    test_simulated_balance_off_counts_iterations(argc, argv);
 
     if (rank == 0) {
         std::cout << "[PASS] test_runtime_simulated\n";

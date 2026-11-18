@@ -31,11 +31,13 @@ HISTORICAL_PRELIMINARY = {
     ("leanmd", 456): {"erad_s": 4.221200, "hwtopolb_s": 0.361940, "ratio": 11.66, "speedup_pct": 91.43},
 }
 
-# Named heuristic classification thresholds for seed-123 descriptive summary.
+# Named heuristic classification thresholds for seed-123 descriptive summary and telemetry.
 # These thresholds are descriptive heuristics only, NOT causal findings or verified boundaries.
-# Observations and classifications are strictly limited to the measured 2-GPU configuration.
+# Observations and classifications are strictly limited to the measured configuration.
 HEURISTIC_SEED_123_SPEEDUP_THRESHOLD = 2.0
 HEURISTIC_SEED_123_PARITY_THRESHOLD = 1.05
+# Non-causal heuristic threshold (MHz) for flagging inter-node graphics clock spread in telemetry.
+HEURISTIC_CLOCK_DIVERGENCE_DELTA_MHZ = 15
 
 _LOAD_LINE_RE = re.compile(
     r"part\[(\d+)\]\s+cum=([0-9.]+)%\s+share=([0-9.]+)%\s+"
@@ -1145,9 +1147,9 @@ def _collect_environment_metadata(runs, telemetry_records):
         if tr.get("name") and tr["name"] != "placeholder":
             devices.add(tr["name"])
 
-    devices_str = ", ".join(sorted(devices)) if devices else "NVIDIA A100 80GB PCIe (unidentified)"
+    devices_str = ", ".join(sorted(devices)) if devices else "unknown (not observed in telemetry/logs)"
     hosts_str = ", ".join(sorted(hosts)) if hosts else "PBS compute allocation"
-    modes_str = ", ".join(sorted(modes)) if modes else "gpu_opencl"
+    modes_str = ", ".join(sorted(modes)) if modes else "unknown"
     return hosts_str, devices_str, modes_str
 
 
@@ -1212,7 +1214,7 @@ def _render_telemetry_section(md, telemetry_records):
             if clock_means:
                 min_g, max_g = min(clock_means, key=clock_means.get), max(clock_means, key=clock_means.get)
                 delta_g = clock_means[max_g] - clock_means[min_g]
-                if delta_g < 15:
+                if delta_g < HEURISTIC_CLOCK_DIVERGENCE_DELTA_MHZ:
                     md.append(f"- **Clock Uniformity:** GPU graphics clocks remained uniform across all nodes (spread: {delta_g:.0f} MHz).")
                 else:
                     md.append(f"- **Clock Divergence:** Graphics clock discrepancy detected between nodes: {delta_g:.0f} MHz difference (`{min_g[0]}` vs `{max_g[0]}`).")

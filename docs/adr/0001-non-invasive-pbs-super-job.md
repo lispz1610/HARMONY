@@ -32,7 +32,7 @@ While the core runtime library remains 100% frozen and untouched, minimal modifi
 ## Amendment (2026-11-18)
 
 Upon migrating the fork's variance investigation and load-balancing capabilities (R1-R5, Super Job, and Pre-Cluster Validation) onto the refactored upstream `harmony` architecture (`namespace harmony`):
-- The Layer 1 core freeze applies to `include/harmony/` and `src/` against baseline commit `c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77` (post-Ticket #41).
+- The Layer 1 core freeze applies to `include/harmony/` and `src/` against baseline commit `8d7c3392c8d616997b342f778ca041a9a717aff2` (post-review Layer 1 fix update over `c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77`).
 - Frontend compilation uses `./build.sh all` (producing `lib/libharmony.a`, `bin/topo_probe`, `bin/migration_profiler`, `bin/kneighbor`, `bin/leanmd`, and `tests/bin/test_*`).
 - `job_harmony_super.pbs` integrates upstream `scripts/pbs/job_env.sh` and `scripts/pbs/rank_wrapper.sh` (per-rank GPU pinning and MIG rejection) while preserving the single-allocation 2-hour reservation, shared 60-second Preflight Verification budget, and prebuilt binary checks.
 - `benchmarks/analyze_super_matrix.py` supports both upstream structured CSV timing reports (`#run`/`#timeline`/`#device`/`#process`/`#balance` via `--report-csv`) and Historical Evidence (`[DCL][balance-metrics]` logs), writing `super_matrix_summary.csv`, `super_matrix_paired.csv`, `hardware_telemetry.json`, and `SUPER_JOB_REPORT.md`.

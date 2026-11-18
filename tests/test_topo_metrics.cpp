@@ -126,6 +126,30 @@ void test_json_parser_edge_cases(int rank) {
     std::remove(good_file.c_str());
     assert(loaded.pcie_latency_ns.size() == 1);
     assert(std::fabs(loaded.pcie_latency_ns[0] - 123.4) < 1e-6);
+
+    // Semantic and dimensional validation at JSON deserialization time (load_topo_metrics).
+    check_bad_json("{ \"pcie_latency_ns\": [ -1.0 ] }", "negative pcie_latency_ns");
+    check_bad_json("{ \"pcie_bandwidth_gbps\": [ 0.0 ] }", "zero pcie_bandwidth_gbps");
+    check_bad_json("{ \"pcie_bandwidth_gbps\": [ -5.0 ] }", "negative pcie_bandwidth_gbps");
+    check_bad_json("{ \"mpi_latency_ns\": [ -0.5 ], \"mpi_bandwidth_gbps\": [ 0.0 ] }", "negative mpi_latency_ns");
+    check_bad_json("{ \"mpi_latency_ns\": [ 0.0 ], \"mpi_bandwidth_gbps\": [ -1.0 ] }", "negative mpi_bandwidth_gbps");
+    check_bad_json("{ \"mpi_latency_ns\": [ 0.0, 100.0, 100.0, 0.0 ], \"mpi_bandwidth_gbps\": [ 0.0, 0.0, 10.0, 0.0 ] }",
+                   "zero off-diagonal mpi_bandwidth_gbps");
+    check_bad_json("{ \"memory_contention_factor\": [ 0.9 ] }", "memory_contention_factor < 1.0");
+    check_bad_json("{ \"thermal_tdp_watts\": [ 0.0 ] }", "zero thermal_tdp_watts");
+    check_bad_json("{ \"current_power_watts\": [ -2.0 ] }", "negative current_power_watts");
+    check_bad_json("{ \"mpi_latency_ns\": [ 0.0, 10.0, 10.0 ], \"mpi_bandwidth_gbps\": [ 0.0, 10.0, 10.0 ] }",
+                   "non-square mpi_latency_ns");
+    check_bad_json("{ \"mpi_latency_ns\": [ 0.0, 10.0, 10.0, 0.0 ], \"mpi_bandwidth_gbps\": [ 0.0 ] }",
+                   "mismatched mpi_latency_ns and mpi_bandwidth_gbps dimensions");
+    check_bad_json("{ \"numa_distance\": [ 10, 20, 20 ] }", "non-square numa_distance");
+    check_bad_json("{ \"numa_distance\": [ 0, 20, 20, 10 ] }", "non-positive numa_distance");
+    check_bad_json("{ \"numa_distance\": [ 30, 10, 10, 30 ] }", "numa_distance diagonal > off-diagonal");
+    check_bad_json("{ \"device_numa_node\": [ 0, 1 ] }", "device_numa_node without numa_distance");
+    check_bad_json("{ \"numa_distance\": [ 10, 20, 20, 10 ], \"device_numa_node\": [ 0, 2 ] }",
+                   "device_numa_node out of range");
+    check_bad_json("{ \"pcie_latency_ns\": [ 100.0, 200.0 ], \"pcie_bandwidth_gbps\": [ 15.0 ] }",
+                   "mismatched device vector dimensions");
 }
 
 void test_save_validation_errors(int rank) {

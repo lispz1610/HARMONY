@@ -72,7 +72,7 @@ CODING_STANDARDS.md        frozen core invariants, artifact names, and review st
 ./build.sh
 ```
 
-Produces `lib/libharmony.a` and `bin/migration_profiler`. The build is
+Produces `lib/libharmony.a`, `bin/migration_profiler`, and `bin/topo_probe`. The build is
 incremental: only what changed (sources, included headers or flags) is
 recompiled.
 
@@ -709,7 +709,7 @@ Run Pre-Cluster Validation in two ways:
 
 ### Super Job Variance Investigation Workflow
 
-To evaluate multi-GPU load-balancing variance (`erad` vs. `hwtopolb`) on the HPC cluster while keeping the core runtime (`include/harmony/` and `src/`) 100% frozen against baseline `c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77`, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs Preflight Verification, an untimed warm-up, a 5-repetition Rotated Matrix, an isolated A/B/A Test for seed 123, and multi-node GPU telemetry.
+To evaluate multi-GPU load-balancing variance (`erad` vs. `hwtopolb`) on the HPC cluster while keeping the core runtime (`include/harmony/` and `src/`) 100% frozen against baseline `8d7c3392c8d616997b342f778ca041a9a717aff2`, HARMONY provides a single-allocation PBS Super Job (`job_harmony_super.pbs`). It runs Preflight Verification, an untimed warm-up, a 5-repetition Rotated Matrix, an isolated A/B/A Test for seed 123, and multi-node GPU telemetry.
 
 1. **Pre-build on frontend** (compute-node compilation is strictly forbidden):
    ```bash
