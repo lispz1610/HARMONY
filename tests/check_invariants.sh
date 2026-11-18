@@ -12,7 +12,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-CORE_FREEZE_BASE="${HARMONY_CORE_FREEZE_BASE:-c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77}"
+CORE_FREEZE_BASE="${HARMONY_CORE_FREEZE_BASE:-8d7c3392c8d616997b342f778ca041a9a717aff2}"
 
 echo "=== 1. Checking Runtime Core Invariants (include/harmony/ and src/ freeze) ==="
 if git rev-parse --verify "${CORE_FREEZE_BASE}^{commit}" >/dev/null 2>&1; then

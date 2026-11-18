@@ -496,6 +496,23 @@ class TestAnalyzeSuperMatrix(unittest.TestCase):
         self.assertTrue((self.output_dir / "super_matrix_summary.csv").exists())
         self.assertFalse((self.output_dir / "hardware_telemetry.json").exists())
 
+    def test_unknown_hardware_and_mode_fallbacks_and_heuristic_constant(self):
+        """Missing hardware/mode logs must fall back to 'unknown' labels and expose named heuristic constant."""
+        self.assertEqual(asm.HEURISTIC_CLOCK_DIVERGENCE_DELTA_MHZ, 15)
+
+        runs = [
+            {"benchmark": "kneighbor", "algo": "erad", "seed": 42, "repetition": 1,
+             "stage": "matrix", "wall_s": 1.0, "status": "SUCCESS"},
+            {"benchmark": "kneighbor", "algo": "hwtopolb", "seed": 42, "repetition": 1,
+             "stage": "matrix", "wall_s": 0.5, "status": "SUCCESS"},
+        ]
+        asm.generate_artifacts(self.output_dir, runs)
+        report_text = (self.output_dir / "SUPER_JOB_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("unknown (not observed in telemetry/logs)", report_text)
+        self.assertIn("| Execution Mode | `unknown` |", report_text)
+        self.assertNotIn("NVIDIA A100 80GB PCIe (unidentified)", report_text)
+        self.assertNotIn("| Execution Mode | `gpu_opencl` |", report_text)
+
 
 if __name__ == "__main__":
     unittest.main()

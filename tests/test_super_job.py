@@ -294,6 +294,20 @@ class TestSuperJobExecution(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("analyzer failed", (proc.stderr + proc.stdout).lower())
 
+    def test_multiword_launcher_executes_properly(self):
+        """Multi-word LAUNCHER (e.g. 'env MOCK_MULTIWORD=1 prun') must word-split cleanly without failing."""
+        self._create_prebuilt_binaries()
+        shutil.copytree(os.path.join(ROOT_DIR, "benchmarks"), os.path.join(self.temp_dir, "benchmarks"))
+
+        proc = self._run_job_script({
+            "LAUNCHER": "env MOCK_MULTIWORD_FLAG=1 prun",
+            "BENCH_SEEDS": "42",
+            "BENCH_ITERATIONS": "5",
+        })
+        self.assertEqual(proc.returncode, 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        expected_out = os.path.join(self.temp_dir, "results", "variance_run_12345.headnode")
+        self.assertTrue(os.path.isfile(os.path.join(expected_out, "SUPER_JOB_REPORT.md")))
+
 
 class TestBenchmarkNumericalVerification(unittest.TestCase):
     """Verifies that refactored benchmarks check std::isfinite via benchmark_common.hpp."""

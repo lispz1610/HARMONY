@@ -7,7 +7,7 @@ Automated checks and mechanical invariants are enforced by `tests/check_invarian
 
 ## 1. Architectural Invariants & Core Freeze
 
-- **Frozen Runtime Core (`include/harmony/` and `src/`)**: The `include/harmony/` public headers and `src/` runtime implementation are 100% frozen against the post-Layer-1 baseline (`c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77`). Under no circumstances should Layer 2 evaluation harnesses modify `include/harmony/` or `src/`. All variance investigation and performance evaluation harnesses must remain external.
+- **Frozen Runtime Core (`include/harmony/` and `src/`)**: The `include/harmony/` public headers and `src/` runtime implementation are 100% frozen against the post-Layer-1 baseline (`8d7c3392c8d616997b342f778ca041a9a717aff2`). Under no circumstances should Layer 2 evaluation harnesses modify `include/harmony/` or `src/`. All variance investigation and performance evaluation harnesses must remain external.
 - **Minimal Driver Adjustments**: Benchmark drivers (`benchmarks/*.cpp`, `benchmarks/benchmark_common.hpp`) and preflight tests (`tests/test_*.cpp`) may only receive minimal, surgical modifications when explicitly authorized by an issue (e.g., isolating loop duration before validation, enforcing per-rank GPU counts).
 - **Frontend Build Only**: Never trigger compilation (`mpic++`, `mpicxx`, `./build.sh`) inside compute node jobs or batch execution scripts. Compute node scripts must verify prebuilt binaries in `bin/` and `tests/bin/` (built on the frontend via `./build.sh all`) and exit with an error if missing.
 

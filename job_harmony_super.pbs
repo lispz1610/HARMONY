@@ -30,11 +30,17 @@ LAUNCHER="${LAUNCHER:-prun}"
 # shellcheck disable=SC1091
 source "$HARMONY_ROOT/scripts/pbs/job_env.sh"
 
+read -r -a launcher_cmd <<< "$LAUNCHER"
+if [[ ${#launcher_cmd[@]} -eq 0 ]]; then
+    echo "Error: LAUNCHER must not be empty" >&2
+    exit 1
+fi
+
 echo "=== Toolchain ==="
 if command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1; then
     module list 2>&1 || true
 fi
-command -v "$LAUNCHER"
+command -v "${launcher_cmd[0]}"
 
 # 2. Prebuilt binary verification (no compute-node compilation)
 bin_dir="$HARMONY_ROOT/bin"
@@ -89,7 +95,7 @@ preflight_remaining() {
 topo_stdout="$output_dir/topo_probe.stdout"
 remaining=$(preflight_remaining "topology probe")
 echo "Running topology probe (shared preflight budget: ${remaining}s of ${preflight_budget}s left)..."
-timeout "${remaining}s" "$LAUNCHER" "${rank_prefix[@]}" "$bin_dir/topo_probe" --output-json "$output_dir/topo_metrics_cluster.json" | tee "$topo_stdout"
+timeout "${remaining}s" "${launcher_cmd[@]}" "${rank_prefix[@]}" "$bin_dir/topo_probe" --output-json "$output_dir/topo_metrics_cluster.json" | tee "$topo_stdout"
 
 python3 - "$output_dir/topo_metrics_cluster.json" "$topo_stdout" <<'PY'
 import json
@@ -132,7 +138,7 @@ PY
 
 remaining=$(preflight_remaining "asynchronous halo test")
 echo "Running asynchronous OpenCL halo test (shared preflight budget: ${remaining}s of ${preflight_budget}s left)..."
-if ! timeout "${remaining}s" "$LAUNCHER" "${rank_prefix[@]}" "$halo_bin" --require-gpu --timeout-seconds "$remaining"; then
+if ! timeout "${remaining}s" "${launcher_cmd[@]}" "${rank_prefix[@]}" "$halo_bin" --require-gpu --timeout-seconds "$remaining"; then
     echo "ERROR: Asynchronous halo test preflight failed (requires at least 1 OpenCL GPU per rank)" >&2
     exit 1
 fi

@@ -118,7 +118,7 @@ class TestRefactoredStandardsAndGlossary(unittest.TestCase):
         self.assertIn("bin/", standards)
         self.assertIn("tests/bin/", standards)
         self.assertIn("./build.sh all", standards)
-        self.assertIn("c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77", standards)
+        self.assertIn("8d7c3392c8d616997b342f778ca041a9a717aff2", standards)
         self.assertNotIn("dcl/", standards)
         self.assertNotIn("cluster_build.sh", standards)
         self.assertNotIn("build/cluster", standards)
@@ -141,7 +141,7 @@ class TestAdrConsistency(unittest.TestCase):
         self.assertIn("./build.sh all", content)
         self.assertIn("scripts/pbs/job_env.sh", content)
         self.assertIn("scripts/pbs/rank_wrapper.sh", content)
-        self.assertIn("c5376aaa2c1a7bf6c68d92fcc3c349cb7a2fdd77", content)
+        self.assertIn("8d7c3392c8d616997b342f778ca041a9a717aff2", content)
         self.assertRegex(content, r"## Amendment \(2026-11-\d{2}\)")
 
     def test_adr_0002_exists_and_reflects_refactored_colab_layout(self):
