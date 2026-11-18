@@ -15,6 +15,7 @@
 // Otherwise it is launched once over each partition ("full").
 
 #include "runtime_impl.hpp"
+#include "detail/load_math.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -56,12 +57,104 @@ void append_unique(std::vector<cl_event>& out, const std::vector<cl_event>& even
 
 } // namespace
 
+void Runtime::Impl::prune_micro_partitions_for_halos(std::size_t max_halo_width) {
+    if (max_halo_width == 0 || partitions_.size() < 2 || !partition_.has_value()) return;
+
+    auto has_unsafe_micro = [&](const std::vector<DevicePartition>& parts) {
+        std::size_t active = 0;
+        for (const DevicePartition& p : parts) {
+            if (p.element_count > 0) ++active;
+        }
+        if (active < 2) return false;
+        for (const DevicePartition& p : parts) {
+            if (p.element_count > 0 && p.element_count < max_halo_width) return true;
+        }
+        return false;
+    };
+
+    std::vector<DevicePartition> projected = partitions_;
+    std::vector<float> new_cum;
+    for (std::size_t pass = 0; pass < partitions_.size() && has_unsafe_micro(projected); ++pass) {
+        std::vector<std::size_t> counts;
+        counts.reserve(projected.size());
+        for (const DevicePartition& p : projected) counts.push_back(p.element_count);
+
+        for (std::size_t p = 0; p < counts.size(); ++p) {
+            if (counts[p] == 0 || counts[p] >= max_halo_width) continue;
+            std::size_t recipient = counts.size();
+            for (std::size_t q = p; q > 0; --q) {
+                if (counts[q - 1] > 0) {
+                    recipient = q - 1;
+                    break;
+                }
+            }
+            if (recipient == counts.size()) {
+                for (std::size_t q = p + 1; q < counts.size(); ++q) {
+                    if (counts[q] > 0) {
+                        recipient = q;
+                        break;
+                    }
+                }
+            }
+            if (recipient == counts.size()) break;
+            counts[recipient] += counts[p];
+            counts[p] = 0;
+        }
+
+        new_cum.resize(counts.size());
+        std::size_t covered = 0;
+        for (std::size_t p = 0; p < counts.size(); ++p) {
+            covered += counts[p];
+            new_cum[p] = static_cast<float>(
+                static_cast<double>(covered) / static_cast<double>(partition_->global_elements));
+        }
+        new_cum.back() = 1.0f;
+        projected = partitions_from_loads(new_cum, /*allow_empty=*/true);
+    }
+
+    const int local_invalid =
+        (projected.size() != partitions_.size() || has_unsafe_micro(projected)) ? 1 : 0;
+    const int local_rebalance =
+        (!local_invalid && !detail::same_partition_layout(partitions_, projected)) ? 1 : 0;
+    const int local_state[2] = {local_invalid, local_rebalance};
+    int min_state[2] = {};
+    int max_state[2] = {};
+    {
+        PhaseTimer mpi_timer(*this, Phase::mpi_balance);
+        detail::check_mpi(
+            MPI_Allreduce(local_state, min_state, 2, MPI_INT, MPI_MIN, comm_),
+            "MPI_Allreduce(halo state minimum)");
+        detail::check_mpi(
+            MPI_Allreduce(local_state, max_state, 2, MPI_INT, MPI_MAX, comm_),
+            "MPI_Allreduce(halo state maximum)");
+    }
+    if (max_state[0] != 0) {
+        throw Error("execute(): halo partitions cannot satisfy the minimum width");
+    }
+    if (min_state[1] != max_state[1]) {
+        throw Error("execute(): inconsistent halo partitions across ranks");
+    }
+    if (local_rebalance != 0) {
+        rebalance_to(new_cum);
+    }
+}
+
 void Runtime::Impl::execute(const ExecutionStep& step) {
     const bool simulated_balance_only =
         step.invocations.empty() && simulated_devices_ && devices_discovered_ &&
         step.balance.mode != BalanceMode::off;
     if (step.invocations.empty() && !simulated_balance_only) return;
     PhaseTimer timer(*this, Phase::launch);
+
+    std::size_t max_halo_width = 0;
+    for (const HaloSpec& hs : step.halos) {
+        if (!hs.fields.empty() && hs.width_elements > max_halo_width) {
+            max_halo_width = hs.width_elements;
+        }
+    }
+    if (max_halo_width > 0) {
+        prune_micro_partitions_for_halos(max_halo_width);
+    }
 
     std::vector<ResolvedArgs> fields;
     fields.reserve(step.invocations.size());
@@ -78,6 +171,9 @@ void Runtime::Impl::execute(const ExecutionStep& step) {
     ++iteration_counter_;
     if (step.balance.mode != BalanceMode::off) {
         maybe_balance_after_step(step);
+        if (max_halo_width > 0) {
+            prune_micro_partitions_for_halos(max_halo_width);
+        }
     }
 
     if (step.synchronize_at_end) {
@@ -372,9 +468,11 @@ void Runtime::Impl::maybe_balance_after_step(const ExecutionStep& step) {
         balance_policy_ = policy;
     }
 
+    const bool is_hierarchical = policy.mode == BalanceMode::hierarchical;
     const bool is_threshold = policy.mode == BalanceMode::dynamic_threshold ||
                               policy.mode == BalanceMode::static_threshold;
-    const bool is_dynamic = policy.mode == BalanceMode::dynamic_threshold ||
+    const bool is_dynamic = is_hierarchical ||
+                            policy.mode == BalanceMode::dynamic_threshold ||
                             policy.mode == BalanceMode::dynamic_profiled;
 
     // Moving data for iterations that will not run is pointless.
@@ -395,7 +493,9 @@ void Runtime::Impl::maybe_balance_after_step(const ExecutionStep& step) {
     BalanceRecord record;
     record.iteration = it;
     record.warmup_probe = probe;
-    record.policy = std::string(is_dynamic ? "dynamic " : "static ") + (is_threshold ? "threshold" : "profiled");
+    record.policy = is_hierarchical
+        ? std::string("hierarchical")
+        : std::string(is_dynamic ? "dynamic " : "static ") + (is_threshold ? "threshold" : "profiled");
     record.algorithm = (policy.algorithm == BalanceAlgorithm::hwtopolb) ? "hwtopolb" : "erad";
     record.perturbation_factor =
         (policy.algorithm == BalanceAlgorithm::hwtopolb) ? policy.perturbation_factor : 0.0f;
@@ -403,7 +503,10 @@ void Runtime::Impl::maybe_balance_after_step(const ExecutionStep& step) {
     record.power_budget_watts = policy.use_power_cap ? policy.power_budget_watts : 0.0;
     for (const DevicePartition& p : partitions_) record.elements_before.push_back(p.element_count);
 
-    if (fields.empty()) {
+    validate_collective_balance_inputs(fields, "maybe_balance_after_step()");
+    if (is_hierarchical) {
+        record.applied = maybe_rebalance_hierarchical(fields, policy, record);
+    } else if (fields.empty()) {
         reset_balance_window_events();
         record.reason = "no proportional field to move";
     } else {

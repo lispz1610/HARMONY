@@ -5,6 +5,7 @@
 
 #include "harmony/types.hpp"
 
+#include <cstddef>
 #include <vector>
 
 namespace harmony {
@@ -63,6 +64,33 @@ std::vector<float> apply_power_cap(
     double power_budget_watts = 0.0,
     double* out_throttle_factor = nullptr,
     const std::vector<float>* current_loads = nullptr);
+
+// Symmetric NUMA hop distance between two NUMA nodes (R2).
+// Validates that metrics.numa_distance is a non-empty N x N matrix and clamps
+// against the diagonal minimum. Throws harmony::Error on invalid inputs.
+int numa_distance_between(const TopoMetrics& metrics, int node_a, int node_b);
+
+// Estimates migration time in seconds for transferring `bytes` from
+// (src_global_device, src_rank) to (dst_global_device, dst_rank) (R2).
+// Inter-rank transfers model PCIe(src) + MPI(src,dst) + PCIe(dst); intra-rank
+// transfers model PCIe + symmetric NUMA hop penalty. Throws harmony::Error on
+// negative device indices or invalid MPI metrics when ranks differ.
+double estimate_migration_cost_bytes(
+    const TopoMetrics& metrics,
+    int src_global_device,
+    int dst_global_device,
+    int src_rank,
+    int dst_rank,
+    std::size_t bytes,
+    double numa_penalty_ns_per_hop = 50.0);
+
+// Intra-rank convenience overload for estimate_migration_cost_bytes.
+double estimate_migration_cost_bytes(
+    const TopoMetrics& metrics,
+    int src_global_device,
+    int dst_global_device,
+    std::size_t bytes,
+    double numa_penalty_ns_per_hop = 50.0);
 
 } // namespace harmony
 

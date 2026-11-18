@@ -56,7 +56,8 @@ enum class BalanceMode {
     static_threshold,   // a single rebalance attempt (after the warm-up)
     dynamic_threshold,  // a rebalance attempt every `interval` iterations
     static_profiled,    // like static_threshold, decided by the cost model
-    dynamic_profiled    // like dynamic_threshold, decided by the cost model
+    dynamic_profiled,   // like dynamic_threshold, decided by the cost model
+    hierarchical        // two-phase intra-node + hysteresis-gated inter-node
 };
 
 // Load-calculation algorithm used by automatic balancing (R4).
@@ -284,6 +285,10 @@ struct AutoBalancePolicy {
     bool use_contention_adjustment{false};
     bool use_power_cap{false};
     double power_budget_watts{0.0};
+
+    // NUMA migration cost-to-gain ratio threshold (R2, default 0.50).
+    // If < 0.0, falls back to Runtime::numa_cost_gain_ratio_threshold().
+    double numa_cost_gain_ratio_threshold{0.50};
 };
 
 // Extra meaning of a field in a step (Runtime::step().tag_field()).

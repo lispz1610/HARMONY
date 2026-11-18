@@ -305,6 +305,108 @@ std::vector<float> apply_power_cap(
     return cumulative_from_shares(shares);
 }
 
+int numa_distance_between(const TopoMetrics& metrics, int node_a, int node_b) {
+    if (metrics.numa_distance.empty()) {
+        throw Error("NUMA distance matrix is empty");
+    }
+    const std::size_t n_dist = metrics.numa_distance.size();
+    const std::size_t num_nodes =
+        static_cast<std::size_t>(std::llround(std::sqrt(static_cast<double>(n_dist))));
+    if (num_nodes == 0 || num_nodes * num_nodes != n_dist) {
+        throw Error("Invalid NUMA distance matrix dimension");
+    }
+    if (node_a < 0 || static_cast<std::size_t>(node_a) >= num_nodes ||
+        node_b < 0 || static_cast<std::size_t>(node_b) >= num_nodes) {
+        throw Error("Invalid NUMA node index");
+    }
+    const std::size_t a = static_cast<std::size_t>(node_a);
+    const std::size_t b = static_cast<std::size_t>(node_b);
+    int dist = std::max(metrics.numa_distance[a * num_nodes + b],
+                        metrics.numa_distance[b * num_nodes + a]);
+    const int diag_min = std::min(metrics.numa_distance[a * num_nodes + a],
+                                  metrics.numa_distance[b * num_nodes + b]);
+    return std::max(dist, diag_min);
+}
+
+double estimate_migration_cost_bytes(
+    const TopoMetrics& metrics,
+    int src_global_device,
+    int dst_global_device,
+    int src_rank,
+    int dst_rank,
+    std::size_t bytes,
+    double numa_penalty_ns_per_hop) {
+    if (src_global_device < 0 || dst_global_device < 0) {
+        throw Error("Device index cannot be negative");
+    }
+    if (!std::isfinite(numa_penalty_ns_per_hop) || numa_penalty_ns_per_hop < 0.0) {
+        throw Error("numa_penalty_ns_per_hop must be finite and non-negative");
+    }
+
+    auto device_pcie = [&](std::size_t dev_idx) {
+        const double lat = (dev_idx < metrics.pcie_latency_ns.size())
+            ? metrics.pcie_latency_ns[dev_idx] : 5000.0;
+        const double bw = (dev_idx < metrics.pcie_bandwidth_gbps.size() &&
+                           metrics.pcie_bandwidth_gbps[dev_idx] > 0.0)
+            ? metrics.pcie_bandwidth_gbps[dev_idx] : 10.0;
+        return std::pair<double, double>{lat, bw};
+    };
+
+    const std::size_t s_idx = static_cast<std::size_t>(src_global_device);
+    const std::size_t d_idx = static_cast<std::size_t>(dst_global_device);
+    const auto [pcie_lat_src, pcie_bw_src] = device_pcie(s_idx);
+    const auto [pcie_lat_dst, pcie_bw_dst] = device_pcie(d_idx);
+
+    double latency_s = 0.0;
+    double transfer_s = 0.0;
+
+    if (src_rank != dst_rank && src_rank >= 0 && dst_rank >= 0) {
+        // Inter-rank migration: PCIe(src) + MPI(src, dst) + PCIe(dst).
+        latency_s = (pcie_lat_src + pcie_lat_dst) * 1e-9;
+        transfer_s = (static_cast<double>(bytes) / (pcie_bw_src * 1e9)) +
+                     (static_cast<double>(bytes) / (pcie_bw_dst * 1e9));
+
+        const std::size_t num_ranks =
+            static_cast<std::size_t>(std::llround(std::sqrt(static_cast<double>(metrics.mpi_latency_ns.size()))));
+        if (num_ranks == 0 || num_ranks * num_ranks != metrics.mpi_latency_ns.size() ||
+            metrics.mpi_bandwidth_gbps.size() != metrics.mpi_latency_ns.size() ||
+            static_cast<std::size_t>(src_rank) >= num_ranks ||
+            static_cast<std::size_t>(dst_rank) >= num_ranks) {
+            throw Error("MPI migration metrics do not cover the requested ranks");
+        }
+        const std::size_t mpi_idx =
+            static_cast<std::size_t>(src_rank) * num_ranks + static_cast<std::size_t>(dst_rank);
+        const double mpi_bw = metrics.mpi_bandwidth_gbps[mpi_idx];
+        const double mpi_lat = metrics.mpi_latency_ns[mpi_idx];
+        if (!std::isfinite(mpi_bw) || mpi_bw <= 0.0 || !std::isfinite(mpi_lat) || mpi_lat < 0.0) {
+            throw Error("Invalid MPI migration metrics");
+        }
+        latency_s += mpi_lat * 1e-9;
+        transfer_s += static_cast<double>(bytes) / (mpi_bw * 1e9);
+    } else {
+        // Intra-rank migration: PCIe(src) + symmetric NUMA hop penalty.
+        const int src_node = (s_idx < metrics.device_numa_node.size()) ? metrics.device_numa_node[s_idx] : 0;
+        const int dst_node = (d_idx < metrics.device_numa_node.size()) ? metrics.device_numa_node[d_idx] : 0;
+        const double extra_latency_ns = (src_node == dst_node)
+            ? 0.0
+            : static_cast<double>(numa_distance_between(metrics, src_node, dst_node)) * numa_penalty_ns_per_hop;
+        latency_s = (pcie_lat_src + extra_latency_ns) * 1e-9;
+        transfer_s = static_cast<double>(bytes) / (pcie_bw_src * 1e9);
+    }
+
+    return latency_s + transfer_s;
+}
+
+double estimate_migration_cost_bytes(
+    const TopoMetrics& metrics,
+    int src_global_device,
+    int dst_global_device,
+    std::size_t bytes,
+    double numa_penalty_ns_per_hop) {
+    return estimate_migration_cost_bytes(
+        metrics, src_global_device, dst_global_device, -1, -1, bytes, numa_penalty_ns_per_hop);
+}
+
 } // namespace harmony
 
 namespace harmony::detail {
