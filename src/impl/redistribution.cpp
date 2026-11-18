@@ -43,6 +43,7 @@ void Runtime::Impl::rebalance_to(const std::vector<float>& loads) {
     BalanceRecord record;
     record.iteration = iteration_counter_;
     record.policy = "manual";
+    record.algorithm = "manual";
     for (const DevicePartition& p : old_parts) record.elements_before.push_back(p.element_count);
 
     if (detail::same_partition_layout(old_parts, new_parts)) {

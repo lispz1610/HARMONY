@@ -153,7 +153,22 @@ void Runtime::Impl::print_balance_policy(const AutoBalancePolicy& policy) {
 
     std::ostringstream out;
     out << "[HARMONY] Load balancing: " << (is_dynamic ? "dynamic " : "static ")
-        << (is_threshold ? "threshold" : "profiled") << "\n          ";
+        << (is_threshold ? "threshold" : "profiled")
+        << " (algorithm: " << (policy.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad");
+    if (policy.algorithm == BalanceAlgorithm::hwtopolb) {
+        out << ", perturbation=" << detail::format_number(policy.perturbation_factor, 4)
+            << ", seed=" << policy.seed;
+    }
+    if (policy.use_contention_adjustment) {
+        out << ", contention=on";
+    }
+    if (policy.use_power_cap) {
+        out << ", power_cap=on";
+        if (policy.power_budget_watts > 0.0) {
+            out << ", budget=" << detail::format_number(policy.power_budget_watts, 1) << "W";
+        }
+    }
+    out << ")\n          ";
     if (warmup > 0) {
         out << "Warm-up probe at iteration " << detail::format_count(static_cast<std::size_t>(warmup))
             << " (adjusts the initial division; not a balancing attempt).\n          ";
@@ -192,8 +207,25 @@ void Runtime::Impl::print_balance_interval_metrics(BalanceRecord record) {
         std::ostringstream out;
         out << "[HARMONY] " << (record.warmup_probe ? std::string("Warm-up probe") : "Balance #" + std::to_string(record.number))
             << " | iteration " << detail::format_count(record.iteration)
-            << " | " << record.policy << " | " << (record.applied ? "CHANGED the division" : "kept the division")
+            << " | " << record.policy << " (" << record.algorithm << ")"
+            << " | " << (record.applied ? "CHANGED the division" : "kept the division")
             << "\n" << pad << "Why: " << record.reason << "\n";
+        if (record.contention_adjusted || record.power_capped || record.algorithm == "hwtopolb") {
+            out << pad << "Controls: algorithm=" << record.algorithm;
+            if (record.algorithm == "hwtopolb") {
+                out << ", perturbation=" << detail::format_number(record.perturbation_factor, 4)
+                    << ", seed=" << record.seed;
+            }
+            if (record.contention_adjusted) out << ", contention=adjusted";
+            if (record.power_capped) {
+                out << ", power_cap=active";
+                if (record.power_budget_watts > 0.0) {
+                    out << " (budget=" << detail::format_number(record.power_budget_watts, 1) << "W)";
+                }
+                out << ", throttle=" << detail::format_number(record.throttle_factor, 4);
+            }
+            out << "\n";
+        }
 
         const std::size_t devices = record.elements_after.size();
         const bool measured = record.window_iterations > 0 && record.window_seconds.size() == devices;
@@ -428,10 +460,18 @@ void Runtime::Impl::print_timing_report(std::ostream& os) {
         const bool is_threshold = p.mode == BalanceMode::dynamic_threshold || p.mode == BalanceMode::static_threshold;
         const int interval = std::max(1, p.interval);
         out << "Load balancing: " << (is_dynamic ? "dynamic " : "static ") << (is_threshold ? "threshold" : "profiled")
+            << ", algorithm " << (p.algorithm == BalanceAlgorithm::hwtopolb ? "hwtopolb" : "erad")
             << ", warm-up probe at " << (p.warmup > 0 ? detail::format_count(static_cast<std::size_t>(p.warmup)) : "-")
             << ", interval " << detail::format_count(static_cast<std::size_t>(interval))
             << (is_dynamic ? "" : " (single attempt)");
         if (is_threshold) out << ", threshold " << detail::format_number(p.threshold, 4);
+        if (p.use_contention_adjustment) out << ", contention adjustment";
+        if (p.use_power_cap) {
+            out << ", power cap";
+            if (p.power_budget_watts > 0.0) {
+                out << " (" << detail::format_number(p.power_budget_watts, 1) << " W)";
+            }
+        }
         out << "\n";
     } else {
         out << "Load balancing: off\n";
@@ -706,12 +746,15 @@ void Runtime::Impl::write_timing_report(const std::string& path) {
     }
 
     out << "#balance,number,iteration,policy,applied,iteration_s_before,iteration_s_after,bytes_moved,"
-           "migration_s,decision_s,warmup_probe,reason\n";
+           "migration_s,decision_s,warmup_probe,reason,algorithm,perturbation_factor,seed,"
+           "contention_adjusted,power_capped,power_budget_watts,throttle_factor\n";
     for (const BalanceRecord& b : r.balance) {
         out << "balance," << b.number << "," << b.iteration << "," << clean(b.policy) << "," << (b.applied ? 1 : 0)
             << "," << b.iteration_seconds_before << "," << b.iteration_seconds_after << "," << b.bytes_moved << ","
             << b.migration_seconds << "," << b.decision_seconds << "," << (b.warmup_probe ? 1 : 0) << ","
-            << clean(b.reason) << "\n";
+            << clean(b.reason) << "," << clean(b.algorithm) << "," << b.perturbation_factor << "," << b.seed << ","
+            << (b.contention_adjusted ? 1 : 0) << "," << (b.power_capped ? 1 : 0) << ","
+            << b.power_budget_watts << "," << b.throttle_factor << "\n";
     }
 }
 

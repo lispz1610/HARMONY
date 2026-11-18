@@ -59,6 +59,12 @@ enum class BalanceMode {
     dynamic_profiled    // like dynamic_threshold, decided by the cost model
 };
 
+// Load-calculation algorithm used by automatic balancing (R4).
+enum class BalanceAlgorithm {
+    erad,     // deterministic throughput-proportional shares
+    hwtopolb  // bounded stochastic perturbation around throughput shares
+};
+
 // How a kernel uses a field argument. The runtime derives from it the
 // dependencies between kernels, which halos to exchange and when.
 enum class Access {
@@ -268,6 +274,16 @@ struct AutoBalancePolicy {
     // a balancing attempt: the attempts keep their schedule (multiples of
     // `interval`) and a static policy still makes its single attempt.
     int warmup{0};
+
+    // Load-calculation algorithm (R4).
+    BalanceAlgorithm algorithm{BalanceAlgorithm::erad};
+    float perturbation_factor{0.0f};
+    unsigned int seed{0};  // 0 = auto-generate on rank 0 and broadcast via MPI_Bcast
+
+    // Contention and power-capping controls (R5).
+    bool use_contention_adjustment{false};
+    bool use_power_cap{false};
+    double power_budget_watts{0.0};
 };
 
 // Extra meaning of a field in a step (Runtime::step().tag_field()).
@@ -356,6 +372,13 @@ struct BalanceRecord {
     std::size_t bytes_moved{0};
     double decision_seconds{0.0};
     double migration_seconds{0.0};
+    std::string algorithm{"erad"};        // "erad", "hwtopolb", or "manual"
+    float perturbation_factor{0.0f};
+    unsigned int seed{0};
+    bool contention_adjusted{false};
+    bool power_capped{false};
+    double power_budget_watts{0.0};
+    double throttle_factor{1.0};
 };
 
 // The wall time of the critical path in one line: the MPI process that
